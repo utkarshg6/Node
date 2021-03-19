@@ -124,7 +124,20 @@ x86_64-pc-windows-gnu:
     LIBZ_SYS_STATIC: 1
     SQLITE_STATIC: 1
     OPENSSL_STATIC: 1
-  extends: .build
+  script:
+    - cargo install cross
+    - cd node
+    - cross build  --release --target $ARCH
+    - cd ../masq
+    - cargo build --release --target $ARCH
+    - cd ../dns_utility
+    - cargo build --release --target $ARCH
+    - cd ../port_exposer
+    - cargo build --release --target $ARCH
+    - cd ..
+    - aws s3 sync node/target/x86_64-apple-darwin/release/ s3://$S3_BUCKET/$ARCH/
+    - aws s3 sync dns_utility/target/x86_64-apple-darwin/release/  s3://$S3_BUCKET/$ARCH/
+    - aws s3 sync port_exposer/target/x86_64-apple-darwin/release/  s3://$S3_BUCKET/$ARCH/
 
 linux:
   stage: docker-build

@@ -32,7 +32,7 @@ stages:
 include:
   - project: masq.ai/shared-ci
     ref: develop
-    file: pipelines/rust/linux.yml
+    file: pipelines/rust/build.yml
   - project: masq.ai/shared-ci
     ref: develop
     file: pipelines/cross-compile/aarch64-darwin.yml

@@ -13,3 +13,7 @@ ar = "x86_64-apple-darwin14-ar"
 rustflags = ["-C", "target-feature=+crt-static"]
 linker = "/usr/bin/x86_64-w64-mingw32-gcc"
 ar = "/usr/x86_64-w64-mingw32/bin/ar"
+[target.aarch64-apple-darwin20.2]
+rustflags = ["-C", "target-feature=+crt-static"]
+linker = "aarch64-apple-darwin20.2-clang"
+ar = "aarch64-apple-darwin20.2-ar"

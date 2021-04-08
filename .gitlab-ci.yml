@@ -90,9 +90,9 @@ stages:
       - port_exposer
     expire_in: 1 week
   script: 
-    - aws s3 sync node/target/$ARCH/release/ s3://$S3_BUCKET/$ARCH/$RELEASE/ --exclude ".fingerprint/*"
-    - aws s3 sync dns_utility/target/$ARCH/release/  s3://$S3_BUCKET/$ARCH/$RELEASE/ --exclude ".fingerprint/*"
-    - aws s3 sync port_exposer/target/$ARCH/release/  s3://$S3_BUCKET/$ARCH/$RELEASE/ --exclude ".fingerprint/*"
+    - aws s3 sync node/target/$ARCH/release/ s3://$S3_BUCKET/Builds/$ARCH/$RELEASE/ --exclude ".fingerprint/*"
+    - aws s3 sync dns_utility/target/$ARCH/release/  s3://$S3_BUCKET/Builds/$ARCH/$RELEASE/ --exclude ".fingerprint/*"
+    - aws s3 sync port_exposer/target/$ARCH/release/  s3://$S3_BUCKET/Builds/$ARCH/$RELEASE/ --exclude ".fingerprint/*"
 
 
 x86_64-linux-gnu:build:

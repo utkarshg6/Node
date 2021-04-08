@@ -20,10 +20,7 @@ cache:
     - port_exposer
 
 stages:
-  - x86_64-unknown-linux-gnu
-  - x86_64-pc-windows-gnu
-  - x86_64-apple-darwin
-  - aarch64-apple-darwin
+  - build
   - sync
   - docker
   - security
@@ -62,12 +59,18 @@ stages:
   dependencies: []
   script:
     - cd $BUILD_DIR/
-    - cargo audit 
-    # - cargo audit --format=json > gl-dependency-scanning-report.json
+    - cargo audit --format=json > gl-dependency-scanning-report.json
   artifacts:
     paths: [gl-dependency-scanning-report.json]
 
 .build:
+  artifacts:
+    paths:
+      - node
+      - masq
+      - dns_utility
+      - port_exposer
+    expire_in: 1 week
   script:
     - export PATH=$PATH:$HOME/.cargo/bin
     - cd $CI_PROJECT_DIR
@@ -78,17 +81,25 @@ stages:
     - cargo build --manifest-path=port_exposer/Cargo.toml --release --target $ARCH
 
 .s3:
+  image: alpine:latest
+  artifacts:
+    paths:
+      - node
+      - masq
+      - dns_utility
+      - port_exposer
+    expire_in: 1 week
   script: 
-    - aws s3 sync node/target/$ARCH/release/ s3://$S3_BUCKET/$ARCH/ --exclude ".fingerprint/*"
+    - aws s3 sync node/target/$ARCH/release/ s3://$S3_BUCKET/$ARCH/$RELEASE/ --exclude ".fingerprint/*"
     - aws s3 sync dns_utility/target/$ARCH/release/  s3://$S3_BUCKET/$ARCH/$RELEASE/ --exclude ".fingerprint/*"
     - aws s3 sync port_exposer/target/$ARCH/release/  s3://$S3_BUCKET/$ARCH/$RELEASE/ --exclude ".fingerprint/*"
 
 
-x86_64-unknown-linux-gnu:
+x86_64-linux-gnu:build:
   image: rust:buster
   variables:
     ARCH: x86_64-unknown-linux-gnu
-  stage: x86_64-unknown-linux-gnu
+  stage: build
   before_script:
     - apt-get update 
     - apt-get upgrade -y
@@ -102,27 +113,29 @@ x86_64-unknown-linux-gnu:
     - cargo build --manifest-path=dns_utility/Cargo.toml --release 
     - cargo build --manifest-path=port_exposer/Cargo.toml --release 
 
-x86_64-unknown-linux-s3:
-  image: alpine:latest
-  stage: x86_64-unknown-linux-gnu
+x86_64-linux:s3:
+  stage: sync
   variables:
     ARCH: x86_64-unknown-linux-gnu
     RELEASE: latest
+  needs: ["x86_64-linux-gnu:build"]
   extends: .s3
 
-x86_64-unknown-linux-s3-stable:
-  image: alpine:latest
-  stage: x86_64-unknown-linux-gnu
+x86_64-linux-stable:s3:
+  stage: sync
   variables:
     ARCH: x86_64-unknown-linux-gnu
     RELEASE: stable
   only:
     - master
+  needs:
+    - job: x86_64-linux-gnu:build
+      artifacts: true
   extends: .s3
 
-x86_64-pc-windows-gnu:
+x86_64-windows:build:
   image: registry.gitlab.com/masq.ai/cross-builder/windows
-  stage: x86_64-pc-windows-gnu
+  stage: build
   services:
     - docker:18.09-dind
   variables:
@@ -141,27 +154,31 @@ x86_64-pc-windows-gnu:
    - pip3 install awscli
   extends: .build
 
-x86_64-pc-windows-s3:
-  image: alpine:latest
-  stage: x86_64-pc-windows-gnu
+x86_64-windows:s3:
+  stage: sync
   variables:
     ARCH: x86_64-pc-windows-gnu
     RELEASE: latest
+  needs:
+    - job: x86_64-windows:build
+      artifacts: true
   extends: .s3
 
-x86_64-pc-windows-s3-stable:
-  image: alpine:latest
-  stage: x86_64-pc-windows-gnu
+x86_64-windows-stable:s3:
+  stage: sync
   variables:
     ARCH: x86_64-pc-windows-gnu
     RELEASE: stable
+  needs:
+    - job: x86_64-windows:build
+      artifacts: true
   only:
     - master
   extends: .s3
 
-x86_64-apple-darwin:
+x86_64-apple:build:
   image: registry.gitlab.com/masq.ai/cross-builder/osx
-  stage: x86_64-apple-darwin
+  stage: build
   variables: 
     ARCH: x86_64-apple-darwin
     LIBZ_SYS_STATIC: 1
@@ -185,27 +202,31 @@ x86_64-apple-darwin:
     - make install
   extends: .build
 
-x86_64-apple-darwin-s3:
-  image: alpine:latest
-  stage: x86_64-apple-darwin
+x86_64-apple:s3:
+  stage: sync
   variables:
     ARCH: x86_64-apple-darwin
     RELEASE: latest
+  needs:
+    - job: x86_64-apple:build
+      artifacts: true
   extends: .s3
 
-x86_64-apple-darwin-s3-stable:
-  image: alpine:latest
-  stage: x86_64-apple-darwin
+x86_64-apple-stable:s3:
+  stage: sync
   variables:
     ARCH: x86_64-apple-darwin
     RELEASE: stable
+  needs:
+    - job: x86_64-apple:build
+      artifacts: true
   only:
     - master
   extends: .s3
 
-aarch64-apple-darwin:
+aarch64-apple:build:
   image: registry.gitlab.com/masq.ai/cross-builder/osx
-  stage: aarch64-apple-darwin
+  stage: build
   variables: 
     ARCH: aarch64-apple-darwin
     LIBZ_SYS_STATIC: 1
@@ -229,25 +250,31 @@ aarch64-apple-darwin:
     - make install
   extends: .build
 
-aarch64-apple-darwin-s3:
+aarch64-apple:s3:
   image: alpine:latest
-  stage: aarch64-apple-darwin
+  stage: sync
   variables:
     ARCH: aarch64-apple-darwin
     RELEASE: latest
+  needs:
+    - job: aarch64-apple:build
+      artifacts: true
   extends: .s3
 
-aarch64-apple-darwin-s3-stable:
+aarch64-apple-stable:s3:
   image: alpine:latest
-  stage: aarch64-apple-darwin
+  stage: sync
   variables:
     ARCH: aarch64-apple-darwin
     RELEASE: stable
+  needs:
+    - job: aarch64-apple:build
+      artifacts: true
   only:
     - master
   extends: .s3
 
-linux:
+cloud:
   stage: docker
   variables:
     BUILD_IMAGE: $CI_REGISTRY/$CI_REGISTRY_GROUP/$CI_REGISTRY_IMAGE:cloud

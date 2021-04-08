@@ -21,6 +21,7 @@ cache:
 
 stages:
   - build
+  - sync
   - docker-build
   - docker-push
   - security
@@ -73,9 +74,12 @@ stages:
     - cargo build --manifest-path=masq/Cargo.toml --release --target $ARCH
     - cargo build --manifest-path=dns_utility/Cargo.toml --release --target $ARCH 
     - cargo build --manifest-path=port_exposer/Cargo.toml --release --target $ARCH
+
+.s3:
+  script: 
     - aws s3 sync node/target/$ARCH/release/ s3://$S3_BUCKET/$ARCH/ --exclude ".fingerprint/*"
-    - aws s3 sync dns_utility/target/$ARCH/release/  s3://$S3_BUCKET/$ARCH/ --exclude ".fingerprint/*"
-    - aws s3 sync port_exposer/target/$ARCH/release/  s3://$S3_BUCKET/$ARCH/ --exclude ".fingerprint/*"
+    - aws s3 sync dns_utility/target/$ARCH/release/  s3://$S3_BUCKET/$ARCH/$RELEASE/ --exclude ".fingerprint/*"
+    - aws s3 sync port_exposer/target/$ARCH/release/  s3://$S3_BUCKET/$ARCH/$RELEASE/ --exclude ".fingerprint/*"
 
 
 x86_64-unknown-linux-gnu:
@@ -95,9 +99,24 @@ x86_64-unknown-linux-gnu:
     - cargo build --manifest-path=masq/Cargo.toml --release 
     - cargo build --manifest-path=dns_utility/Cargo.toml --release 
     - cargo build --manifest-path=port_exposer/Cargo.toml --release 
-    - aws s3 sync node/target/release/ s3://$S3_BUCKET/$ARCH/  --exclude ".fingerprint/*"
-    - aws s3 sync dns_utility/target/release/ s3://$S3_BUCKET/$ARCH/ --exclude ".fingerprint/*"
-    - aws s3 sync port_exposer/target/release/ s3://$S3_BUCKET/$ARCH/ --exclude ".fingerprint/*"
+
+x86_64-unknown-linux-s3:
+  image: alpine:latest
+  stage: sync
+  variables:
+    ARCH: x86_64-unknown-linux-gnu
+    RELEASE: latest
+  extends: .s3
+
+x86_64-unknown-linux-s3-stable:
+  image: alpine:latest
+  stage: sync
+  variables:
+    ARCH: x86_64-unknown-linux-gnu
+    RELEASE: stable
+  only:
+    - master
+  extends: .s3
 
 x86_64-pc-windows-gnu:
   image: registry.gitlab.com/masq.ai/cross-builder/windows
@@ -119,6 +138,24 @@ x86_64-pc-windows-gnu:
    - apk add python3 py3-pip zip
    - pip3 install awscli
   extends: .build
+
+x86_64-pc-windows-s3:
+  image: alpine:latest
+  stage: sync
+  variables:
+    ARCH: x86_64-pc-windows-gnu
+    RELEASE: latest
+  extends: .s3
+
+x86_64-pc-windows-s3-stable:
+  image: alpine:latest
+  stage: sync
+  variables:
+    ARCH: x86_64-pc-windows-gnu
+    RELEASE: stable
+  only:
+    - master
+  extends: .s3
 
 x86_64-apple-darwin:
   image: registry.gitlab.com/masq.ai/cross-builder/osx
@@ -146,6 +183,24 @@ x86_64-apple-darwin:
     - make install
   extends: .build
 
+x86_64-apple-darwin-s3:
+  image: alpine:latest
+  stage: sync
+  variables:
+    ARCH: x86_64-apple-darwin
+    RELEASE: latest
+  extends: .s3
+
+x86_64-apple-darwin-s3-stable:
+  image: alpine:latest
+  stage: sync
+  variables:
+    ARCH: x86_64-apple-darwin
+    RELEASE: stable
+  only:
+    - master
+  extends: .s3
+
 aarch64-apple-darwin:
   image: registry.gitlab.com/masq.ai/cross-builder/osx
   stage: build
@@ -171,6 +226,24 @@ aarch64-apple-darwin:
     - make -j4 && 
     - make install
   extends: .build
+
+aarch64-apple-darwin-s3:
+  image: alpine:latest
+  stage: sync
+  variables:
+    ARCH: aarch64-apple-darwin
+    RELEASE: latest
+  extends: .s3
+
+aarch64-apple-darwin-s3-stable:
+  image: alpine:latest
+  stage: sync
+  variables:
+    ARCH: aarch64-apple-darwin
+    RELEASE: stable
+  only:
+    - master
+  extends: .s3
 
 linux:
   stage: docker-build

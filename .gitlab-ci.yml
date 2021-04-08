@@ -20,7 +20,10 @@ cache:
     - port_exposer
 
 stages:
-  - build
+  - x86_64-unknown-linux-gnu
+  - x86_64-pc-windows-gnu
+  - x86_64-apple-darwin
+  - aarch64-apple-darwin
   - sync
   - docker-build
   - docker-push
@@ -86,7 +89,7 @@ x86_64-unknown-linux-gnu:
   image: rust:buster
   variables:
     ARCH: x86_64-unknown-linux-gnu
-  stage: build
+  stage: x86_64-unknown-linux-gnu
   before_script:
     - apt-get update 
     - apt-get upgrade -y
@@ -102,7 +105,7 @@ x86_64-unknown-linux-gnu:
 
 x86_64-unknown-linux-s3:
   image: alpine:latest
-  stage: sync
+  stage: x86_64-unknown-linux-gnu
   variables:
     ARCH: x86_64-unknown-linux-gnu
     RELEASE: latest
@@ -110,7 +113,7 @@ x86_64-unknown-linux-s3:
 
 x86_64-unknown-linux-s3-stable:
   image: alpine:latest
-  stage: sync
+  stage: x86_64-unknown-linux-gnu
   variables:
     ARCH: x86_64-unknown-linux-gnu
     RELEASE: stable
@@ -120,7 +123,7 @@ x86_64-unknown-linux-s3-stable:
 
 x86_64-pc-windows-gnu:
   image: registry.gitlab.com/masq.ai/cross-builder/windows
-  stage: build
+  stage: x86_64-pc-windows-gnu
   services:
     - docker:18.09-dind
   variables:
@@ -141,7 +144,7 @@ x86_64-pc-windows-gnu:
 
 x86_64-pc-windows-s3:
   image: alpine:latest
-  stage: sync
+  stage: x86_64-pc-windows-gnu
   variables:
     ARCH: x86_64-pc-windows-gnu
     RELEASE: latest
@@ -149,7 +152,7 @@ x86_64-pc-windows-s3:
 
 x86_64-pc-windows-s3-stable:
   image: alpine:latest
-  stage: sync
+  stage: x86_64-pc-windows-gnu
   variables:
     ARCH: x86_64-pc-windows-gnu
     RELEASE: stable
@@ -159,7 +162,7 @@ x86_64-pc-windows-s3-stable:
 
 x86_64-apple-darwin:
   image: registry.gitlab.com/masq.ai/cross-builder/osx
-  stage: build
+  stage: x86_64-apple-darwin
   variables: 
     ARCH: x86_64-apple-darwin
     LIBZ_SYS_STATIC: 1
@@ -185,7 +188,7 @@ x86_64-apple-darwin:
 
 x86_64-apple-darwin-s3:
   image: alpine:latest
-  stage: sync
+  stage: x86_64-apple-darwin
   variables:
     ARCH: x86_64-apple-darwin
     RELEASE: latest
@@ -193,7 +196,7 @@ x86_64-apple-darwin-s3:
 
 x86_64-apple-darwin-s3-stable:
   image: alpine:latest
-  stage: sync
+  stage: x86_64-apple-darwin
   variables:
     ARCH: x86_64-apple-darwin
     RELEASE: stable
@@ -203,7 +206,7 @@ x86_64-apple-darwin-s3-stable:
 
 aarch64-apple-darwin:
   image: registry.gitlab.com/masq.ai/cross-builder/osx
-  stage: build
+  stage: aarch64-apple-darwin
   variables: 
     ARCH: aarch64-apple-darwin
     LIBZ_SYS_STATIC: 1
@@ -229,7 +232,7 @@ aarch64-apple-darwin:
 
 aarch64-apple-darwin-s3:
   image: alpine:latest
-  stage: sync
+  stage: aarch64-apple-darwin
   variables:
     ARCH: aarch64-apple-darwin
     RELEASE: latest
@@ -237,7 +240,7 @@ aarch64-apple-darwin-s3:
 
 aarch64-apple-darwin-s3-stable:
   image: alpine:latest
-  stage: sync
+  stage: aarch64-apple-darwin
   variables:
     ARCH: aarch64-apple-darwin
     RELEASE: stable
@@ -246,7 +249,7 @@ aarch64-apple-darwin-s3-stable:
   extends: .s3
 
 linux:
-  stage: docker-build
+  stage: docker
   script:
     - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
     - docker build -t $IMAGE ./
@@ -254,7 +257,7 @@ linux:
   extends: .docker
 
 aws-ecr:
-  stage: docker-push
+  stage: docker
   variables:
     BUILD_IMAGE: $CI_REGISTRY/$CI_REGISTRY_GROUP/$CI_REGISTRY_IMAGE:cloud
   script:

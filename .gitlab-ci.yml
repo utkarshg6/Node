@@ -25,8 +25,7 @@ stages:
   - x86_64-apple-darwin
   - aarch64-apple-darwin
   - sync
-  - docker-build
-  - docker-push
+  - docker
   - security
 
 .docker:
@@ -250,55 +249,21 @@ aarch64-apple-darwin-s3-stable:
 
 linux:
   stage: docker
-  script:
-    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
-    - docker build -t $IMAGE ./
-    - docker push $IMAGE
-  extends: .docker
-
-aws-ecr:
-  stage: docker
   variables:
     BUILD_IMAGE: $CI_REGISTRY/$CI_REGISTRY_GROUP/$CI_REGISTRY_IMAGE:cloud
   script:
     - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
-    - docker pull $IMAGE 
+    - docker build -t $IMAGE ./
     - docker tag $IMAGE $BUILD_IMAGE
-    - docker push $BUILD_IMAGE
     - docker tag $BUILD_IMAGE $AWS_ECR_REPO:latest
+    - docker push $IMAGE
     - aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin $AWS_ECR_REPO
     - docker push $AWS_ECR_REPO
   extends: .docker
-  needs: 
-    - linux
 
 include:
   - template: SAST.gitlab-ci.yml
   - template: Container-Scanning.gitlab-ci.yml
-
-dep-scan-node: 
-  stage: security
-  variables: 
-    BUILD_DIR: $CI_PROJECT_DIR/node/
-  extends: .dependency
-
-dep-scan-masq:
-  stage: security
-  variables: 
-    BUILD_DIR: $CI_PROJECT_DIR/masq/
-  extends: .dependency
-
-dep-scan-dns_utility: 
-  stage: security
-  variables: 
-    BUILD_DIR: $CI_PROJECT_DIR/dns_utility/
-  extends: .dependency
-
-dep-scan-port_exposer: 
-  stage: security
-  variables: 
-    BUILD_DIR: $CI_PROJECT_DIR/port_exposer/
-  extends: .dependency
 
 sast:
   stage: security

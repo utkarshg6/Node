@@ -64,6 +64,8 @@ stages:
     paths: [gl-dependency-scanning-report.json]
 
 .build:
+  tags:
+    - docker
   artifacts:
     paths:
       - node
@@ -82,6 +84,8 @@ stages:
 
 .s3:
   image: alpine:latest
+  tags:
+    - docker
   artifacts:
     paths:
       - node
@@ -95,8 +99,10 @@ stages:
     - aws s3 sync port_exposer/target/$ARCH/release/  s3://$S3_BUCKET/Builds/$ARCH/$RELEASE/ --exclude ".fingerprint/*"
 
 
-x86_64-linux-gnu:build:
+x86_64-linux:build:
   image: rust:buster
+  tags:
+    - docker
   variables:
     ARCH: x86_64-unknown-linux-gnu
   stage: build
@@ -118,7 +124,7 @@ x86_64-linux:s3:
   variables:
     ARCH: x86_64-unknown-linux-gnu
     RELEASE: latest
-  needs: ["x86_64-linux-gnu:build"]
+  needs: ["x86_64-linux:build"]
   extends: .s3
 
 x86_64-linux-stable:s3:
@@ -129,7 +135,7 @@ x86_64-linux-stable:s3:
   only:
     - master
   needs:
-    - job: x86_64-linux-gnu:build
+    - job: x86_64-linux:build
       artifacts: true
   extends: .s3
 

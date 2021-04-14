@@ -1,5 +1,5 @@
 [registries]
-gitlab = { index = "https://gitlab-ci-token@gitlab.com/masq.ai/node-old/crates/registry" }
+gitlab = { index = "https://gitlab-ci-token@gitlab.com/masq.ai/Node/crates/registry" }
 [package]
 include = [
     "target/*/release/*",

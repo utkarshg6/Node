@@ -32,16 +32,16 @@ stages:
 
 include:
   - project: masq.ai/shared-ci
-    ref: develop
+    ref: master
     file: pipelines/rust/build.yml
   - project: masq.ai/shared-ci
-    ref: develop
+    ref: master
     file: pipelines/cross-compile/x86-64-darwin.yml
   - project: masq.ai/shared-ci
-    ref: develop
+    ref: master
     file: pipelines/cross-compile/x86-64-windows.yml
   - project: masq.ai/shared-ci
-    ref: develop
+    ref: master
     file: pipelines/docker/cloud.yml
   - template: SAST.gitlab-ci.yml
 

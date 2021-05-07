@@ -36,7 +36,10 @@ include:
     file: pipelines/rust/build.yml
   - project: masq.ai/shared-ci
     ref: develop
-    file: pipelines/cross-compile/aarch64-darwin.yml
+    file: pipelines/cross-compile/x86-64-darwin.yml
+  - project: masq.ai/shared-ci
+    ref: develop
+    file: pipelines/cross-compile/x86-64-windows.yml
   - project: masq.ai/shared-ci
     ref: develop
     file: pipelines/docker/cloud.yml

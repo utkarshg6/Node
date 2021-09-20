@@ -16,11 +16,11 @@ pub struct CheckPasswordCommand {
     pub db_password_opt: Option<String>,
 }
 
-pub fn check_password_subcommand() -> App<'static, 'static> {
-    SubCommand::with_name("check-password")
+pub fn check_password_subcommand() -> App<'static> {
+    SubCommand::new("check-password")
         .about("Checks whether the supplied db-password (if any) is the correct password for the Node's database")
-        .arg(Arg::with_name ("db-password")
-            .help ("Password to check--leave it out if you think the database doesn't have a password yet")
+        .arg(Arg::new ("db-password")
+            .about ("Password to check--leave it out if you think the database doesn't have a password yet")
             .index (1)
             .required (false)
             .case_insensitive(false)

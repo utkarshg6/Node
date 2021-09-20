@@ -12,11 +12,11 @@ pub struct CrashCommand {
     panic_message: String,
 }
 
-pub fn crash_subcommand() -> App<'static, 'static> {
-    SubCommand::with_name("crash")
+pub fn crash_subcommand() -> App<'static> {
+    SubCommand::new("crash")
         .about("Causes an element of the Node to crash with a specified message. Only valid if the Node has been started with '--crash-point message'")
-        .arg(Arg::with_name ("actor")
-            .help ("Name of actor inside the Node that should be made to crash")
+        .arg(Arg::new ("actor")
+            .about ("Name of actor inside the Node that should be made to crash")
             .index (1)
             .possible_values(&[
                 "BlockchainBridge",
@@ -32,8 +32,8 @@ pub fn crash_subcommand() -> App<'static, 'static> {
             ])
             .case_insensitive(true)
             .default_value("BlockchainBridge"))
-        .arg(Arg::with_name ("message")
-            .help ("Panic message that should be produced by the crash")
+        .arg(Arg::new ("message")
+            .about ("Panic message that should be produced by the crash")
             .index (2)
             .default_value("Intentional crash")
         )

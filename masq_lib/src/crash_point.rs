@@ -1,16 +1,14 @@
 // Copyright (c) 2017-2019, Substratum LLC (https://substratum.net) and/or its affiliates. All rights reserved.
 
-use clap::arg_enum;
+use clap::ArgEnum;
 
-arg_enum! {
-    #[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(ArgEnum, Debug, PartialEq, Clone, Copy)]
     pub enum CrashPoint {
         Message,
         Panic,
         Error,
         None,
     }
-}
 
 const NONE: usize = 0;
 const PANIC: usize = 1;

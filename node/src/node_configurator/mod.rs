@@ -67,13 +67,13 @@ pub const DB_PASSWORD_HELP: &str =
 // to from multiple places.
 
 //TODO this code (and the allied -- see thorough this file) is very likely to go away when GH-457 is played
-pub fn consuming_wallet_arg<'a>() -> Arg<'a, 'a> {
-    Arg::with_name("consuming-wallet")
+pub fn consuming_wallet_arg<'a>() -> Arg<'a> {
+    Arg::new("consuming-wallet")
         .long("consuming-wallet")
         .value_name("CONSUMING-WALLET")
         .empty_values(false)
         .validator(common_validators::validate_derivation_path)
-        .help(CONSUMING_WALLET_HELP)
+        .about(CONSUMING_WALLET_HELP)
 }
 
 pub fn earning_wallet_arg<F>(help: &str, validator: F) -> Arg
@@ -81,17 +81,17 @@ where
     F: 'static,
     F: Fn(String) -> Result<(), String>,
 {
-    Arg::with_name("earning-wallet")
+    Arg::new("earning-wallet")
         .long("earning-wallet")
         .value_name("EARNING-WALLET")
         .required(false)
         .takes_value(true)
         .validator(validator)
-        .help(help)
+        .about(help)
 }
 
-pub fn language_arg<'a>() -> Arg<'a, 'a> {
-    Arg::with_name("language")
+pub fn language_arg<'a>() -> Arg<'a> {
+    Arg::new("language")
         .alias("language")
         .long("language")
         .value_name("LANGUAGE")
@@ -99,18 +99,18 @@ pub fn language_arg<'a>() -> Arg<'a, 'a> {
         .case_insensitive(true)
         .possible_values(Bip39::possible_language_values().as_slice())
         .default_value(Bip39::name_from_language(Language::default()))
-        .help(LANGUAGE_HELP)
+        .about(LANGUAGE_HELP)
 }
 
-pub fn mnemonic_passphrase_arg<'a>() -> Arg<'a, 'a> {
-    Arg::with_name("mnemonic-passphrase")
+pub fn mnemonic_passphrase_arg<'a>() -> Arg<'a> {
+    Arg::new("mnemonic-passphrase")
         .long("mnemonic-passphrase")
         .value_name("MNEMONIC-PASSPHRASE")
         .required(false)
         .takes_value(true)
         .min_values(0)
         .max_values(1)
-        .help(MNEMONIC_PASSPHRASE_HELP)
+        .about(MNEMONIC_PASSPHRASE_HELP)
 }
 
 pub fn determine_config_file_path(

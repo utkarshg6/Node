@@ -41,16 +41,16 @@ pub fn app_head() -> App<'static, 'static> {
         .about("masq is a command-line user interface to the MASQ Daemon and the MASQ Node")
 }
 
-pub fn app() -> App<'static, 'static> {
+pub fn app() -> App<'static> {
     app_head()
         .arg(
-            Arg::with_name("ui-port")
+            Arg::new("ui-port")
                 .long("ui-port")
                 .value_name("UI-PORT")
                 .takes_value(true)
                 .default_value(DEFAULT_UI_PORT_STRING.as_str())
                 .validator(validate_ui_port)
-                .help(UI_PORT_HELP.as_str()),
+                .about(UI_PORT_HELP.as_str()),
         )
         .subcommand(change_password_subcommand())
         .subcommand(check_password_subcommand())

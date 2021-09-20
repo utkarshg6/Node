@@ -3,7 +3,7 @@
 use crate::shared_schema::{ConfiguratorError, ParamError};
 use crate::utils::WrapResult;
 #[allow(unused_imports)]
-use clap::{value_t, values_t};
+use clap::{Values, Error};
 use clap::{App, ArgMatches};
 use regex::Regex;
 use serde::export::Formatter;
@@ -26,6 +26,51 @@ macro_rules! value_m {
             Err(_) => None,
         }
     }};
+}
+
+#[macro_export]
+macro_rules! value_t {
+    ($m:ident, $v:expr, $t:ty) => {
+        value_t!($m.value_of($v), $t)
+    };
+    ($m:ident.value_of($v:expr), $t:ty) => {
+        if let Some(v) = $m.value_of($v) {
+            match v.parse::<$t>() {
+                Ok(val) => Ok(val),
+                Err(err) => Err(clap::ErrorKind::ValueValidation),
+            }
+        } else {
+            Err(clap::ErrorKind::ArgumentNotFound)
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! values_t {
+    ($m:ident, $v:expr, $t:ty) => {
+        values_t!($m.values_of($v), $t)
+    };
+    ($m:ident.values_of($v:expr), $t:ty) => {
+        if let Some(vals) = $m.values_of($v) {
+            let mut tmp = vec![];
+            let mut err = None;
+            for pv in vals {
+                match pv.parse::<$t>() {
+                    Ok(rv) => tmp.push(rv),
+                    Err(..) => {
+                        err = Some(::clap::ErrorKind::ValueValidation);
+                        break;
+                    }
+                }
+            }
+            match err {
+                Some(e) => Err(e),
+                None => Ok(tmp),
+            }
+        } else {
+            Err(::clap::ErrorKind::ArgumentNotFound)
+        }
+    };
 }
 
 #[macro_export]
@@ -53,26 +98,26 @@ macro_rules! values_m {
     }};
 }
 
-pub struct MultiConfig<'a> {
-    arg_matches: ArgMatches<'a>,
+pub struct MultiConfig {
+    arg_matches: ArgMatches,
 }
 
-impl<'a> Deref for MultiConfig<'a> {
-    type Target = ArgMatches<'a>;
+impl<'a> Deref for MultiConfig {
+    type Target = ArgMatches;
     fn deref(&self) -> &Self::Target {
         &self.arg_matches
     }
 }
 
-impl<'a> MultiConfig<'a> {
+impl<'a> MultiConfig {
     /// Create a new MultiConfig that can be passed into the value_m! and values_m! macros, containing
     /// several VirtualCommandLine objects in increasing priority order. That is, values found in
     /// VirtualCommandLine objects placed later in the list will override values found in
     /// VirtualCommandLine objects placed earlier.
     pub fn try_new(
-        schema: &App<'a, 'a>,
+        schema: &App<'a>,
         vcls: Vec<Box<dyn VirtualCommandLine>>,
-    ) -> Result<MultiConfig<'a>, ConfiguratorError> {
+    ) -> Result<MultiConfig, ConfiguratorError> {
         let initial: Box<dyn VirtualCommandLine> =
             Box::new(CommandLineVcl::new(vec![String::new()]));
         let merged: Box<dyn VirtualCommandLine> = vcls
@@ -80,11 +125,11 @@ impl<'a> MultiConfig<'a> {
             .fold(initial, |so_far, vcl| merge(so_far, vcl));
         let arg_matches = match schema
             .clone()
-            .get_matches_from_safe(merged.args().into_iter())
+            .get_matches_from(merged.args().into_iter())
         {
             Ok(matches) => matches,
             Err(e) => match e.kind {
-                clap::ErrorKind::HelpDisplayed | clap::ErrorKind::VersionDisplayed => {
+                clap::ErrorKind::DisplayHelp | clap::ErrorKind::DisplayVersion => {
                     unreachable!("The program's entry check failed to catch this.")
                 }
                 _ => return Err(Self::make_configurator_error(e)),
@@ -303,7 +348,7 @@ impl VirtualCommandLine for EnvironmentVcl {
 }
 
 impl EnvironmentVcl {
-    pub fn new<'a>(schema: &App<'a, 'a>) -> EnvironmentVcl {
+    pub fn new<'a>(schema: &App<'a>) -> EnvironmentVcl {
         let opt_names: HashSet<String> = schema
             .p
             .opts
@@ -468,8 +513,8 @@ fn append<T>(ts: Vec<T>, t: T) -> Vec<T> {
 }
 
 #[cfg(not(feature = "no_test_share"))]
-impl<'a> MultiConfig<'a> {
-    pub fn new_test_only(arg_matches: ArgMatches<'a>) -> Self {
+impl<'a> MultiConfig {
+    pub fn new_test_only(arg_matches: ArgMatches) -> Self {
         Self { arg_matches }
     }
 }
@@ -555,7 +600,8 @@ pub mod tests {
         let result = MultiConfig::make_configurator_error(clap::Error {
             message: "unfamiliar".to_string(),
             kind: clap::ErrorKind::InvalidValue,
-            info: None,
+            info: "unfamiliar".to_string(),
+            source: None
         });
 
         assert_eq!(
@@ -567,7 +613,7 @@ pub mod tests {
     #[test]
     fn double_provided_optional_single_valued_parameter_with_no_default_produces_second_value() {
         let schema = App::new("test").arg(
-            Arg::with_name("numeric-arg")
+            Arg::new("numeric-arg")
                 .long("numeric-arg")
                 .takes_value(true)
                 .required(false),
@@ -586,7 +632,7 @@ pub mod tests {
         ];
         let subject = MultiConfig::try_new(&schema, vcls).unwrap();
 
-        let result = value_m!(subject, "numeric-arg", u64);
+        let result = value_m!(subject, "numeric-arg".to_string(), u64);
 
         assert_eq!(Some(20), result);
     }
@@ -594,7 +640,7 @@ pub mod tests {
     #[test]
     fn first_provided_optional_single_valued_parameter_with_no_default_produces_provided_value() {
         let schema = App::new("test").arg(
-            Arg::with_name("numeric-arg")
+            Arg::new("numeric-arg")
                 .long("numeric-arg")
                 .takes_value(true)
                 .required(false),
@@ -609,7 +655,7 @@ pub mod tests {
         ];
         let subject = MultiConfig::try_new(&schema, vcls).unwrap();
 
-        let result = value_m!(subject, "numeric-arg", u64);
+        let result = value_m!(subject, "numeric-arg".to_string(), u64);
 
         assert_eq!(Some(20), result);
     }
@@ -617,7 +663,7 @@ pub mod tests {
     #[test]
     fn second_provided_optional_single_valued_parameter_with_no_default_produces_provided_value() {
         let schema = App::new("test").arg(
-            Arg::with_name("numeric-arg")
+            Arg::new("numeric-arg")
                 .long("numeric-arg")
                 .takes_value(true)
                 .required(false),
@@ -632,7 +678,7 @@ pub mod tests {
         ];
         let subject = MultiConfig::try_new(&schema, vcls).unwrap();
 
-        let result = value_m!(subject, "numeric-arg", u64);
+        let result = value_m!(subject, "numeric-arg".to_string(), u64);
 
         assert_eq!(Some(20), result);
     }
@@ -640,11 +686,11 @@ pub mod tests {
     #[test]
     fn double_provided_optional_multivalued_parameter_with_no_default_produces_second_value() {
         let schema = App::new("test").arg(
-            Arg::with_name("numeric-arg")
+            Arg::new("numeric-arg")
                 .long("numeric-arg")
                 .takes_value(true)
                 .required(false)
-                .multiple(true)
+                .multiple_values(true)
                 .use_delimiter(true),
         );
         let vcls: Vec<Box<dyn VirtualCommandLine>> = vec![
@@ -661,7 +707,7 @@ pub mod tests {
         ];
         let subject = MultiConfig::try_new(&schema, vcls).unwrap();
 
-        let result = values_m!(subject, "numeric-arg", u64);
+        let result = values_m!(subject, "numeric-arg".to_string(), u64);
 
         assert_eq!(vec![20, 21], result);
     }
@@ -669,11 +715,11 @@ pub mod tests {
     #[test]
     fn first_provided_optional_multivalued_parameter_with_no_default_produces_provided_value() {
         let schema = App::new("test").arg(
-            Arg::with_name("numeric-arg")
+            Arg::new("numeric-arg")
                 .long("numeric-arg")
                 .takes_value(true)
                 .required(false)
-                .multiple(true)
+                .multiple_values(true)
                 .use_delimiter(true),
         );
         let vcls: Vec<Box<dyn VirtualCommandLine>> = vec![
@@ -686,7 +732,7 @@ pub mod tests {
         ];
         let subject = MultiConfig::try_new(&schema, vcls).unwrap();
 
-        let result = values_m!(subject, "numeric-arg", u64);
+        let result = values_m!(subject, "numeric-arg".to_string(), u64);
 
         assert_eq!(vec![20, 21], result);
     }
@@ -694,11 +740,11 @@ pub mod tests {
     #[test]
     fn second_provided_optional_multivalued_parameter_with_no_default_produces_provided_value() {
         let schema = App::new("test").arg(
-            Arg::with_name("numeric-arg")
+            Arg::new("numeric-arg")
                 .long("numeric-arg")
                 .takes_value(true)
                 .required(false)
-                .multiple(true)
+                .multiple_values(true)
                 .use_delimiter(true),
         );
         let vcls: Vec<Box<dyn VirtualCommandLine>> = vec![
@@ -711,7 +757,7 @@ pub mod tests {
         ];
         let subject = MultiConfig::try_new(&schema, vcls).unwrap();
 
-        let result = values_m!(subject, "numeric-arg", u64);
+        let result = values_m!(subject, "numeric-arg".to_string(), u64);
 
         assert_eq!(vec![20, 21], result);
     }
@@ -719,7 +765,7 @@ pub mod tests {
     #[test]
     fn first_provided_required_single_valued_parameter_with_no_default_produces_provided_value() {
         let schema = App::new("test").arg(
-            Arg::with_name("numeric-arg")
+            Arg::new("numeric-arg")
                 .long("numeric-arg")
                 .takes_value(true)
                 .required(true),
@@ -734,7 +780,7 @@ pub mod tests {
         ];
         let subject = MultiConfig::try_new(&schema, vcls).unwrap();
 
-        let result = value_m!(subject, "numeric-arg", u64);
+        let result = value_m!(subject, "numeric-arg".to_string(), u64);
 
         assert_eq!(Some(20), result);
     }
@@ -742,7 +788,7 @@ pub mod tests {
     #[test]
     fn second_provided_required_single_valued_parameter_with_no_default_produces_provided_value() {
         let schema = App::new("test").arg(
-            Arg::with_name("numeric-arg")
+            Arg::new("numeric-arg")
                 .long("numeric-arg")
                 .takes_value(true)
                 .required(true),
@@ -757,7 +803,7 @@ pub mod tests {
         ];
         let subject = MultiConfig::try_new(&schema, vcls).unwrap();
 
-        let result = value_m!(subject, "numeric-arg", u64);
+        let result = value_m!(subject, "numeric-arg".to_string(), u64);
 
         assert_eq!(Some(20), result);
     }
@@ -766,7 +812,7 @@ pub mod tests {
     fn first_provided_required_single_valued_parameter_with_no_default_produces_provided_value_with_user_specified_flag(
     ) {
         let schema = App::new("test").arg(
-            Arg::with_name("numeric-arg")
+            Arg::new("numeric-arg")
                 .long("numeric-arg")
                 .takes_value(true)
                 .required(true),
@@ -781,7 +827,7 @@ pub mod tests {
         ];
         let subject = MultiConfig::try_new(&schema, vcls).unwrap();
 
-        let (result, user_specified) = value_user_specified_m!(subject, "numeric-arg", u64);
+        let (result, user_specified) = value_user_specified_m!(subject, "numeric-arg".to_string(), u64);
 
         assert_eq!(Some(20), result);
         assert!(user_specified);
@@ -791,7 +837,7 @@ pub mod tests {
     fn second_provided_required_single_valued_parameter_with_no_default_produces_provided_value_with_user_specified_flag(
     ) {
         let schema = App::new("test").arg(
-            Arg::with_name("numeric-arg")
+            Arg::new("numeric-arg")
                 .long("numeric-arg")
                 .takes_value(true)
                 .required(true),
@@ -806,7 +852,7 @@ pub mod tests {
         ];
         let subject = MultiConfig::try_new(&schema, vcls).unwrap();
 
-        let (result, user_specified) = value_user_specified_m!(subject, "numeric-arg", u64);
+        let (result, user_specified) = value_user_specified_m!(subject, "numeric-arg".to_string(), u64);
 
         assert_eq!(Some(20), result);
         assert!(user_specified);
@@ -817,14 +863,14 @@ pub mod tests {
     ) {
         let schema = App::new("test")
             .arg(
-                Arg::with_name("numeric-arg")
+                Arg::new("numeric-arg")
                     .long("numeric-arg")
                     .takes_value(true)
                     .required(false)
                     .default_value("20"),
             )
             .arg(
-                Arg::with_name("missing-arg")
+                Arg::new("missing-arg")
                     .long("missing-arg")
                     .takes_value(true)
                     .required(false)
@@ -838,9 +884,9 @@ pub mod tests {
         let subject = MultiConfig::try_new(&schema, vcls).unwrap();
 
         let (numeric_arg_result, user_specified_numeric) =
-            value_user_specified_m!(subject, "numeric-arg", u64);
+            value_user_specified_m!(subject, "numeric-arg".to_string(), u64);
         let (missing_arg_result, user_specified_missing) =
-            value_user_specified_m!(subject, "missing-arg", u64);
+            value_user_specified_m!(subject, "missing-arg".to_string(), u64);
 
         assert_eq!(Some(20), numeric_arg_result);
         assert!(user_specified_numeric);
@@ -852,7 +898,7 @@ pub mod tests {
     #[test]
     fn existing_nonvalued_parameter_overrides_nonexistent_nonvalued_parameter() {
         let schema = App::new("test").arg(
-            Arg::with_name("nonvalued")
+            Arg::new("nonvalued")
                 .long("nonvalued")
                 .takes_value(false),
         );
@@ -874,13 +920,13 @@ pub mod tests {
     fn clap_match_error_produces_panic() {
         let schema = App::new("test")
             .arg(
-                Arg::with_name("numeric-arg")
+                Arg::new("numeric-arg")
                     .long("numeric-arg")
                     .takes_value(true)
                     .required(true),
             )
             .arg(
-                Arg::with_name("another-arg")
+                Arg::new("another-arg")
                     .long("another-arg")
                     .takes_value(true)
                     .required(true),
@@ -943,7 +989,7 @@ pub mod tests {
     fn environment_vcl_works() {
         let _guard = EnvironmentGuard::new();
         let schema = App::new("test").arg(
-            Arg::with_name("numeric-arg")
+            Arg::new("numeric-arg")
                 .long("numeric-arg")
                 .takes_value(true),
         );

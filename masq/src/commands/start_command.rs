@@ -10,8 +10,8 @@ use std::fmt::Debug;
 
 const START_COMMAND_TIMEOUT_MILLIS: u64 = 5000;
 
-pub fn start_subcommand() -> App<'static, 'static> {
-    SubCommand::with_name("start")
+pub fn start_subcommand() -> App<'static> {
+    SubCommand::new("start")
         .about("Starts a MASQNode with the parameters that have been established by 'setup.' Only valid if Node is not already running.")
 }
 

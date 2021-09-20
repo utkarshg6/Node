@@ -29,11 +29,11 @@ impl WalletAddressesCommand {
         })
     }
 }
-pub fn wallet_addresses_subcommand() -> App<'static, 'static> {
-    SubCommand::with_name("wallet-addresses")
+pub fn wallet_addresses_subcommand() -> App<'static> {
+    SubCommand::new("wallet-addresses")
         .about("Provides addresses of consuming and earning wallets. Only valid if the wallets were successfully generated (generate-wallets) or recovered (recover-wallets)")
-        .arg(Arg::with_name ("db-password")
-            .help ("The current database password (a password must be set to use this command)")
+        .arg(Arg::new ("db-password")
+            .about ("The current database password (a password must be set to use this command)")
             .value_name("DB-PASSWORD")
             .required (true)
             .case_insensitive(false)

@@ -20,12 +20,12 @@ pub struct ConfigurationCommand {
     pub db_password: Option<String>,
 }
 
-pub fn configuration_subcommand() -> App<'static, 'static> {
-    SubCommand::with_name("configuration")
+pub fn configuration_subcommand() -> App<'static> {
+    SubCommand::new("configuration")
         .about("Displays a running Node's current configuration.")
         .arg(
-            Arg::with_name("db-password")
-                .help("Password of the database from which the configuration will be read")
+            Arg::new("db-password")
+                .about("Password of the database from which the configuration will be read")
                 .index(1)
                 .required(false),
         )

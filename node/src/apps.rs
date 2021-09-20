@@ -22,30 +22,30 @@ pub fn app_head() -> App<'static, 'static> {
         .about(crate_description!())
 }
 
-pub fn app_daemon() -> App<'static, 'static> {
+pub fn app_daemon() -> App<'static> {
     app_head()
         .arg(
-            Arg::with_name("initialization")
+            Arg::new("initialization")
                 .long("initialization")
                 .required(true)
                 .takes_value(false)
-                .help("Directs MASQ to start the Daemon that controls the Node, rather than the Node itself"),
+                .about("Directs MASQ to start the Daemon that controls the Node, rather than the Node itself"),
         )
         .arg(ui_port_arg(&DAEMON_UI_PORT_HELP))
 }
 
-pub fn app_node() -> App<'static, 'static> {
+pub fn app_node() -> App<'static> {
     shared_app(app_head().after_help(NODE_HELP_TEXT)).arg(ui_port_arg(&DAEMON_UI_PORT_HELP))
 }
 
-pub fn app_config_dumper() -> App<'static, 'static> {
+pub fn app_config_dumper() -> App<'static> {
     app_head()
         .arg(
-            Arg::with_name("dump-config")
+            Arg::new("dump-config")
                 .long("dump-config")
                 .required(true)
                 .takes_value(false)
-                .help(DUMP_CONFIG_HELP),
+                .about(DUMP_CONFIG_HELP),
         )
         .arg(chain_arg())
         .arg(data_directory_arg())

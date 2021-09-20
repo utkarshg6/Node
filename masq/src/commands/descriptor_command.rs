@@ -14,8 +14,8 @@ use std::fmt::Debug;
 #[derive(Debug)]
 pub struct DescriptorCommand {}
 
-pub fn descriptor_subcommand() -> App<'static, 'static> {
-    SubCommand::with_name("descriptor")
+pub fn descriptor_subcommand() -> App<'static> {
+    SubCommand::new("descriptor")
         .about("Displays the Node descriptor of the running MASQNode. Only valid if Node is already running.")
 }
 

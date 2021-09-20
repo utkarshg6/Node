@@ -59,12 +59,12 @@ impl Command for SetConfigurationCommand {
     as_any_impl!();
 }
 
-pub fn set_configuration_subcommand() -> App<'static, 'static> {
-    SubCommand::with_name("set-configuration")
+pub fn set_configuration_subcommand() -> App<'static> {
+    SubCommand::new("set-configuration")
         .about("Sets Node configuration parameters being enabled for this operation when the Node is running")
         .arg(
-            Arg::with_name("gas-price")
-                .help(&GAS_PRICE_HELP)
+            Arg::new("gas-price")
+                .about(&GAS_PRICE_HELP)
                 .long("gas-price")
                 .value_name("GAS-PRICE")
                 .takes_value(true)
@@ -73,8 +73,8 @@ pub fn set_configuration_subcommand() -> App<'static, 'static> {
 
         )
         .arg(
-            Arg::with_name("start-block")
-                .help("Ordinal number of the Ethereum block where scanning for transactions will start.")
+            Arg::new("start-block")
+                .about("Ordinal number of the Ethereum block where scanning for transactions will start.")
                 .long("start-block")
                 .value_name("START-BLOCK")
                 .takes_value(true)
@@ -82,7 +82,7 @@ pub fn set_configuration_subcommand() -> App<'static, 'static> {
                 .validator(validate_start_block)
         )
         .group (
-        ArgGroup::with_name("parameter")
+        ArgGroup::new("parameter")
             .args( &["gas-price","start-block"] )
             .required (true)
             )

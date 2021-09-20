@@ -111,46 +111,46 @@ lazy_static! {
 
 // These Args are needed in more than one clap schema. To avoid code duplication, they're defined here and referred
 // to from multiple places.
-pub fn config_file_arg<'a>() -> Arg<'a, 'a> {
-    Arg::with_name("config-file")
+pub fn config_file_arg<'a>() -> Arg<'a> {
+    Arg::new("config-file")
         .long("config-file")
         .value_name("FILE-PATH")
         .default_value("config.toml")
         .min_values(0)
         .max_values(1)
         .required(false)
-        .help(CONFIG_FILE_HELP)
+        .about(CONFIG_FILE_HELP)
 }
 
-pub fn data_directory_arg<'a>() -> Arg<'a, 'a> {
-    Arg::with_name("data-directory")
+pub fn data_directory_arg<'a>() -> Arg<'a> {
+    Arg::new("data-directory")
         .long("data-directory")
         .value_name("DATA-DIRECTORY")
         .required(false)
         .min_values(0)
         .max_values(1)
-        .empty_values(false)
-        .help(DATA_DIRECTORY_HELP)
+        .forbid_empty_values(true)
+        .about(DATA_DIRECTORY_HELP)
 }
 
-pub fn chain_arg<'a>() -> Arg<'a, 'a> {
-    Arg::with_name("chain")
+pub fn chain_arg<'a>() -> Arg<'a> {
+    Arg::new("chain")
         .long("chain")
         .value_name("CHAIN")
         .min_values(0)
         .max_values(1)
         .possible_values(&["dev", DEFAULT_CHAIN_NAME, "ropsten", "rinkeby"])
-        .help(CHAIN_HELP)
+        .about(CHAIN_HELP)
 }
 
 pub fn db_password_arg(help: &str) -> Arg {
-    Arg::with_name("db-password")
+    Arg::new("db-password")
         .long("db-password")
         .value_name("DB-PASSWORD")
         .required(false)
         .min_values(0)
         .max_values(1)
-        .help(help)
+        .about(help)
 }
 
 pub fn earning_wallet_arg<F>(help: &str, validator: F) -> Arg
@@ -158,31 +158,31 @@ where
     F: 'static,
     F: Fn(String) -> Result<(), String>,
 {
-    Arg::with_name("earning-wallet")
+    Arg::new("earning-wallet")
         .long("earning-wallet")
         .value_name("EARNING-WALLET")
         .required(false)
         .min_values(0)
         .max_values(1)
         .validator(validator)
-        .help(help)
+        .about(help)
 }
 
 #[cfg(not(target_os = "windows"))]
 pub fn real_user_arg<'a>() -> Arg<'a, 'a> {
-    Arg::with_name("real-user")
+    Arg::new("real-user")
         .long("real-user")
         .value_name("REAL-USER")
         .required(false)
         .min_values(0)
         .max_values(1)
         .validator(common_validators::validate_real_user)
-        .help(REAL_USER_HELP)
+        .about(REAL_USER_HELP)
 }
 
 #[cfg(target_os = "windows")]
-pub fn real_user_arg<'a>() -> Arg<'a, 'a> {
-    Arg::with_name("real-user")
+pub fn real_user_arg<'a>() -> Arg<'a> {
+    Arg::new("real-user")
         .long("real-user")
         .value_name("REAL-USER")
         .required(false)
@@ -192,65 +192,65 @@ pub fn real_user_arg<'a>() -> Arg<'a, 'a> {
 }
 
 pub fn ui_port_arg(help: &str) -> Arg {
-    Arg::with_name("ui-port")
+    Arg::new("ui-port")
         .long("ui-port")
         .value_name("UI-PORT")
         .takes_value(true)
         .default_value(&DEFAULT_UI_PORT_VALUE)
         .validator(common_validators::validate_ui_port)
-        .help(help)
+        .about(help)
 }
 
 //TODO resolve this discrepancy: shared_app is in fact not used anywhere but in the crate of the node so the name may lack sense
-pub fn shared_app(head: App<'static, 'static>) -> App<'static, 'static> {
+pub fn shared_app(head: App<'static>) -> App<'static> {
     head.arg(
-        Arg::with_name("blockchain-service-url")
+        Arg::new("blockchain-service-url")
             .long("blockchain-service-url")
-            .empty_values(false)
+            .forbid_empty_values(true)
             .value_name("URL")
             .min_values(0)
             .max_values(1)
-            .help(BLOCKCHAIN_SERVICE_HELP),
+            .about(BLOCKCHAIN_SERVICE_HELP),
     )
     .arg(
-        Arg::with_name("clandestine-port")
+        Arg::new("clandestine-port")
             .long("clandestine-port")
             .value_name("CLANDESTINE-PORT")
-            .empty_values(false)
+            .forbid_empty_values(true)
             .min_values(0)
             .validator(common_validators::validate_clandestine_port)
-            .help(&CLANDESTINE_PORT_HELP),
+            .about(&CLANDESTINE_PORT_HELP),
     )
     .arg(config_file_arg())
     .arg(
-        Arg::with_name("consuming-private-key")
+        Arg::new("consuming-private-key")
             .long("consuming-private-key")
             .value_name("PRIVATE-KEY")
             .min_values(0)
             .max_values(1)
             .validator(common_validators::validate_private_key)
-            .help(CONSUMING_PRIVATE_KEY_HELP),
+            .about(CONSUMING_PRIVATE_KEY_HELP),
     )
     .arg(
-        Arg::with_name("crash-point")
+        Arg::new("crash-point")
             .long("crash-point")
             .value_name("CRASH-POINT")
             .min_values(0)
             .max_values(1)
-            .possible_values(&CrashPoint::variants())
+            .possible_values(&CrashPoint::varients())
             .case_insensitive(true)
             .hidden(true),
     )
     .arg(data_directory_arg())
     .arg(db_password_arg(DB_PASSWORD_HELP))
     .arg(
-        Arg::with_name("dns-servers")
+        Arg::new("dns-servers")
             .long("dns-servers")
             .value_name("DNS-SERVERS")
             .min_values(0)
             .max_values(1)
             .validator(common_validators::validate_ip_addresses)
-            .help(DNS_SERVERS_HELP),
+            .about(DNS_SERVERS_HELP),
     )
     .arg(earning_wallet_arg(
         EARNING_WALLET_HELP,
@@ -258,7 +258,7 @@ pub fn shared_app(head: App<'static, 'static>) -> App<'static, 'static> {
     ))
     .arg(chain_arg())
     .arg(
-        Arg::with_name("fake-public-key")
+        Arg::new("fake-public-key")
             .long("fake-public-key")
             .value_name("FAKE-PUBLIC-KEY")
             .min_values(0)
@@ -266,49 +266,49 @@ pub fn shared_app(head: App<'static, 'static>) -> App<'static, 'static> {
             .hidden(true),
     )
     .arg(
-        Arg::with_name("gas-price")
+        Arg::new("gas-price")
             .long("gas-price")
             .value_name("GAS-PRICE")
             .min_values(0)
             .max_values(1)
             .validator(common_validators::validate_gas_price)
-            .help(&GAS_PRICE_HELP),
+            .about(&GAS_PRICE_HELP),
     )
     .arg(
-        Arg::with_name("ip")
+        Arg::new("ip")
             .long("ip")
             .value_name("IP")
             .min_values(0)
             .max_values(1)
             .validator(common_validators::validate_ip_address)
-            .help(IP_ADDRESS_HELP),
+            .about(IP_ADDRESS_HELP),
     )
     .arg(
-        Arg::with_name("log-level")
+        Arg::new("log-level")
             .long("log-level")
             .value_name("FILTER")
             .min_values(0)
             .max_values(1)
             .possible_values(&["off", "error", "warn", "info", "debug", "trace"])
             .case_insensitive(true)
-            .help(LOG_LEVEL_HELP),
+            .about(LOG_LEVEL_HELP),
     )
     .arg(
-        Arg::with_name("neighborhood-mode")
+        Arg::new("neighborhood-mode")
             .long("neighborhood-mode")
             .value_name("NEIGHBORHOOD-MODE")
             .min_values(0)
             .max_values(1)
             .possible_values(&["zero-hop", "originate-only", "consume-only", "standard"])
             .case_insensitive(true)
-            .help(NEIGHBORHOOD_MODE_HELP),
+            .about(NEIGHBORHOOD_MODE_HELP),
     )
     .arg(
-        Arg::with_name("neighbors")
+        Arg::new("neighbors")
             .long("neighbors")
             .value_name("NODE-DESCRIPTORS")
             .min_values(0)
-            .help(NEIGHBORS_HELP),
+            .about(NEIGHBORS_HELP),
     )
     .arg(real_user_arg())
 }

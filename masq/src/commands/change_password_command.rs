@@ -78,20 +78,20 @@ impl Command for ChangePasswordCommand {
     as_any_impl!();
 }
 
-pub fn change_password_subcommand() -> App<'static, 'static> {
-    SubCommand::with_name("change-password")
+pub fn change_password_subcommand() -> App<'static> {
+    SubCommand::new("change-password")
         .about("Changes the existing password on the Node database")
         .arg(
-            Arg::with_name("old-db-password")
-                .help("The existing password")
+            Arg::new("old-db-password")
+                .about("The existing password")
                 .value_name("OLD-DB-PASSWORD")
                 .index(1)
                 .required(true)
                 .case_insensitive(false),
         )
         .arg(
-            Arg::with_name("new-db-password")
-                .help("The new password to set")
+            Arg::new("new-db-password")
+                .about("The new password to set")
                 .value_name("NEW-DB-PASSWORD")
                 .index(2)
                 .required(true)
@@ -99,12 +99,12 @@ pub fn change_password_subcommand() -> App<'static, 'static> {
         )
 }
 
-pub fn set_password_subcommand() -> App<'static, 'static> {
-    SubCommand::with_name("set-password")
+pub fn set_password_subcommand() -> App<'static> {
+    SubCommand::new("set-password")
         .about("Sets an initial password on the Node database")
         .arg(
-            Arg::with_name("new-db-password")
-                .help("Password to be set; must not already exist")
+            Arg::new("new-db-password")
+                .about("Password to be set; must not already exist")
                 .index(1)
                 .required(true)
                 .case_insensitive(false),

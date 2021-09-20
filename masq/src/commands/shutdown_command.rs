@@ -28,8 +28,8 @@ pub struct ShutdownCommand {
     attempt_limit: u64,
 }
 
-pub fn shutdown_subcommand() -> App<'static, 'static> {
-    SubCommand::with_name("shutdown")
+pub fn shutdown_subcommand() -> App<'static> {
+    SubCommand::new("shutdown")
         .about("Shuts down the running MASQNode. Only valid if Node is already running.")
 }
 

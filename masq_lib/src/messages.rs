@@ -508,11 +508,11 @@ pub struct UiReceivableAccount {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 pub struct UiFinancialsRequest {
     #[serde(rename = "payableMinimumAmount")]
-    pub payable_minimum_amount: u64,
+    pub payable_minimum_amount: u128,
     #[serde(rename = "payableMaximumAge")]
     pub payable_maximum_age: u64,
     #[serde(rename = "receivableMinimumAmount")]
-    pub receivable_minimum_amount: u64,
+    pub receivable_minimum_amount: i128,
     #[serde(rename = "receivableMaximumAge")]
     pub receivable_maximum_age: u64,
 }
@@ -522,10 +522,10 @@ conversation_message!(UiFinancialsRequest, "financials");
 pub struct UiFinancialsResponse {
     pub payables: Vec<UiPayableAccount>,
     #[serde(rename = "totalPayable")]
-    pub total_payable: u64,
+    pub total_payable: i128,
     pub receivables: Vec<UiReceivableAccount>,
     #[serde(rename = "totalReceivable")]
-    pub total_receivable: u64,
+    pub total_receivable: i128,
 }
 conversation_message!(UiFinancialsResponse, "financials");
 

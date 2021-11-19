@@ -14,6 +14,8 @@ use web3::contract::{Contract, Options};
 use web3::transports::EventLoopHandle;
 use web3::types::{Address, BlockNumber, Bytes, FilterBuilder, Log, H256, U256};
 use web3::{Transport, Web3};
+use masq_lib::utils::ExpectValue;
+use crate::accountant::to_wei_in_i128;
 
 pub const REQUESTS_IN_PARALLEL: usize = 1;
 
@@ -33,7 +35,7 @@ const TRANSFER_METHOD_ID: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
 pub struct Transaction {
     pub block_number: u64,
     pub from: Wallet,
-    pub gwei_amount: u64,
+    pub gwei_amount: u128,
 }
 
 impl fmt::Display for Transaction {
@@ -75,7 +77,7 @@ pub trait BlockchainInterface {
         &self,
         consuming_wallet: &Wallet,
         recipient: &Wallet,
-        amount: u64,
+        amount: u128,
         nonce: U256,
         gas_price: u64,
     ) -> BlockchainResult<H256>;
@@ -130,7 +132,7 @@ impl BlockchainInterface for BlockchainInterfaceClandestine {
         &self,
         _consuming_wallet: &Wallet,
         _recipient: &Wallet,
-        _amount: u64,
+        _amount: u128,
         _nonce: U256,
         _gas_price: u64,
     ) -> BlockchainResult<H256> {
@@ -169,8 +171,8 @@ pub fn to_gwei(wei: U256) -> Option<u64> {
     u64::try_from(wei / GWEI).ok()
 }
 
-pub fn to_wei(gwub: u64) -> U256 {
-    let subgwei = U256::from(gwub);
+pub fn to_wei(gwei: u128) -> U256 {
+    let subgwei = U256::from(gwei);
     subgwei.full_mul(GWEI).try_into().expect("Internal Error")
 }
 
@@ -220,8 +222,8 @@ where
                                 .filter_map(|log: &Log| match log.block_number {
                                     Some(block_number) => {
                                         let amount: U256 = U256::from(log.data.0.as_slice());
-                                        let gwei_amount = to_gwei(amount);
-                                        gwei_amount.map(|gwei_amount| Transaction {
+                                        let wei_amount = u128::try_from(amount / GWEI).ok();
+                                        wei_amount.map(|gwei_amount| Transaction {
                                             block_number: u64::try_from(block_number)
                                                 .expect("Internal Error"), // TODO: back to testing for overflow
                                             from: Wallet::from(log.topics[1]),
@@ -245,7 +247,7 @@ where
         &self,
         consuming_wallet: &Wallet,
         recipient: &Wallet,
-        amount: u64,
+        amount: u128,
         nonce: U256,
         gas_price: u64,
     ) -> BlockchainResult<H256> {
@@ -273,7 +275,7 @@ where
         )
         .expect("Internal error");
         let gas_price = serde_json::from_value::<ethereum_types::U256>(
-            serde_json::to_value(to_wei(gas_price)).expect("Internal error"),
+            serde_json::to_value(to_wei(gas_price as u128)).expect("Internal error"),
         )
         .expect("Internal error");
 
@@ -478,7 +480,7 @@ mod tests {
             vec![Transaction {
                 block_number: 4_974_179u64,
                 from: Wallet::from_str("0x3f69f9efd4f2592fd70be8c32ecd9dce71c472fc").unwrap(),
-                gwei_amount: 4_503_599u64,
+                gwei_amount: 4_503_599_u128,
             }]
         )
     }
@@ -890,11 +892,11 @@ mod tests {
 
     #[test]
     fn to_wei_converts_units_properly_for_max_value() {
-        let converted_wei = to_wei(u64::MAX);
+        let converted_wei = to_wei(u128::MAX);
 
         assert_eq!(
             converted_wei,
-            U256::from_dec_str(format!("{}000000000", u64::MAX).as_str()).unwrap()
+            U256::from_dec_str(format!("{}000000000", u128::MAX).as_str()).unwrap()
         );
     }
 

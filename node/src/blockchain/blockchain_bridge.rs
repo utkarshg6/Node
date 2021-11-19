@@ -22,6 +22,7 @@ use masq_lib::crash_point::CrashPoint;
 use masq_lib::messages::{FromMessageBody, UiCrashRequest};
 use masq_lib::ui_gateway::NodeFromUiMessage;
 use std::convert::TryFrom;
+use crate::accountant::{i128_to_unsigned, u128_to_signed};
 
 pub const CRASH_KEY: &str = "BLOCKCHAINBRIDGE";
 
@@ -170,7 +171,7 @@ impl BlockchainBridge {
                     .get_transaction_count(consuming_wallet)
                 {
                     Ok(nonce) => {
-                        let amount = u64::try_from(payable.balance).unwrap_or_else(|_| {
+                        let amount = i128_to_unsigned(payable.balance).unwrap_or_else(|_| {
                             panic!("Lost payable amount precision: {}", payable.balance)
                         });
                         match self.blockchain_interface.send_transaction(
@@ -283,7 +284,7 @@ mod tests {
     struct BlockchainInterfaceMock {
         pub retrieve_transactions_parameters: Arc<Mutex<Vec<(u64, Wallet)>>>,
         pub retrieve_transactions_results: RefCell<Vec<BlockchainResult<Vec<Transaction>>>>,
-        pub send_transaction_parameters: Arc<Mutex<Vec<(Wallet, Wallet, u64, U256, u64)>>>,
+        pub send_transaction_parameters: Arc<Mutex<Vec<(Wallet, Wallet, u128, U256, u64)>>>,
         pub send_transaction_results: RefCell<Vec<BlockchainResult<H256>>>,
         pub contract_address_results: RefCell<Vec<Address>>,
         pub get_transaction_count_parameters: Arc<Mutex<Vec<Wallet>>>,
@@ -332,7 +333,7 @@ mod tests {
             &self,
             consuming_wallet: &Wallet,
             recipient: &Wallet,
-            amount: u64,
+            amount: u128,
             nonce: U256,
             gas_price: u64,
         ) -> BlockchainResult<H256> {

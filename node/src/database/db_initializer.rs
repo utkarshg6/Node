@@ -154,12 +154,12 @@ impl DbInitializerReal {
                 value text,
                 encrypted integer not null
             )",
-            NO_PARAMS,
+            [],
         )
         .expect("Can't create config table");
         conn.execute(
             "create unique index if not exists idx_config_name on config (name)",
-            NO_PARAMS,
+            [],
         )
         .expect("Can't create config name index");
     }
@@ -241,12 +241,12 @@ impl DbInitializerReal {
                 last_paid_timestamp integer not null,
                 pending_payment_transaction text null
             )",
-            NO_PARAMS,
+            [],
         )
         .expect("Can't create payable table");
         conn.execute(
             "create unique index if not exists idx_payable_wallet_address on payable (wallet_address)",
-            NO_PARAMS,
+            [],
         )
         .expect("Can't create payable wallet_address index");
     }
@@ -258,12 +258,12 @@ impl DbInitializerReal {
                 balance integer not null,
                 last_received_timestamp integer not null
             )",
-            NO_PARAMS,
+            [],
         )
         .expect("Can't create receivable table");
         conn.execute(
             "create unique index if not exists idx_receivable_wallet_address on receivable (wallet_address)",
-            NO_PARAMS,
+            [],
         )
         .expect("Can't create receivable wallet_address index");
     }
@@ -271,19 +271,19 @@ impl DbInitializerReal {
     fn create_banned_table(&self, conn: &Connection) {
         conn.execute(
             "create table banned ( wallet_address text primary key )",
-            NO_PARAMS,
+            [],
         )
         .expect("Can't create banned table");
         conn.execute(
             "create unique index idx_banned_wallet_address on banned (wallet_address)",
-            NO_PARAMS,
+            [],
         )
         .expect("Can't create banned wallet_address index");
     }
 
     fn extract_configurations(&self, conn: &Connection) -> HashMap<String, Option<String>> {
         let mut stmt = conn.prepare("select name, value from config").unwrap();
-        let query_result = stmt.query_map(NO_PARAMS, |row| Ok((row.get(0), row.get(1))));
+        let query_result = stmt.query_map([], |row| Ok((row.get(0), row.get(1))));
         match query_result {
             Ok(rows) => rows,
             Err(e) => panic!("Error retrieving configuration: {}", e),

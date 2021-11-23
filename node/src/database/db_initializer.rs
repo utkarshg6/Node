@@ -237,7 +237,7 @@ impl DbInitializerReal {
         conn.execute(
             "create table if not exists payable (
                 wallet_address text primary key,
-                balance integer not null,
+                balance blob not null,
                 last_paid_timestamp integer not null,
                 pending_payment_transaction text null
             )",
@@ -255,7 +255,7 @@ impl DbInitializerReal {
         conn.execute(
             "create table if not exists receivable (
                 wallet_address text primary key,
-                balance integer not null,
+                balance blob not null,
                 last_received_timestamp integer not null
             )",
             [],

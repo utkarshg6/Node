@@ -1,14 +1,14 @@
 // Copyright (c) 2019, MASQ (https://masq.ai) and/or its affiliates. All rights reserved.
 
+pub mod dao_shared_methods;
 pub mod payable_dao;
 pub mod receivable_dao;
 
 #[cfg(test)]
 pub mod test_utils;
 
-use std::fmt::{Display, Formatter};
 use crate::accountant::payable_dao::{PayableAccount, PayableDaoFactory, Payment};
-use crate::accountant::receivable_dao::{ReceivableAccount, ReceivableDaoFactory};
+use crate::accountant::receivable_dao::{ReceivableAccount, ReceivableDaoFactory, ReceivableError};
 use crate::banned_dao::{BannedDao, BannedDaoFactory};
 use crate::blockchain::blockchain_bridge::RetrieveTransactions;
 use crate::blockchain::blockchain_interface::{BlockchainError, Transaction};
@@ -45,6 +45,8 @@ use masq_lib::ui_gateway::MessageTarget::ClientId;
 use masq_lib::ui_gateway::{NodeFromUiMessage, NodeToUiMessage};
 use payable_dao::PayableDao;
 use receivable_dao::ReceivableDao;
+use rusqlite::types::Value;
+use std::fmt::{Display, Formatter};
 use std::ops::Add;
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -68,38 +70,38 @@ lazy_static! {
     };
 }
 
-#[derive(PartialEq, Debug, Clone)]
-pub enum AccountantError{
-PayableError(PayableError),
-//ReceivableError
-//PaymentCurvesError
-RecordServicesOverflow(SignConversionError)
+#[derive(PartialEq, Debug)]
+pub enum AccountantError {
+    PayableError(PayableError),
+    ReceivableError(ReceivableError),
+    //PaymentCurvesError
+    RecordServiceDataOverflow(SignConversionError),
 }
 
-impl Display for AccountantError{
+impl Display for AccountantError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         todo!()
     }
 }
 
-#[derive(PartialEq, Debug, Clone)]
-pub enum PayableError{
+#[derive(PartialEq, Debug)]
+pub enum PayableError {
     Owerflow(SignConversionError),
-    StatementExecution(String)
+    RusqliteError(String),
 }
 
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Debug)]
 pub enum SignConversionError {
     U64(String),
     U128(String),
-    I128(String)
+    I128(String),
 }
 
-impl SignConversionError{
-    fn into_payable(self)->AccountantError{
+impl SignConversionError {
+    fn into_payable(self) -> AccountantError {
         unimplemented!()
     }
-    fn into_receivable(self)-> AccountantError{
+    fn into_receivable(self) -> AccountantError {
         unimplemented!()
     }
 }
@@ -116,15 +118,17 @@ pub struct PaymentCurves {
 
 impl PaymentCurves {
     pub fn sugg_and_grace(&self, now: i64) -> i64 {
-        now - u64_to_signed(self.payment_suggested_after_sec).expect("we allowed an overflow") - u64_to_signed(self.payment_grace_before_ban_sec).expect("we allowed an overflow")
+        now - u64_to_signed(self.payment_suggested_after_sec).expect("we allowed an overflow")
+            - u64_to_signed(self.payment_grace_before_ban_sec).expect("we allowed an overflow")
     }
 
     pub fn sugg_thru_decreasing(&self, now: i64) -> i64 {
-        self.sugg_and_grace(now)  - u64_to_signed(self.balance_decreases_for_sec).expect("we allowed an overflow")
+        self.sugg_and_grace(now)
+            - u64_to_signed(self.balance_decreases_for_sec).expect("we allowed an overflow")
     }
 }
 
-pub fn to_wei_in_i128(gwei:u64)->i128{
+pub fn to_wei_in_i128(gwei: u64) -> i128 {
     i128::from(gwei) * WEI_IN_GWEI
 }
 
@@ -375,7 +379,8 @@ impl Accountant {
 
         let now = SystemTime::now();
         self.receivable_dao
-            .new_delinquencies(now, &PAYMENT_CURVES).unwrap_or_else(|e|panic!("{}",e))
+            .new_delinquencies(now, &PAYMENT_CURVES)
+            .unwrap_or_else(|e| panic!("{}", e))
             .into_iter()
             .for_each(|account| {
                 self.banned_dao.ban(&account.wallet);
@@ -390,7 +395,8 @@ impl Accountant {
             });
 
         self.receivable_dao
-            .paid_delinquencies(&PAYMENT_CURVES).unwrap_or_else(|e|panic!("{}",e))
+            .paid_delinquencies(&PAYMENT_CURVES)
+            .unwrap_or_else(|e| panic!("{}", e))
             .into_iter()
             .for_each(|account| {
                 self.banned_dao.unban(&account.wallet);
@@ -465,7 +471,7 @@ impl Accountant {
     }
 
     fn balance_and_age(account: &ReceivableAccount) -> (String, Duration) {
-        let balance = format!("{}", (account.balance as f64) / 1_000_000_000.0);  //balance in gwei
+        let balance = format!("{}", (account.balance as f64) / 1_000_000_000.0); //balance in gwei
         let age = account
             .last_received_timestamp
             .elapsed()
@@ -488,7 +494,11 @@ impl Accountant {
             return None;
         }
 
-        if payable.balance <= u128_to_signed(PAYMENT_CURVES.permanent_debt_allowed_wei).expect("we allowed an overflow") {  //TODO handle this a better way
+        if payable.balance
+            <= u128_to_signed(PAYMENT_CURVES.permanent_debt_allowed_wei)
+                .expect("we allowed an overflow")
+        {
+            //TODO handle this a better way
             return None;
         }
 
@@ -789,7 +799,11 @@ impl Accountant {
     fn handle_financials(&mut self, client_id: u64, context_id: u64, request: UiFinancialsRequest) {
         let payables = self
             .payable_dao
-            .top_records(u128_to_signed(request.payable_minimum_amount).unwrap_or_else(|e|unimplemented!()), request.payable_maximum_age).unwrap_or_else(|e|panic!("{}",e))
+            .top_records(
+                u128_to_signed(request.payable_minimum_amount).unwrap_or_else(|e| unimplemented!()),
+                request.payable_maximum_age,
+            )
+            .unwrap_or_else(|e| panic!("{}", e))
             .iter()
             .map(|account| UiPayableAccount {
                 wallet: account.wallet.to_string(),
@@ -809,7 +823,8 @@ impl Accountant {
             .top_records(
                 request.receivable_minimum_amount,
                 request.receivable_maximum_age,
-            ).unwrap_or_else(|e|panic!("{}",e))
+            )
+            .unwrap_or_else(|e| panic!("{}", e))
             .iter()
             .map(|account| UiReceivableAccount {
                 wallet: account.wallet.to_string(),
@@ -838,28 +853,33 @@ impl Accountant {
             .expect("UiGateway is dead");
     }
 }
+//TODO I think this is needless
 
-// At the time of this writing, Rust 1.44.0 was unpredictably producing
-// segfaults on the Mac when using u64::try_from (i64). This is an attempt to
-// work around that.
-// pub fn jackass_unsigned_to_signed(unsigned: u64) -> Result<i64,SignConversionError> {
-//     if unsigned <= (std::i64::MAX as u64) {
-//         Ok(unsigned as i64)
-//     } else {
-//         Err(::SignConversion(unsigned))
-//     }
-// }
-
-pub fn u128_to_signed(value: u128)->Result<i128, SignConversionError> {
-    i128::try_from(value).map_err(|e|SignConversionError::U128(format!("conversion of {} from u128 to i128 failed on: {}",value,e)))
+pub fn u128_to_signed(value: u128) -> Result<i128, SignConversionError> {
+    i128::try_from(value).map_err(|e| {
+        SignConversionError::U128(format!(
+            "conversion of {} from u128 to i128 failed on: {}",
+            value, e
+        ))
+    })
 }
 
-pub fn i128_to_unsigned(value: i128)-> Result<u128,SignConversionError>{
-    u128::try_from(value).map_err(|e|SignConversionError::I128(format!("conversion of {} from i128 to u128 failed on: {}",value,e)))
+pub fn i128_to_unsigned(value: i128) -> Result<u128, SignConversionError> {
+    u128::try_from(value).map_err(|e| {
+        SignConversionError::I128(format!(
+            "conversion of {} from i128 to u128 failed on: {}",
+            value, e
+        ))
+    })
 }
 
-pub fn u64_to_signed(value: u64)->Result<i64,SignConversionError> {
-    i64::try_from(value).map_err(|e|SignConversionError::U64(format!("conversion of {} from u64 to i64 failed on: {}",value,e)))
+pub fn u64_to_signed(value: u64) -> Result<i64, SignConversionError> {
+    i64::try_from(value).map_err(|e| {
+        SignConversionError::U64(format!(
+            "conversion of {} from u64 to i64 failed on: {}",
+            value, e
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -898,25 +918,25 @@ pub mod tests {
     use std::thread;
     use std::time::Duration;
     use std::time::SystemTime;
-    use web3::types::{H256, Res};
     use web3::types::U256;
+    use web3::types::{Res, H256};
 
     #[derive(Debug, Default)]
     pub struct PayableDaoMock {
         account_status_parameters: Arc<Mutex<Vec<Wallet>>>,
         account_status_results: RefCell<Vec<Option<PayableAccount>>>,
         more_money_payable_parameters: Arc<Mutex<Vec<(Wallet, u128)>>>,
-        more_money_payable_results: RefCell<Vec<Result<(),AccountantError>>>,
+        more_money_payable_results: RefCell<Vec<Result<(), AccountantError>>>,
         non_pending_payables_results: RefCell<Vec<Vec<PayableAccount>>>,
         payment_sent_parameters: Arc<Mutex<Vec<Payment>>>,
-        payment_sent_results: RefCell<Vec<Result<(),AccountantError>>>,
+        payment_sent_results: RefCell<Vec<Result<(), AccountantError>>>,
         top_records_parameters: Arc<Mutex<Vec<(i128, u64)>>>,
-        top_records_results: RefCell<Vec<Result<Vec<PayableAccount>,AccountantError>>>,
+        top_records_results: RefCell<Vec<Result<Vec<PayableAccount>, AccountantError>>>,
         total_results: RefCell<Vec<i128>>,
     }
 
     impl PayableDao for PayableDaoMock {
-        fn more_money_payable(&self, wallet: &Wallet, amount: u128) -> Result<(),AccountantError> {
+        fn more_money_payable(&self, wallet: &Wallet, amount: u128) -> Result<(), AccountantError> {
             self.more_money_payable_parameters
                 .lock()
                 .unwrap()
@@ -924,7 +944,7 @@ pub mod tests {
             self.more_money_payable_results.borrow_mut().remove(0)
         }
 
-        fn payment_sent(&self, sent_payment: &Payment) -> Result<(),AccountantError> {
+        fn payment_sent(&self, sent_payment: &Payment) -> Result<(), AccountantError> {
             self.payment_sent_parameters
                 .lock()
                 .unwrap()
@@ -938,7 +958,7 @@ pub mod tests {
             _amount: u128,
             _confirmation_noticed_timestamp: SystemTime,
             _transaction_hash: H256,
-        ) -> Result<(),AccountantError> {
+        ) -> Result<(), AccountantError> {
             unimplemented!("SC-925: TODO")
         }
 
@@ -958,7 +978,11 @@ pub mod tests {
             }
         }
 
-        fn top_records(&self, minimum_amount: i128, maximum_age: u64) -> Result<Vec<PayableAccount>,AccountantError> {
+        fn top_records(
+            &self,
+            minimum_amount: i128,
+            maximum_age: u64,
+        ) -> Result<Vec<PayableAccount>, AccountantError> {
             self.top_records_parameters
                 .lock()
                 .unwrap()
@@ -984,7 +1008,7 @@ pub mod tests {
             self
         }
 
-        fn more_money_payable_result(self, result: Result<(),AccountantError>) -> Self {
+        fn more_money_payable_result(self, result: Result<(), AccountantError>) -> Self {
             self.more_money_payable_results.borrow_mut().push(result);
             self
         }
@@ -999,7 +1023,7 @@ pub mod tests {
             self
         }
 
-        fn payment_sent_result(self, result: Result<(),AccountantError>) -> Self {
+        fn payment_sent_result(self, result: Result<(), AccountantError>) -> Self {
             self.payment_sent_results.borrow_mut().push(result);
             self
         }
@@ -1009,7 +1033,7 @@ pub mod tests {
             self
         }
 
-        fn top_records_result(self, result: Result<Vec<PayableAccount>,AccountantError>) -> Self {
+        fn top_records_result(self, result: Result<Vec<PayableAccount>, AccountantError>) -> Self {
             self.top_records_results.borrow_mut().push(result);
             self
         }
@@ -1051,21 +1075,25 @@ pub mod tests {
         account_status_parameters: Arc<Mutex<Vec<Wallet>>>,
         account_status_results: RefCell<Vec<Option<ReceivableAccount>>>,
         more_money_receivable_parameters: Arc<Mutex<Vec<(Wallet, u128)>>>,
-        more_money_receivable_results: RefCell<Vec<Result<(),AccountantError>>>,
+        more_money_receivable_results: RefCell<Vec<Result<(), AccountantError>>>,
         more_money_received_parameters: Arc<Mutex<Vec<Vec<Transaction>>>>,
-        more_money_received_results: RefCell<Vec<Result<(),AccountantError>>>,
+        more_money_received_results: RefCell<Vec<Result<(), AccountantError>>>,
         receivables_results: RefCell<Vec<Vec<ReceivableAccount>>>,
         new_delinquencies_parameters: Arc<Mutex<Vec<(SystemTime, PaymentCurves)>>>,
-        new_delinquencies_results: RefCell<Vec<Result<Vec<ReceivableAccount>,AccountantError>>>,
+        new_delinquencies_results: RefCell<Vec<Result<Vec<ReceivableAccount>, AccountantError>>>,
         paid_delinquencies_parameters: Arc<Mutex<Vec<PaymentCurves>>>,
-        paid_delinquencies_results: RefCell<Vec<Result<Vec<ReceivableAccount>,AccountantError>>>,
+        paid_delinquencies_results: RefCell<Vec<Result<Vec<ReceivableAccount>, AccountantError>>>,
         top_records_parameters: Arc<Mutex<Vec<(i128, u64)>>>,
-        top_records_results: RefCell<Vec<Result<Vec<ReceivableAccount>,AccountantError>>>,
+        top_records_results: RefCell<Vec<Result<Vec<ReceivableAccount>, AccountantError>>>,
         total_results: RefCell<Vec<i128>>,
     }
 
     impl ReceivableDao for ReceivableDaoMock {
-        fn more_money_receivable(&self, wallet: &Wallet, amount: u128) -> Result<(),AccountantError > {
+        fn more_money_receivable(
+            &self,
+            wallet: &Wallet,
+            amount: u128,
+        ) -> Result<(), AccountantError> {
             self.more_money_receivable_parameters
                 .lock()
                 .unwrap()
@@ -1080,7 +1108,7 @@ pub mod tests {
                 .push(transactions);
         }
 
-        fn account_status(&self, wallet: &Wallet) -> Option<ReceivableAccount> {
+        fn single_account_status(&self, wallet: &Wallet) -> Option<ReceivableAccount> {
             self.account_status_parameters
                 .lock()
                 .unwrap()
@@ -1089,7 +1117,7 @@ pub mod tests {
             self.account_status_results.borrow_mut().remove(0)
         }
 
-        fn receivables(&self) -> Vec<ReceivableAccount> {
+        fn all_receivable_accounts(&self) -> Vec<ReceivableAccount> {
             self.receivables_results.borrow_mut().remove(0)
         }
 
@@ -1097,7 +1125,7 @@ pub mod tests {
             &self,
             now: SystemTime,
             payment_curves: &PaymentCurves,
-        ) -> Result<Vec<ReceivableAccount>,AccountantError>{
+        ) -> Result<Vec<ReceivableAccount>, AccountantError> {
             self.new_delinquencies_parameters
                 .lock()
                 .unwrap()
@@ -1109,7 +1137,10 @@ pub mod tests {
             }
         }
 
-        fn paid_delinquencies(&self, payment_curves: &PaymentCurves) -> Result<Vec<ReceivableAccount>,AccountantError>  {
+        fn paid_delinquencies(
+            &self,
+            payment_curves: &PaymentCurves,
+        ) -> Result<Vec<ReceivableAccount>, AccountantError> {
             self.paid_delinquencies_parameters
                 .lock()
                 .unwrap()
@@ -1121,7 +1152,11 @@ pub mod tests {
             }
         }
 
-        fn top_records(&self, minimum_amount: i128, maximum_age: u64) -> Result<Vec<ReceivableAccount>,AccountantError> {
+        fn top_records(
+            &self,
+            minimum_amount: i128,
+            maximum_age: u64,
+        ) -> Result<Vec<ReceivableAccount>, AccountantError> {
             self.top_records_parameters
                 .lock()
                 .unwrap()
@@ -1147,7 +1182,7 @@ pub mod tests {
             self
         }
 
-        fn more_money_receivable_result(self, result: Result<(),AccountantError>) -> Self {
+        fn more_money_receivable_result(self, result: Result<(), AccountantError>) -> Self {
             self.more_money_receivable_results.borrow_mut().push(result);
             self
         }
@@ -1160,7 +1195,7 @@ pub mod tests {
             self
         }
 
-        fn more_money_received_result(self, result: Result<(),AccountantError>) -> Self {
+        fn more_money_received_result(self, result: Result<(), AccountantError>) -> Self {
             self.more_money_received_results.borrow_mut().push(result);
             self
         }
@@ -1173,7 +1208,10 @@ pub mod tests {
             self
         }
 
-        fn new_delinquencies_result(self, result: Result<Vec<ReceivableAccount>,AccountantError>) -> ReceivableDaoMock {
+        fn new_delinquencies_result(
+            self,
+            result: Result<Vec<ReceivableAccount>, AccountantError>,
+        ) -> ReceivableDaoMock {
             self.new_delinquencies_results.borrow_mut().push(result);
             self
         }
@@ -1186,7 +1224,10 @@ pub mod tests {
             self
         }
 
-        fn paid_delinquencies_result(self, result: Result<Vec<ReceivableAccount>,AccountantError>) -> ReceivableDaoMock {
+        fn paid_delinquencies_result(
+            self,
+            result: Result<Vec<ReceivableAccount>, AccountantError>,
+        ) -> ReceivableDaoMock {
             self.paid_delinquencies_results.borrow_mut().push(result);
             self
         }
@@ -1196,7 +1237,10 @@ pub mod tests {
             self
         }
 
-        fn top_records_result(self, result: Result<Vec<ReceivableAccount>,AccountantError>) -> Self {
+        fn top_records_result(
+            self,
+            result: Result<Vec<ReceivableAccount>, AccountantError>,
+        ) -> Self {
             self.top_records_results.borrow_mut().push(result);
             self
         }
@@ -2140,7 +2184,8 @@ pub mod tests {
             // above minimum balance, to the right of minimum time (not in buffer zone, below the curve)
             PayableAccount {
                 wallet: make_wallet("wallet2"),
-                balance: u128_to_signed(PAYMENT_CURVES.balance_to_decrease_from_wei - 1000).unwrap(),
+                balance: u128_to_signed(PAYMENT_CURVES.balance_to_decrease_from_wei - 1000)
+                    .unwrap(),
                 last_paid_timestamp: from_time_t(
                     now - u64_to_signed(PAYMENT_CURVES.payment_suggested_after_sec).unwrap() - 1,
                 ),
@@ -2319,7 +2364,10 @@ pub mod tests {
             .new_delinquencies_parameters(&new_delinquencies_parameters_arc)
             .new_delinquencies_result(Ok(vec![newly_banned_1.clone(), newly_banned_2.clone()]))
             .paid_delinquencies_parameters(&paid_delinquencies_parameters_arc)
-            .paid_delinquencies_result(Ok(vec![newly_unbanned_1.clone(), newly_unbanned_2.clone()]));
+            .paid_delinquencies_result(Ok(vec![
+                newly_unbanned_1.clone(),
+                newly_unbanned_2.clone(),
+            ]));
         let ban_parameters_arc = Arc::new(Mutex::new(vec![]));
         let unban_parameters_arc = Arc::new(Mutex::new(vec![]));
         let banned_dao = BannedDaoMock::new()
@@ -2947,10 +2995,11 @@ pub mod tests {
         let subject = make_subject(
             None,
             None,
-            Some(
-                ReceivableDaoMock::new()
-                    .more_money_receivable_result(Err(AccountantError::RecordServicesOverflow(SignConversionError::U128("overflow".to_string())))),
-            ),
+            Some(ReceivableDaoMock::new().more_money_receivable_result(Err(
+                AccountantError::RecordServiceDataOverflow(SignConversionError::U128(
+                    "overflow".to_string(),
+                )),
+            ))),
             None,
             None,
         );
@@ -2970,10 +3019,11 @@ pub mod tests {
         let wallet = make_wallet("booga");
         let subject = make_subject(
             None,
-            Some(
-                PayableDaoMock::new()
-                    .more_money_payable_result(Err(AccountantError::RecordServicesOverflow(SignConversionError::U64("overflow".to_string())))),
-            ),
+            Some(PayableDaoMock::new().more_money_payable_result(Err(
+                AccountantError::RecordServiceDataOverflow(SignConversionError::U64(
+                    "overflow".to_string(),
+                )),
+            ))),
             None,
             None,
             None,
@@ -3002,15 +3052,9 @@ pub mod tests {
         let mut subject = make_subject(
             None,
             Some(
-                PayableDaoMock::new().payment_sent_result(
-                    Err(
-                        AccountantError::PayableError(
-                            PayableError::Owerflow(
-                                SignConversionError::U128("owerflow".to_string())
-                            )
-                        )
-                    )
-                ),
+                PayableDaoMock::new().payment_sent_result(Err(AccountantError::PayableError(
+                    PayableError::Owerflow(SignConversionError::U128("owerflow".to_string())),
+                ))),
             ),
             None,
             None,
@@ -3098,22 +3142,22 @@ pub mod tests {
     }
 
     #[test]
-    #[should_panic(expected="blah")]
-    fn u128_to_signed_panics_verbosely_on_an_error(){
+    #[should_panic(expected = "blah")]
+    fn u128_to_signed_panics_verbosely_on_an_error() {
         let _ = u128_to_signed(u128::MAX);
     }
 
     #[test]
-    #[should_panic(expected="blah")]
-    fn u64_to_signed_panics_verbosely_on_an_error(){
+    #[should_panic(expected = "blah")]
+    fn u64_to_signed_panics_verbosely_on_an_error() {
         let _ = u64_to_signed(u64::MAX);
     }
 
     #[test]
-    fn to_wei_in_i128_provides_correct_values(){
-       let result = to_wei_in_i128(55);
+    fn to_wei_in_i128_provides_correct_values() {
+        let result = to_wei_in_i128(55);
 
-       assert_eq!(result,55_000_000_000)
+        assert_eq!(result, 55_000_000_000)
     }
 
     fn bc_from_ac_plus_earning_wallet(

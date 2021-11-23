@@ -1,5 +1,6 @@
 // Copyright (c) 2019, MASQ (https://masq.ai) and/or its affiliates. All rights reserved.
 
+use crate::accountant::to_wei_in_i128;
 use crate::blockchain::raw_transaction::RawTransaction;
 use crate::sub_lib::logger::Logger;
 use crate::sub_lib::wallet::Wallet;
@@ -7,6 +8,7 @@ use actix::Message;
 use futures::{future, Future};
 use masq_lib::blockchains::chains::Chain;
 use masq_lib::constants::DEFAULT_CHAIN;
+use masq_lib::utils::ExpectValue;
 use std::convert::{From, TryFrom, TryInto};
 use std::fmt;
 use std::fmt::{Debug, Display, Formatter};
@@ -14,8 +16,6 @@ use web3::contract::{Contract, Options};
 use web3::transports::EventLoopHandle;
 use web3::types::{Address, BlockNumber, Bytes, FilterBuilder, Log, H256, U256};
 use web3::{Transport, Web3};
-use masq_lib::utils::ExpectValue;
-use crate::accountant::to_wei_in_i128;
 
 pub const REQUESTS_IN_PARALLEL: usize = 1;
 

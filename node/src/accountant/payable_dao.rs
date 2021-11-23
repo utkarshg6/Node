@@ -1,16 +1,19 @@
 // Copyright (c) 2019, MASQ (https://masq.ai) and/or its affiliates. All rights reserved.
-use crate::accountant::{AccountantError, PayableError, SignConversionError, u128_to_signed, u64_to_signed};
+use crate::accountant::dao_shared_methods::blob_i128;
+use crate::accountant::{
+    u128_to_signed, u64_to_signed, AccountantError, PayableError, SignConversionError,
+};
 use crate::database::connection_wrapper::ConnectionWrapper;
 use crate::database::dao_utils;
 use crate::database::dao_utils::DaoFactoryReal;
 use crate::sub_lib::wallet::Wallet;
+use masq_lib::utils::WrapResult;
 use rusqlite::types::{ToSql, Type};
-use rusqlite::{Error, OptionalExtension, NO_PARAMS, named_params};
+use rusqlite::{named_params, Error, OptionalExtension};
 use serde_json::{self, json};
 use std::fmt::Debug;
 use std::time::SystemTime;
 use web3::types::H256;
-use masq_lib::utils::WrapResult;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PayableAccount {
@@ -56,7 +59,11 @@ pub trait PayableDao: Debug + Send {
 
     fn non_pending_payables(&self) -> Vec<PayableAccount>;
 
-    fn top_records(&self, minimum_amount: i128, maximum_age: u64) -> Result<Vec<PayableAccount>,AccountantError>;
+    fn top_records(
+        &self,
+        minimum_amount: i128,
+        maximum_age: u64,
+    ) -> Result<Vec<PayableAccount>, AccountantError>;
 
     fn total(&self) -> i128;
 }
@@ -134,7 +141,10 @@ impl PayableDao for PayableDaoReal {
                             },
                         })
                     }
-                    _ => panic!("Database is corrupt: PAYABLE table columns and/or types"),
+                    (r, a, e) => panic!(
+                        "Database is corrupt: PAYABLE table columns and/or types {:?}{:?}{:?}",
+                        r, a, e
+                    ),
                 }
             })
             .optional()
@@ -168,9 +178,13 @@ impl PayableDao for PayableDaoReal {
         .collect()
     }
 
-    fn top_records(&self, minimum_amount: i128, maximum_age: u64) -> Result<Vec<PayableAccount>,AccountantError>{
+    fn top_records(
+        &self,
+        minimum_amount: i128,
+        maximum_age: u64,
+    ) -> Result<Vec<PayableAccount>, AccountantError> {
         let max_age = u64_to_signed(maximum_age)
-            .map_err(|e|AccountantError::PayableError(PayableError::Owerflow(e)))?;
+            .map_err(|e| AccountantError::PayableError(PayableError::Owerflow(e)))?;
         let min_timestamp = dao_utils::now_time_t() - max_age;
         let mut stmt = self
             .conn
@@ -226,7 +240,8 @@ impl PayableDao for PayableDaoReal {
         })
         .expect("Database is corrupt")
         .flatten()
-        .collect::<Vec<PayableAccount>>().wrap_to_ok()
+        .collect::<Vec<PayableAccount>>()
+        .wrap_to_ok()
     }
 
     fn total(&self) -> i128 {
@@ -259,10 +274,6 @@ impl PayableDao for PayableDaoReal {
     }
 }
 
-fn sign_con_err_into_payable_acc_err(err: SignConversionError)->AccountantError{
-    AccountantError::PayableError(PayableError::Owerflow(err))
-}
-
 impl PayableDaoReal {
     pub fn new(conn: Box<dyn ConnectionWrapper>) -> PayableDaoReal {
         PayableDaoReal { conn }
@@ -273,12 +284,12 @@ impl PayableDaoReal {
             .conn
             .prepare("insert into payable (wallet_address, balance, last_paid_timestamp, pending_payment_transaction) values (:address, :balance, strftime('%s','now'), null) on conflict (wallet_address) do update set balance = balance + :balance where wallet_address = :address")
             .expect("Internal error");
-        let amount = u128_to_signed(amount).map_err(sign_con_err_into_payable_acc_err)?; //TODO neaten this once you escape from the error rain
-        let params = named_params! {":address": &wallet, ":balance": &amount};
+        let amount = u128_to_signed(amount).map_err(|e| e.into_payable())?;
+        let params = named_params! {":address": &wallet, ":balance": &blob_i128(amount)};
         match stmt.execute(params) {
             Ok(0) => Ok(false),
             Ok(_) => Ok(true),
-            Err(e) => unimplemented!() //Err(AccountantError::PayableError(PayableError::StatementExecution(format!("increasing balance: {}", e)))),
+            Err(e) => unimplemented!(), //Err(AccountantError::PayableError(PayableError::StatementExecution(format!("increasing balance: {}", e)))),
         }
     }
 
@@ -291,11 +302,11 @@ impl PayableDaoReal {
     ) -> Result<bool, AccountantError> {
         let mut stmt = self
             .conn
-            .prepare("insert into payable (balance, last_paid_timestamp, pending_payment_transaction, wallet_address) values (0 - :balance, :last_paid, :transaction, :address) on conflict (wallet_address) do update set balance = balance - :balance, last_paid_timestamp = :last_paid, pending_payment_transaction = :transaction where wallet_address = :address")
+            .prepare("insert into payable (balance, last_paid_timestamp, pending_payment_transaction, wallet_address) values (:balance, :last_paid, :transaction, :address) on conflict (wallet_address) do update set balance = balance - :balance, last_paid_timestamp = :last_paid, pending_payment_transaction = :transaction where wallet_address = :address")
             .expect("Internal error");
-        let amount = u128_to_signed(amount).map_err(sign_con_err_into_payable_acc_err)?;
+        let amount = u128_to_signed(amount).map_err(|e| e.into_payable())?;
         let params = named_params! {
-            ":balance": &amount,
+            ":balance": &blob_i128(amount),
             ":last_paid": &dao_utils::to_time_t(last_paid_timestamp),
             ":transaction": &format!("{:#x}", &transaction_hash),
             ":address": &wallet
@@ -303,7 +314,7 @@ impl PayableDaoReal {
         match stmt.execute(params) {
             Ok(0) => Ok(false),
             Ok(_) => Ok(true),
-            Err(e) => unimplemented!() // Err(format!("{}", e)),
+            Err(e) => unimplemented!(), // Err(format!("{}", e)),
         }
     }
 }
@@ -379,7 +390,7 @@ mod tests {
                     .unwrap();
             conn.execute(
                 "update payable set last_paid_timestamp = 0 where wallet_address = '0x000000000000000000000000000000626f6f6761'",
-                NO_PARAMS,
+                [],
             )
             .unwrap();
             subject
@@ -410,7 +421,12 @@ mod tests {
 
         let result = subject.more_money_payable(&wallet, std::u128::MAX);
 
-        assert_eq!(result, Err(AccountantError::PayableError(PayableError::Owerflow(SignConversionError::U128("blah".to_string())))));
+        assert_eq!(
+            result,
+            Err(AccountantError::PayableError(PayableError::Owerflow(
+                SignConversionError::U128("blah".to_string())
+            )))
+        );
     }
 
     #[test]
@@ -491,7 +507,12 @@ mod tests {
 
         let result = subject.payment_sent(&payment);
 
-        assert_eq!(result, Err(AccountantError::PayableError(PayableError::Owerflow(SignConversionError::U128("blah".to_string())))))
+        assert_eq!(
+            result,
+            Err(AccountantError::PayableError(PayableError::Owerflow(
+                SignConversionError::U128("blah".to_string())
+            )))
+        )
     }
 
     #[test]
@@ -514,7 +535,12 @@ mod tests {
             H256::from_uint(&U256::from(1)),
         );
 
-        assert_eq!(result, Err(AccountantError::PayableError(PayableError::Owerflow(SignConversionError::U128("blah".to_string())))))
+        assert_eq!(
+            result,
+            Err(AccountantError::PayableError(PayableError::Owerflow(
+                SignConversionError::U128("blah".to_string())
+            )))
+        )
     }
 
     #[test]
@@ -627,7 +653,12 @@ mod tests {
 
         let result = subject.more_money_payable(&make_wallet("foobar"), u128::MAX);
 
-        assert_eq!(result, Err(AccountantError::PayableError(PayableError::Owerflow(SignConversionError::U128("blah".to_string())))))
+        assert_eq!(
+            result,
+            Err(AccountantError::PayableError(PayableError::Owerflow(
+                SignConversionError::U128("blah".to_string())
+            )))
+        )
     }
 
     #[test]
@@ -648,7 +679,12 @@ mod tests {
             H256::from_uint(&U256::from(123)),
         ));
 
-        assert_eq!(result, Err(AccountantError::PayableError(PayableError::Owerflow(SignConversionError::U128("blah".to_string())))))
+        assert_eq!(
+            result,
+            Err(AccountantError::PayableError(PayableError::Owerflow(
+                SignConversionError::U128("blah".to_string())
+            )))
+        )
     }
 
     #[test]
@@ -741,4 +777,6 @@ mod tests {
 
         assert_eq!(result, 0)
     }
+
+    fn read_blob_to_i128() {}
 }

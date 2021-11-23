@@ -1,5 +1,7 @@
 // Copyright (c) 2019, MASQ (https://masq.ai) and/or its affiliates. All rights reserved.
-use crate::accountant::{SignConversionError, PaymentCurves, AccountantError, u64_to_signed};
+use crate::accountant::dao_shared_methods::blob_i128;
+use crate::accountant::u128_to_signed;
+use crate::accountant::{u64_to_signed, AccountantError, PaymentCurves, SignConversionError};
 use crate::blockchain::blockchain_interface::Transaction;
 use crate::database::connection_wrapper::ConnectionWrapper;
 use crate::database::dao_utils;
@@ -9,28 +11,29 @@ use crate::db_config::persistent_configuration::PersistentConfigError;
 use crate::sub_lib::logger::Logger;
 use crate::sub_lib::wallet::Wallet;
 use indoc::indoc;
+use masq_lib::utils::WrapResult;
 use rusqlite::named_params;
 use rusqlite::types::{ToSql, Type};
-use rusqlite::{OptionalExtension, Row, NO_PARAMS};
+use rusqlite::{OptionalExtension, Row};
 use std::time::SystemTime;
-use masq_lib::utils::WrapResult;
-use crate::accountant::u128_to_signed;
 
 #[derive(Debug, PartialEq)]
-pub enum ReceivableDaoError {
+pub enum ReceivableError {
+    Overflow(SignConversionError),
     ConfigurationError(String),
+    RusqliteError(String), // TODO you will have to pick up from different cases and give it to here or Other
     Other(String),
 }
 
-impl From<PersistentConfigError> for ReceivableDaoError {
+impl From<PersistentConfigError> for ReceivableError {
     fn from(input: PersistentConfigError) -> Self {
-        ReceivableDaoError::ConfigurationError(format!("{:?}", input))
+        ReceivableError::ConfigurationError(format!("{:?}", input))
     }
 }
 
-impl From<String> for ReceivableDaoError {
+impl From<String> for ReceivableError {
     fn from(input: String) -> Self {
-        ReceivableDaoError::Other(input)
+        ReceivableError::Other(input)
     }
 }
 
@@ -46,19 +49,26 @@ pub trait ReceivableDao: Send {
 
     fn more_money_received(&mut self, transactions: Vec<Transaction>);
 
-    fn account_status(&self, wallet: &Wallet) -> Option<ReceivableAccount>;
+    fn single_account_status(&self, wallet: &Wallet) -> Option<ReceivableAccount>;
 
-    fn receivables(&self) -> Vec<ReceivableAccount>;
+    fn all_receivable_accounts(&self) -> Vec<ReceivableAccount>;
 
     fn new_delinquencies(
         &self,
         now: SystemTime,
         payment_curves: &PaymentCurves,
-    ) -> Result<Vec<ReceivableAccount>,AccountantError>;
+    ) -> Result<Vec<ReceivableAccount>, AccountantError>;
 
-    fn paid_delinquencies(&self, payment_curves: &PaymentCurves) -> Result<Vec<ReceivableAccount>,AccountantError> ;
+    fn paid_delinquencies(
+        &self,
+        payment_curves: &PaymentCurves,
+    ) -> Result<Vec<ReceivableAccount>, AccountantError>;
 
-    fn top_records(&self, minimum_amount: i128, maximum_age: u64) -> Result<Vec<ReceivableAccount>,AccountantError>;
+    fn top_records(
+        &self,
+        minimum_amount: i128,
+        maximum_age: u64,
+    ) -> Result<Vec<ReceivableAccount>, AccountantError>;
 
     fn total(&self) -> i128;
 }
@@ -80,7 +90,7 @@ pub struct ReceivableDaoReal {
 
 impl ReceivableDao for ReceivableDaoReal {
     fn more_money_receivable(&self, wallet: &Wallet, amount: u128) -> Result<(), AccountantError> {
-        let signed_amount = u128_to_signed(amount).map_err(|e|e.into_receivable())?;
+        let signed_amount = u128_to_signed(amount).map_err(|e| e.into_receivable())?;
         match self.try_update(wallet, signed_amount) {
             Ok(true) => Ok(()),
             Ok(false) => match self.try_insert(wallet, signed_amount) {
@@ -97,10 +107,10 @@ impl ReceivableDao for ReceivableDaoReal {
 
     fn more_money_received(&mut self, payments: Vec<Transaction>) {
         self.try_multi_insert_payment(&payments)
-            .unwrap_or_else(|e|multi_insert_payment_error_logged(payments,&self.logger,e))
+            .unwrap_or_else(|e| multi_insert_payment_error_logged(payments, &self.logger, e))
     }
 
-    fn account_status(&self, wallet: &Wallet) -> Option<ReceivableAccount> {
+    fn single_account_status(&self, wallet: &Wallet) -> Option<ReceivableAccount> {
         let mut stmt = self
             .conn
             .prepare(
@@ -113,35 +123,23 @@ impl ReceivableDao for ReceivableDaoReal {
         }
     }
 
-    fn receivables(&self) -> Vec<ReceivableAccount> {
+    fn all_receivable_accounts(&self) -> Vec<ReceivableAccount> {
         let mut stmt = self
             .conn
-            .prepare("select balance, last_received_timestamp, wallet_address from receivable")
+            .prepare("select wallet_address, balance, last_received_timestamp from receivable")
             .expect("Internal error");
 
-        stmt.query_map([], |row| {
-            let balance_result = row.get(0);
-            let last_received_timestamp_result = row.get(1);
-            let wallet: Result<Wallet, rusqlite::Error> = row.get(2);
-            match (balance_result, last_received_timestamp_result, wallet) {
-                (Ok(balance), Ok(last_received_timestamp), Ok(wallet)) => Ok(ReceivableAccount {
-                    wallet,
-                    balance,
-                    last_received_timestamp: dao_utils::from_time_t(last_received_timestamp),
-                }),
-                _ => panic!("Database is corrupt: RECEIVABLE table columns and/or types"),
-            }
-        })
-        .expect("Database is corrupt")
-        .flatten()
-        .collect()
+        stmt.query_map([], Self::row_to_account)
+            .expect("Database is corrupt")
+            .flatten()
+            .collect()
     }
 
     fn new_delinquencies(
         &self,
         system_now: SystemTime,
         payment_curves: &PaymentCurves,
-    ) -> Result<Vec<ReceivableAccount>,AccountantError> {
+    ) -> Result<Vec<ReceivableAccount>, AccountantError> {
         let now = to_time_t(system_now);
         let slope = (payment_curves.permanent_debt_allowed_wei as f64
             - payment_curves.balance_to_decrease_from_wei as f64)
@@ -158,7 +156,7 @@ impl ReceivableDao for ReceivableDaoReal {
         "
         );
         let mut stmt = self.conn.prepare(sql).expect("Couldn't prepare statement");
-        stmt.query_map_named(
+        stmt.query_map(
             named_params! {
                 ":slope": slope,
                 ":sugg_and_grace": payment_curves.sugg_and_grace(now),
@@ -172,7 +170,10 @@ impl ReceivableDao for ReceivableDaoReal {
         .collect::<Vec<ReceivableAccount>>().wrap_to_ok()
     }
 
-    fn paid_delinquencies(&self, payment_curves: &PaymentCurves) -> Result<Vec<ReceivableAccount>,AccountantError> {
+    fn paid_delinquencies(
+        &self,
+        payment_curves: &PaymentCurves,
+    ) -> Result<Vec<ReceivableAccount>, AccountantError> {
         let sql = indoc!(
             r"
             select r.wallet_address, r.balance, r.last_received_timestamp
@@ -182,7 +183,7 @@ impl ReceivableDao for ReceivableDaoReal {
         "
         );
         let mut stmt = self.conn.prepare(sql).expect("Couldn't prepare statement");
-        stmt.query_map_named(
+        stmt.query_map(
             named_params! {
                 ":unban_balance": u128_to_signed(payment_curves.unban_when_balance_below_wei).map_err(|e|e.into_receivable())?,
             },
@@ -193,8 +194,12 @@ impl ReceivableDao for ReceivableDaoReal {
         .collect::<Vec<ReceivableAccount>>().wrap_to_ok()
     }
 
-    fn top_records(&self, minimum_amount: i128, maximum_age: u64) -> Result<Vec<ReceivableAccount>,AccountantError> {
-        let max_age = u64_to_signed(maximum_age).map_err(|e|e.into_receivable())?;
+    fn top_records(
+        &self,
+        minimum_amount: i128,
+        maximum_age: u64,
+    ) -> Result<Vec<ReceivableAccount>, AccountantError> {
+        let max_age = u64_to_signed(maximum_age).map_err(|e| e.into_receivable())?;
         let min_timestamp = dao_utils::now_time_t() - max_age;
         let mut stmt = self
             .conn
@@ -231,7 +236,8 @@ impl ReceivableDao for ReceivableDaoReal {
         })
         .expect("Database is corrupt")
         .flatten()
-        .collect::<Vec<ReceivableAccount>>().wrap_to_ok()
+        .collect::<Vec<ReceivableAccount>>()
+        .wrap_to_ok()
     }
 
     fn total(&self) -> i128 {
@@ -288,7 +294,7 @@ impl ReceivableDaoReal {
     fn try_insert(&self, wallet: &Wallet, amount: i128) -> Result<(), String> {
         let timestamp = dao_utils::to_time_t(SystemTime::now());
         let mut stmt = self.conn.prepare("insert into receivable (wallet_address, balance, last_received_timestamp) values (?, ?, ?)").expect("Internal error");
-        let params: &[&dyn ToSql] = &[&wallet, &amount, &(timestamp as i64)];
+        let params: &[&dyn ToSql] = &[&wallet, &blob_i128(amount), &(timestamp as i64)];
         match stmt.execute(params) {
             Ok(_) => Ok(()),
             Err(e) => Err(format!("{}", e)),
@@ -298,10 +304,10 @@ impl ReceivableDaoReal {
     fn try_multi_insert_payment(
         &mut self,
         payments: &[Transaction],
-    ) -> Result<(), ReceivableDaoError> {
+    ) -> Result<(), ReceivableError> {
         let tx = match self.conn.transaction() {
             Ok(t) => t,
-            Err(e) => return Err(ReceivableDaoError::Other(e.to_string())),
+            Err(e) => unimplemented!("test drive me back"), // return Err(ReceivableError::Other(e.to_string())),
         };
 
         let block_number = payments
@@ -313,7 +319,7 @@ impl ReceivableDaoReal {
         let mut writer = ConfigDaoWriteableReal::new(tx);
         match writer.set("start_block", Some(block_number.to_string())) {
             Ok(_) => (),
-            Err(e) => return Err(ReceivableDaoError::Other(format!("{:?}", e))),
+            Err(e) => unimplemented!("test drive me back"), //return Err(ReceivableError::Other(format!("{:?}", e))),
         }
         let tx = writer
             .extract()
@@ -326,12 +332,12 @@ impl ReceivableDaoReal {
                 let timestamp = dao_utils::now_time_t();
                 let gwei_amount = match u128_to_signed(transaction.gwei_amount) {
                     Ok(amount) => amount,
-                    Err(e) => {
-                        return Err(ReceivableDaoError::Other(format!(
-                            "Amount too large: {:?}",
-                            e
-                        )))
-                    }
+                    Err(e) => unimplemented!("test drive me back"), //     {
+                                                                    //     return Err(ReceivableError::Other(format!(
+                                                                    //         "Amount too large: {:?}",
+                                                                    //         e
+                                                                    //     )))
+                                                                    // }
                 };
                 let params: &[&dyn ToSql] = &[&gwei_amount, &timestamp, &transaction.from];
                 stmt.execute(params).map_err(|e| e.to_string())?;
@@ -339,7 +345,7 @@ impl ReceivableDaoReal {
         }
         match tx.commit() {
             // Error response is untested here, because without a mockable Transaction, it's untestable.
-            Err(e) => Err(ReceivableDaoError::Other(format!("{:?}", e))),
+            Err(e) => unimplemented!("test drive me back"), //Err(ReceivableError::Other(format!("{:?}", e))),
             Ok(_) => Ok(()),
         }
     }
@@ -360,10 +366,11 @@ impl ReceivableDaoReal {
 }
 
 fn multi_insert_payment_error_logged(
-    payments: Vec<Transaction>, logger: &Logger, error: ReceivableDaoError)
-{
-    let mut report_lines =
-        vec![format!("{:10} {:42} {:18}", "Block #", "Wallet", "Amount")];
+    payments: Vec<Transaction>,
+    logger: &Logger,
+    error: ReceivableError,
+) {
+    let mut report_lines = vec![format!("{:10} {:42} {:18}", "Block #", "Wallet", "Amount")];
     let mut sum = 0_u128;
     payments.iter().for_each(|t| {
         report_lines.push(format!(
@@ -374,13 +381,17 @@ fn multi_insert_payment_error_logged(
     });
     report_lines.push(format!("{:10} {:42} {:18}", "TOTAL", "", sum));
     let report = report_lines.join("\n");
-    error!(logger,"Payment reception failed, rolling back: {:?}\n{}", error, report);
+    error!(
+        logger,
+        "Payment reception failed, rolling back: {:?}\n{}", error, report
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::accountant::test_utils::make_receivable_account;
+    use crate::accountant::PayableError;
     use crate::database::dao_utils::{from_time_t, now_time_t, to_time_t};
     use crate::database::db_initializer;
     use crate::database::db_initializer::test_utils::ConnectionWrapperMock;
@@ -397,25 +408,25 @@ mod tests {
     use masq_lib::test_utils::utils::{ensure_node_home_directory_exists, TEST_DEFAULT_CHAIN};
     use rusqlite::NO_PARAMS;
     use rusqlite::{Connection, Error, OpenFlags};
-    use crate::accountant::PayableError;
 
     #[test]
     fn conversion_from_pce_works() {
         let pce = PersistentConfigError::BadHexFormat("booga".to_string());
 
-        let subject = ReceivableDaoError::from(pce);
+        let subject = ReceivableError::from(pce);
 
         assert_eq!(
             subject,
-            ReceivableDaoError::ConfigurationError("BadHexFormat(\"booga\")".to_string())
+            ReceivableError::ConfigurationError("BadHexFormat(\"booga\")".to_string())
         );
     }
 
     #[test]
     fn conversion_from_string_works() {
-        let subject = ReceivableDaoError::from("booga".to_string());
+        let subject = ReceivableError::from("booga".to_string());
 
-        assert_eq!(subject, ReceivableDaoError::Other("booga".to_string()));
+        unimplemented!("test drive me back");
+        assert_eq!(subject, ReceivableError::Other("booga".to_string()));
     }
 
     #[test]
@@ -437,9 +448,10 @@ mod tests {
 
         let result = subject.try_multi_insert_payment(&payments.as_slice());
 
+        unimplemented!("test drive me back");
         assert_eq!(
             result,
-            Err(ReceivableDaoError::Other(
+            Err(ReceivableError::Other(
                 "Amount too large: SignConversion(18446744073709551615)".to_string()
             ))
         )
@@ -456,7 +468,7 @@ mod tests {
             .unwrap();
         {
             let mut stmt = conn.prepare("drop table config").unwrap();
-            stmt.execute(NO_PARAMS).unwrap();
+            stmt.execute([]).unwrap();
         }
         let mut subject = ReceivableDaoReal::new(conn);
 
@@ -468,9 +480,10 @@ mod tests {
 
         let result = subject.try_multi_insert_payment(&payments.as_slice());
 
+        unimplemented!("test drive me back");
         assert_eq!(
             result,
-            Err(ReceivableDaoError::Other(
+            Err(ReceivableError::Other(
                 "DatabaseError(\"no such table: config\")".to_string()
             ))
         )
@@ -488,7 +501,7 @@ mod tests {
             .unwrap();
         {
             let mut stmt = conn.prepare("drop table receivable").unwrap();
-            stmt.execute(NO_PARAMS).unwrap();
+            stmt.execute([]).unwrap();
         }
         let mut subject = ReceivableDaoReal::new(conn);
 
@@ -517,7 +530,7 @@ mod tests {
             );
 
             subject.more_money_receivable(&wallet, 1234).unwrap();
-            subject.account_status(&wallet).unwrap()
+            subject.single_account_status(&wallet).unwrap()
         };
 
         let after = dao_utils::to_time_t(SystemTime::now());
@@ -567,7 +580,7 @@ mod tests {
 
         let status = {
             subject.more_money_receivable(&wallet, 2345).unwrap();
-            subject.account_status(&wallet).unwrap()
+            subject.single_account_status(&wallet).unwrap()
         };
 
         assert_eq!(status.wallet, wallet);
@@ -589,7 +602,12 @@ mod tests {
 
         let result = subject.more_money_receivable(&make_wallet("booga"), u128::MAX);
 
-        assert_eq!(result, Err(AccountantError::PayableError(PayableError::Owerflow(SignConversionError::U128("blah".to_string())))))
+        assert_eq!(
+            result,
+            Err(AccountantError::PayableError(PayableError::Owerflow(
+                SignConversionError::U128("blah".to_string())
+            )))
+        )
     }
 
     #[test]
@@ -630,8 +648,8 @@ mod tests {
 
             subject.more_money_received(transactions);
             (
-                subject.account_status(&debtor1).unwrap(),
-                subject.account_status(&debtor2).unwrap(),
+                subject.single_account_status(&debtor1).unwrap(),
+                subject.single_account_status(&debtor2).unwrap(),
             )
         };
 
@@ -677,7 +695,7 @@ mod tests {
                 block_number: 33u64,
             }];
             subject.more_money_received(transactions);
-            subject.account_status(&debtor)
+            subject.single_account_status(&debtor)
         };
 
         assert!(status.is_none());
@@ -755,7 +773,7 @@ mod tests {
                 .unwrap(),
         );
 
-        let result = subject.account_status(&wallet);
+        let result = subject.single_account_status(&wallet);
 
         assert_eq!(result, None);
     }
@@ -780,7 +798,7 @@ mod tests {
         subject.more_money_receivable(&wallet2, 2345).unwrap();
 
         let accounts = subject
-            .receivables()
+            .all_receivable_accounts()
             .into_iter()
             .map(|r| ReceivableAccount {
                 last_received_timestamp: time_stub,
@@ -817,27 +835,33 @@ mod tests {
         };
         let now = now_time_t();
         let mut not_delinquent_inside_grace_period = make_receivable_account(1234, false);
-        not_delinquent_inside_grace_period.balance = u128_to_signed(pcs.balance_to_decrease_from_wei + 1).unwrap();
+        not_delinquent_inside_grace_period.balance =
+            u128_to_signed(pcs.balance_to_decrease_from_wei + 1).unwrap();
         not_delinquent_inside_grace_period.last_received_timestamp =
             from_time_t(pcs.sugg_and_grace(now) + 2);
         let mut not_delinquent_after_grace_below_slope = make_receivable_account(2345, false);
-        not_delinquent_after_grace_below_slope.balance = u128_to_signed(pcs.balance_to_decrease_from_wei - 2).unwrap();
+        not_delinquent_after_grace_below_slope.balance =
+            u128_to_signed(pcs.balance_to_decrease_from_wei - 2).unwrap();
         not_delinquent_after_grace_below_slope.last_received_timestamp =
             from_time_t(pcs.sugg_and_grace(now) - 1);
         let mut delinquent_above_slope_after_grace = make_receivable_account(3456, true);
-        delinquent_above_slope_after_grace.balance = u128_to_signed(pcs.balance_to_decrease_from_wei - 1).unwrap();
+        delinquent_above_slope_after_grace.balance =
+            u128_to_signed(pcs.balance_to_decrease_from_wei - 1).unwrap();
         delinquent_above_slope_after_grace.last_received_timestamp =
             from_time_t(pcs.sugg_and_grace(now) - 2);
         let mut not_delinquent_below_slope_before_stop = make_receivable_account(4567, false);
-        not_delinquent_below_slope_before_stop.balance = u128_to_signed(pcs.permanent_debt_allowed_wei + 1).unwrap();
+        not_delinquent_below_slope_before_stop.balance =
+            u128_to_signed(pcs.permanent_debt_allowed_wei + 1).unwrap();
         not_delinquent_below_slope_before_stop.last_received_timestamp =
             from_time_t(pcs.sugg_thru_decreasing(now) + 2);
         let mut delinquent_above_slope_before_stop = make_receivable_account(5678, true);
-        delinquent_above_slope_before_stop.balance = u128_to_signed(pcs.permanent_debt_allowed_wei + 2).unwrap();
+        delinquent_above_slope_before_stop.balance =
+            u128_to_signed(pcs.permanent_debt_allowed_wei + 2).unwrap();
         delinquent_above_slope_before_stop.last_received_timestamp =
             from_time_t(pcs.sugg_thru_decreasing(now) + 1);
         let mut not_delinquent_above_slope_after_stop = make_receivable_account(6789, false);
-        not_delinquent_above_slope_after_stop.balance = u128_to_signed(pcs.permanent_debt_allowed_wei - 1).unwrap();
+        not_delinquent_above_slope_after_stop.balance =
+            u128_to_signed(pcs.permanent_debt_allowed_wei - 1).unwrap();
         not_delinquent_above_slope_after_stop.last_received_timestamp =
             from_time_t(pcs.sugg_thru_decreasing(now) - 2);
         let home_dir = ensure_node_home_directory_exists("accountant", "new_delinquencies");
@@ -966,11 +990,11 @@ mod tests {
     #[test]
     fn paid_delinquencies() {
         let pcs = PaymentCurves {
-            payment_suggested_after_sec: 0,   // doesn't matter for this test
-            payment_grace_before_ban_sec: 0,  // doesn't matter for this test
+            payment_suggested_after_sec: 0,  // doesn't matter for this test
+            payment_grace_before_ban_sec: 0, // doesn't matter for this test
             permanent_debt_allowed_wei: 0,   // doesn't matter for this test
             balance_to_decrease_from_wei: 0, // doesn't matter for this test
-            balance_decreases_for_sec: 0,     // doesn't matter for this test
+            balance_decreases_for_sec: 0,    // doesn't matter for this test
             unban_when_balance_below_wei: 50,
         };
         let mut paid_delinquent = make_receivable_account(1234, true);
@@ -997,11 +1021,11 @@ mod tests {
     #[test]
     fn paid_delinquencies_does_not_find_existing_nondelinquencies() {
         let pcs = PaymentCurves {
-            payment_suggested_after_sec: 0,   // doesn't matter for this test
-            payment_grace_before_ban_sec: 0,  // doesn't matter for this test
+            payment_suggested_after_sec: 0,  // doesn't matter for this test
+            payment_grace_before_ban_sec: 0, // doesn't matter for this test
             permanent_debt_allowed_wei: 0,   // doesn't matter for this test
             balance_to_decrease_from_wei: 0, // doesn't matter for this test
-            balance_decreases_for_sec: 0,     // doesn't matter for this test
+            balance_decreases_for_sec: 0,    // doesn't matter for this test
             unban_when_balance_below_wei: 50,
         };
         let mut newly_non_delinquent = make_receivable_account(1234, false);

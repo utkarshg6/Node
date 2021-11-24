@@ -45,7 +45,6 @@ use masq_lib::ui_gateway::MessageTarget::ClientId;
 use masq_lib::ui_gateway::{NodeFromUiMessage, NodeToUiMessage};
 use payable_dao::PayableDao;
 use receivable_dao::ReceivableDao;
-use rusqlite::types::Value;
 use std::fmt::{Display, Formatter};
 use std::ops::Add;
 use std::thread;
@@ -919,7 +918,7 @@ pub mod tests {
     use std::time::Duration;
     use std::time::SystemTime;
     use web3::types::U256;
-    use web3::types::{Res, H256};
+    use web3::types::{H256};
 
     #[derive(Debug, Default)]
     pub struct PayableDaoMock {

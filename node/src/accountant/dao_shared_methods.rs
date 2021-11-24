@@ -1,10 +1,10 @@
 // Copyright (c) 2019, MASQ (https://masq.ai) and/or its affiliates. All rights reserved.
 
-use crate::accountant::AccountantError;
+use crate::accountant::receivable_dao::ReceivableError;
+use crate::accountant::{AccountantError, PayableError};
 use crate::database::connection_wrapper::ConnectionWrapper;
-use masq_lib::utils::WrapResult;
 use rusqlite::types::Value;
-use rusqlite::{Connection, ToSql};
+use rusqlite::{ToSql};
 use std::fmt::{Display, Formatter};
 
 pub struct InsertUpdateConfig<'a> {
@@ -48,11 +48,13 @@ fn insert_or_update(
         Ok(rows) => return Ok(()),
         Err(e) => {
             let cause = e.to_string();
-            let constraint_failed = "UNIQUE constraint failed";
-            if &cause[..constraint_failed.len()] == constraint_failed {
+            let constraint_failed_msg = "UNIQUE constraint failed";
+            if cause.len() >= constraint_failed_msg.len()
+                && &cause[..constraint_failed_msg.len()] == constraint_failed_msg
+            {
                 update(conn, wallet, amount, &config)
             } else {
-                unimplemented!("{}", cause)
+                Err(format!("Updating balance after invalid insertion for {} of {} Wei to {}; failing on: '{}'",config.table,amount,wallet,cause))
             }
         }
     }
@@ -62,7 +64,7 @@ pub fn blob_i128(amount: i128) -> Value {
     amount.into()
 }
 
-pub fn update(
+fn update(
     conn: &dyn ConnectionWrapper,
     wallet: &str,
     amount: i128,
@@ -72,9 +74,11 @@ pub fn update(
         .prepare(config.select_sql().as_str())
         .expect("internal rusqlite error");
     match statement.query_row([wallet], |row| {
+        eprintln!("sssssssssss");
         let balance_result: rusqlite::Result<i128> = row.get(0);
         match balance_result {
             Ok(balance) => {
+                eprintln!("bbbb{}",balance);
                 let updated_balance = balance + amount;
                 let blob = blob_i128(updated_balance);
                 let mut adjusted_params = config.update_params().to_vec();
@@ -84,20 +88,25 @@ pub fn update(
                     .prepare(config.update_sql())
                     .expect("internal rusqlite error");
                 stm.execute(&*adjusted_params)
-                    .unwrap_or_else(|e| unimplemented!())
-                    .wrap_to_ok()
             }
             Err(e) => {
-                unimplemented!()
+               Err(e)
             }
         }
     }) {
         Ok(_) => Ok(()),
-        Err(e) => unimplemented!("{}", e),
+        Err(e) => Err(format!(
+            "Updating balance for {} of {} Wei to {}; failing on: '{}'",
+            config.table(),
+            amount,
+            wallet,
+            e
+        )),
     }
 }
 
 pub trait UpdateConfiguration<'a> {
+    fn table(&self) -> String;
     fn select_sql(&self) -> String;
     fn update_sql(&self) -> &'a str;
     fn update_params(&self) -> &'a [(&'static str, &'a dyn ToSql)];
@@ -105,6 +114,10 @@ pub trait UpdateConfiguration<'a> {
 }
 
 impl<'a> UpdateConfiguration<'a> for InsertUpdateConfig<'a> {
+    fn table(&self) -> String {
+        self.table.to_string()
+    }
+
     fn select_sql(&self) -> String {
         format!(
             "select balance from {} where wallet_address = ?",
@@ -126,7 +139,12 @@ impl<'a> UpdateConfiguration<'a> for InsertUpdateConfig<'a> {
 }
 
 impl<'a> UpdateConfiguration<'a> for UpdateConfig<'a> {
+    fn table(&self) -> String {
+        self.table.to_string()
+    }
+
     fn select_sql(&self) -> String {
+        eprintln!("mmmmmmmmmmmmmmmmmmmmmmmmmmm");
         format!(
             "select balance from {} where wallet_address = :wallet",
             self.table
@@ -147,7 +165,7 @@ impl<'a> UpdateConfiguration<'a> for UpdateConfig<'a> {
 }
 
 //update
-fn update_receivable(
+pub fn update_receivable(
     conn: &dyn ConnectionWrapper,
     wallet: &str,
     amount: i128,
@@ -158,11 +176,11 @@ fn update_receivable(
         params: &[(":wallet",&wallet),(":last_received",&last_received_time_stamp)],
         table: Table::Receivable
     };
-    update(conn, wallet, amount, &config).map_err(|e| unimplemented!())
+    update(conn, wallet, amount, &config).map_err(receivable_rusqlite_error)
 }
 
 //insert_update
-fn insert_or_update_receivable(
+pub fn insert_or_update_receivable(
     conn: &dyn ConnectionWrapper,
     wallet: &str,
     amount: i128,
@@ -173,7 +191,7 @@ fn insert_or_update_receivable(
         params: &[(":wallet", &wallet), (":balance", &amount)],
         table: Table::Receivable
     };
-    insert_or_update(conn, wallet, amount, config).map_err(|e| unimplemented!())
+    insert_or_update(conn, wallet, amount, config).map_err(receivable_rusqlite_error)
 }
 
 pub fn insert_or_update_payable(
@@ -187,7 +205,7 @@ pub fn insert_or_update_payable(
         params: &[(":wallet", &wallet), (":balance", &amount)],
         table: Table::Payable
     };
-    insert_or_update(conn, wallet, amount, config).map_err(|e| unimplemented!())
+    insert_or_update(conn, wallet, amount, config).map_err(payable_rusqlite_error)
 }
 
 pub fn insert_or_update_payable_from_our_payment(
@@ -203,22 +221,29 @@ pub fn insert_or_update_payable_from_our_payment(
         params: &[(":wallet", &wallet), (":balance", &amount), (":last_paid", &last_paid_timestamp), (":transaction", &transaction_hash)],
         table: Table::Payable
     };
-    insert_or_update(conn, wallet, amount, config).map_err(|e| unimplemented!())
+    insert_or_update(conn, wallet, amount, config).map_err(payable_rusqlite_error)
+}
+
+fn receivable_rusqlite_error(err: String) -> AccountantError {
+    AccountantError::ReceivableError(ReceivableError::RusqliteError(err))
+}
+
+fn payable_rusqlite_error(err: String) -> AccountantError {
+    AccountantError::PayableError(PayableError::RusqliteError(err))
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::accountant::dao_shared_methods::{
-        insert_or_update_payable, insert_or_update_payable_from_our_payment,
-        insert_or_update_receivable, update_receivable, Table,
-    };
-    use crate::database::connection_wrapper::ConnectionWrapper;
+    use crate::accountant::dao_shared_methods::{insert_or_update_payable, insert_or_update_payable_from_our_payment, insert_or_update_receivable, update_receivable, Table, update, InsertUpdateConfig, UpdateConfig};
+    use crate::accountant::receivable_dao::ReceivableError;
+    use crate::accountant::{AccountantError, PayableError};
+    use crate::database::connection_wrapper::{ConnectionWrapper, ConnectionWrapperReal};
     use crate::database::db_initializer::{DbInitializer, DbInitializerReal};
     use masq_lib::blockchains::chains::Chain;
-    use masq_lib::constants::DEFAULT_CHAIN;
     use masq_lib::test_utils::utils::ensure_node_home_directory_exists;
-    use rusqlite::{named_params, Connection};
+    use rusqlite::{named_params, Connection, params};
     use std::time::SystemTime;
+    use rusqlite::types::Value;
 
     #[test]
     fn update_receivable_works_positive() {
@@ -304,13 +329,9 @@ mod tests {
 
         assert_eq!(result, Ok(()));
         let (balance, last_timestamp) = read_row_receivable(conn_ref, wallet_address).unwrap();
-        assert_eq!(
-            last_timestamp,
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64
-        ); //TODO this is going to produce troubles
+        assert!(
+            is_timely_around(last_timestamp)
+        );
         assert_eq!(balance, amount_wei)
     }
 
@@ -336,13 +357,9 @@ mod tests {
 
         assert_eq!(result, Ok(()));
         let (balance, last_timestamp) = read_row_receivable(conn_ref, wallet_address).unwrap();
-        assert_eq!(
-            last_timestamp,
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64
-        ); //TODO this is going to produce troubles
+        assert!(
+            is_timely_around(last_timestamp)
+        );
         assert_eq!(balance, -125_125)
     }
 
@@ -419,13 +436,9 @@ mod tests {
         assert_eq!(result, Ok(()));
         let (balance, last_timestamp, pending_transaction_hash) =
             read_row_payable(conn_ref, wallet_address).unwrap();
-        assert_eq!(
-            last_timestamp,
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64
-        ); //TODO this is going to produce troubles
+        assert!(
+            is_timely_around(last_timestamp)
+        );
         assert_eq!(balance, amount_wei);
         assert_eq!(pending_transaction_hash, None)
     }
@@ -453,13 +466,9 @@ mod tests {
         assert_eq!(result, Ok(()));
         let (balance, last_timestamp, pending_transaction_hash) =
             read_row_payable(conn_ref, wallet_address).unwrap();
-        assert_eq!(
-            last_timestamp,
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64
-        ); //TODO this is going to produce troubles
+        assert!(
+            is_timely_around(last_timestamp)
+        );
         assert_eq!(balance, -1_245_999);
         assert_eq!(pending_transaction_hash, None)
     }
@@ -595,7 +604,7 @@ mod tests {
         assert_eq!(result, Ok(()));
         let (balance, last_timestamp, pending_transaction_hash) =
             read_row_payable(conn_ref, wallet_address).unwrap();
-        assert_eq!(last_timestamp, last_paid_timestamp); //TODO this is going to produce troubles
+        assert_eq!(last_timestamp, last_paid_timestamp);
         assert_eq!(balance, -1_245_100);
         assert_eq!(pending_transaction_hash, Some(transaction_hash.to_string()))
     }
@@ -680,6 +689,188 @@ mod tests {
         assert_eq!(pending_transaction_hash, Some(transaction_hash.to_string()))
     }
 
+    #[test]
+    fn update_receivable_with_database_with_screwed_table() {
+        let wallet_address = "xyz123";
+        let conn = Connection::open_in_memory().unwrap();
+        create_broken_receivable(&conn);
+        let wrapped_conn = ConnectionWrapperReal::new(conn);
+        let amount_wei = 100;
+        let last_received_time_stamp_sec = 123;
+
+        let result = update_receivable(
+            &wrapped_conn,
+            wallet_address,
+            amount_wei,
+            last_received_time_stamp_sec,
+        );
+
+        assert_eq!(result, Err(AccountantError::ReceivableError(ReceivableError::RusqliteError("Updating balance for receivable of 100 Wei to xyz123; failing on: 'Query returned no rows'".to_string()))));
+    }
+
+    #[test]
+    //TODO rewrite this so that it uses internally mocked insert_or_update()
+    fn insert_or_update_receivable_with_database_with_screwed_table() {
+        let wallet_address = "xyz123";
+        let conn = Connection::open_in_memory().unwrap();
+        create_broken_receivable(&conn);
+        let wrapped_conn = ConnectionWrapperReal::new(conn);
+        let amount_wei = 100;
+
+        let result = insert_or_update_receivable(&wrapped_conn, wallet_address, amount_wei);
+
+        assert_eq!(result, Err(AccountantError::ReceivableError(ReceivableError::RusqliteError("Updating balance after invalid insertion for receivable of 100 Wei to xyz123; failing on: 'datatype mismatch'".to_string()))));
+    }
+
+    #[test]
+    //TODO rewrite this so that it uses internally mocked insert_or_update()
+    fn insert_or_update_payable_with_database_with_screwed_table() {
+        let wallet_address = "xyz123";
+        let conn = Connection::open_in_memory().unwrap();
+        create_broken_payable(&conn);
+        let wrapped_conn = ConnectionWrapperReal::new(conn);
+        let amount_wei = 100;
+
+        let result = insert_or_update_payable(&wrapped_conn, wallet_address, amount_wei);
+
+        assert_eq!(result, Err(AccountantError::PayableError(PayableError::RusqliteError("Updating balance after invalid insertion for payable of 100 Wei to xyz123; failing on: 'datatype mismatch'".to_string()))));
+    }
+
+    #[test]
+    //TODO rewrite this so that it uses internally mocked insert_or_update()
+    fn insert_or_update_payable_after_our_payment_with_database_with_screwed_table() {
+        let wallet_address = "xyz123";
+        let conn = Connection::open_in_memory().unwrap();
+        create_broken_payable(&conn);
+        let wrapped_conn = ConnectionWrapperReal::new(conn);
+        let amount_wei = 100;
+        let last_received_time_stamp_sec = 123;
+        let tx_hash = "ab45cab45";
+
+        let result = insert_or_update_payable_from_our_payment(
+            &wrapped_conn,
+            wallet_address,
+            amount_wei,
+            last_received_time_stamp_sec,
+            tx_hash,
+        );
+
+        assert_eq!(result, Err(AccountantError::PayableError(PayableError::RusqliteError("Updating balance after invalid insertion for payable of 100 Wei to xyz123; failing on: 'datatype mismatch'".to_string()))));
+    }
+
+    #[test]
+    fn update_handles_error_with_insert_update_config(){
+        let wallet_address = "a11122";
+        let conn = Connection::open_in_memory().unwrap();
+        create_broken_payable(&conn);
+        let wrapped_conn = ConnectionWrapperReal::new(conn);
+        let amount_wei = 100;
+        let last_received_time_stamp_sec = 123;
+        let update_config = InsertUpdateConfig{
+            insert_sql: "",
+            update_sql: "",
+            params: &[],
+            table: Table::Payable
+        };
+
+        let result = update(
+            &wrapped_conn,
+            wallet_address,
+            amount_wei,
+            &update_config
+        );
+
+        assert_eq!(result, Err("Updating balance for payable of 100 Wei to a11122; failing on: 'Query returned no rows'".to_string()));
+    }
+
+    #[test]
+    fn update_handles_error_on_a_row_due_to_unfitting_data_types(){
+        let wallet_address = "a11122";
+        let path = ensure_node_home_directory_exists(
+            "dao_shared_methods",
+            "update_handles_error_on_a_row_due_to_unfitting_data_types",
+        );
+        let conn = DbInitializerReal::default()
+            .initialize(&path, Chain::PolyMainnet, true)
+            .unwrap();
+        let conn_ref = conn.as_ref();
+        insert_payable_balance_last_time_stamp_transaction_hash_with_bad_data_types(conn_ref, wallet_address);
+        let amount_wei = 100;
+        let last_received_time_stamp_sec = 123;
+        let null_value = Value::Null;
+        let update_config = UpdateConfig {
+            update_sql: "update receivable set balance = :updated_balance, last_received_timestamp = :last_received where wallet_address = :wallet",
+            params: &[(":wallet",&wallet_address),(":last_received",&last_received_time_stamp_sec)],
+            table: Table::Payable
+        };
+
+        let result = update(
+            conn_ref,
+            wallet_address,
+            amount_wei,
+            &update_config
+        );
+
+        assert_eq!(result, Err("Updating balance for payable of 100 Wei to a11122; failing on: 'Invalid column type Text at index: 0, name: balance'".to_string()));
+    }
+
+    #[test]
+    fn update_handles_error_on_a_row_due_to_bad_sql_params(){
+        let wallet_address = "a11122";
+        let path = ensure_node_home_directory_exists(
+            "dao_shared_methods",
+            "update_handles_error_on_a_row_due_to_bad_sql_params",
+        );
+        let conn = DbInitializerReal::default()
+            .initialize(&path, Chain::PolyMainnet, true)
+            .unwrap();
+        let conn_ref = conn.as_ref();
+        let mut stm = conn_ref.prepare("insert into payable (wallet_address, balance, last_paid_timestamp, pending_payment_transaction) values (?,?,strftime('%s','now'),null)").unwrap();
+        stm.execute(params![wallet_address,45245_i128]).unwrap();
+        let amount_wei = 100;
+        let last_received_time_stamp_sec = 123;
+        let null_value = Value::Null;
+        let update_config = UpdateConfig {
+            update_sql: "update receivable set balance = ?, last_received_timestamp = ? where wallet_address = ?",
+            params: &[(":woodstock",&wallet_address),(":hendrix",&last_received_time_stamp_sec)],
+            table: Table::Payable
+        };
+
+        let result = update(
+            conn_ref,
+            wallet_address,
+            amount_wei,
+            &update_config
+        );
+
+        assert_eq!(result, Err("Updating balance for payable of 100 Wei to a11122; failing on: 'Invalid parameter name: :updated_balance'".to_string()));
+    }
+
+    fn create_broken_receivable(conn: &Connection) {
+        conn.execute(
+            "create table receivable (
+                wallet_address integer primary key,
+                balance text null,
+                last_received_timestamp integer not null
+            )",
+            [],
+        )
+        .unwrap();
+    }
+
+    fn create_broken_payable(conn: &Connection) {
+        conn.execute(
+            "create table payable (
+                wallet_address integer primary key,
+                balance text null,
+                last_paid_timestamp text not null,
+                pending_payment_transaction integer null
+            )",
+            [],
+        )
+        .unwrap();
+    }
+
     fn insert_receivable_100_balance_100_last_time_stamp(
         conn: &dyn ConnectionWrapper,
         wallet: &str,
@@ -702,6 +893,20 @@ mod tests {
             ":balance":100_i128,
             ":last_time_stamp":100_i64,
             ":pending_payment_hash":"abc"
+        };
+        let mut stm = conn.prepare("insert into payable (wallet_address, balance, last_paid_timestamp, pending_payment_transaction) values (:wallet,:balance,:last_time_stamp,:pending_payment_hash)").unwrap();
+        stm.execute(params).unwrap();
+    }
+
+    fn insert_payable_balance_last_time_stamp_transaction_hash_with_bad_data_types(
+        conn: &dyn ConnectionWrapper,
+        wallet: &str,
+    ) {
+        let params = named_params! {
+            ":wallet":wallet,
+            ":balance":"bubblebooo",
+            ":last_time_stamp":"genesis",
+            ":pending_payment_hash":45
         };
         let mut stm = conn.prepare("insert into payable (wallet_address, balance, last_paid_timestamp, pending_payment_transaction) values (:wallet,:balance,:last_time_stamp,:pending_payment_hash)").unwrap();
         stm.execute(params).unwrap();
@@ -752,5 +957,13 @@ mod tests {
                 pending_transaction_hash.unwrap(),
             ))
         })
+    }
+
+    fn is_timely_around(time_stamp: i64)->bool{
+        let new_now =   SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        (new_now - 3) < time_stamp && time_stamp <= new_now
     }
 }

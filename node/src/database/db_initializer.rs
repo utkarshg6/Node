@@ -9,7 +9,7 @@ use masq_lib::constants::{
 };
 use rand::prelude::*;
 use rusqlite::Error::InvalidColumnType;
-use rusqlite::{Connection, OpenFlags, NO_PARAMS};
+use rusqlite::{Connection, OpenFlags};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs;
@@ -409,7 +409,7 @@ impl DbInitializerReal {
                 if encrypted { 1 } else { 0 }
             )
             .as_str(),
-            NO_PARAMS,
+            [],
         )
         .unwrap_or_else(|e| panic!("Can't preload config table with {}: {:?}", readable, e));
     }
@@ -614,7 +614,7 @@ mod tests {
         let conn = Connection::open_with_flags(&home_dir.join(DATABASE_FILE), flags).unwrap();
 
         let mut stmt = conn.prepare ("select wallet_address, balance, last_paid_timestamp, pending_payment_transaction from payable").unwrap ();
-        let mut payable_contents = stmt.query_map(NO_PARAMS, |_| Ok(42)).unwrap();
+        let mut payable_contents = stmt.query_map([], |_| Ok(42)).unwrap();
         assert!(payable_contents.next().is_none());
     }
 
@@ -637,7 +637,7 @@ mod tests {
         let mut stmt = conn
             .prepare("select wallet_address, balance, last_received_timestamp from receivable")
             .unwrap();
-        let mut receivable_contents = stmt.query_map(NO_PARAMS, |_| Ok(())).unwrap();
+        let mut receivable_contents = stmt.query_map([], |_| Ok(())).unwrap();
         assert!(receivable_contents.next().is_none());
     }
 
@@ -658,7 +658,7 @@ mod tests {
         let conn = Connection::open_with_flags(&home_dir.join(DATABASE_FILE), flags).unwrap();
 
         let mut stmt = conn.prepare("select wallet_address from banned").unwrap();
-        let mut banned_contents = stmt.query_map(NO_PARAMS, |_| Ok(42)).unwrap();
+        let mut banned_contents = stmt.query_map([], |_| Ok(42)).unwrap();
         assert!(banned_contents.next().is_none());
     }
 
@@ -720,7 +720,7 @@ mod tests {
             let conn = Connection::open_with_flags(&home_dir.join(DATABASE_FILE), flags).unwrap();
             conn.execute(
                 "insert into config (name, value, encrypted) values ('preexisting', 'yes', 0)",
-                NO_PARAMS,
+                [],
             )
             .unwrap();
         }
@@ -795,7 +795,7 @@ mod tests {
             let conn = Connection::open_with_flags(&home_dir.join(DATABASE_FILE), flags).unwrap();
             conn.execute(
                 "delete from config where name = 'schema_version'",
-                NO_PARAMS,
+                [],
             )
             .unwrap();
         }
@@ -828,7 +828,7 @@ mod tests {
             let conn = Connection::open_with_flags(&home_dir.join(DATABASE_FILE), flags).unwrap();
             conn.execute(
                 "update config set value = 'boooobles' where name = 'schema_version'",
-                NO_PARAMS,
+                [],
             )
             .unwrap();
         }

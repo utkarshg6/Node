@@ -328,7 +328,7 @@ mod tests {
     use crate::test_utils::make_wallet;
     use ethereum_types::BigEndianHash;
     use masq_lib::test_utils::utils::{ensure_node_home_directory_exists, TEST_DEFAULT_CHAIN};
-    use rusqlite::{Connection, OpenFlags, NO_PARAMS};
+    use rusqlite::{Connection, OpenFlags};
     use std::str::FromStr;
     use web3::types::U256;
 

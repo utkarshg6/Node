@@ -406,7 +406,6 @@ mod tests {
     use crate::test_utils::logging::TestLogHandler;
     use crate::test_utils::make_wallet;
     use masq_lib::test_utils::utils::{ensure_node_home_directory_exists, TEST_DEFAULT_CHAIN};
-    use rusqlite::NO_PARAMS;
     use rusqlite::{Connection, Error, OpenFlags};
 
     #[test]
@@ -572,7 +571,7 @@ mod tests {
                     .unwrap();
             conn.execute(
                 "update receivable set last_received_timestamp = 0 where wallet_address = '0x000000000000000000000000000000626f6f6761'",
-                NO_PARAMS,
+                [],
             )
             .unwrap();
             subject

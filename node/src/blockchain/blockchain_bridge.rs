@@ -1,7 +1,7 @@
 // Copyright (c) 2019, MASQ (https://masq.ai) and/or its affiliates. All rights reserved.
 
 use crate::accountant::payable_dao::Payment;
-use crate::accountant::{i128_to_unsigned, u128_to_signed};
+use crate::accountant::{i128_to_unsigned};
 use crate::blockchain::blockchain_interface::{
     BlockchainError, BlockchainInterface, BlockchainResult, Transaction,
 };
@@ -22,7 +22,6 @@ use actix::{Addr, Recipient};
 use masq_lib::crash_point::CrashPoint;
 use masq_lib::messages::{FromMessageBody, UiCrashRequest};
 use masq_lib::ui_gateway::NodeFromUiMessage;
-use std::convert::TryFrom;
 
 pub const CRASH_KEY: &str = "BLOCKCHAINBRIDGE";
 

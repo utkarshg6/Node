@@ -917,8 +917,8 @@ pub mod tests {
     use std::thread;
     use std::time::Duration;
     use std::time::SystemTime;
+    use web3::types::H256;
     use web3::types::U256;
-    use web3::types::{H256};
 
     #[derive(Debug, Default)]
     pub struct PayableDaoMock {

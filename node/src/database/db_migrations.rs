@@ -5,7 +5,7 @@ use crate::database::db_initializer::CURRENT_SCHEMA_VERSION;
 use crate::sub_lib::logger::Logger;
 use masq_lib::blockchains::chains::Chain;
 use masq_lib::utils::{ExpectValue, WrapResult};
-use rusqlite::{Transaction};
+use rusqlite::Transaction;
 use std::fmt::Debug;
 
 pub trait DbMigrator {
@@ -728,11 +728,9 @@ mod tests {
         let connection = Connection::open(&db_path).unwrap();
         //when an error occurs, the underlying transaction gets rolled back, and we cannot see any changes to the database
         let assertion: Option<(String, String)> = connection
-            .query_row(
-                "SELECT count FROM test WHERE name='mushrooms'",
-                [],
-                |row| Ok((row.get(0).unwrap(), row.get(1).unwrap())),
-            )
+            .query_row("SELECT count FROM test WHERE name='mushrooms'", [], |row| {
+                Ok((row.get(0).unwrap(), row.get(1).unwrap()))
+            })
             .optional()
             .unwrap();
         assert!(assertion.is_none()) //means no result for this query

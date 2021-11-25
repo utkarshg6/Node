@@ -1,5 +1,4 @@
 // Copyright (c) 2019, MASQ (https://masq.ai) and/or its affiliates. All rights reserved.
-use crate::accountant::dao_shared_methods::blob_i128;
 use crate::accountant::u128_to_signed;
 use crate::accountant::{u64_to_signed, AccountantError, PaymentCurves, SignConversionError};
 use crate::blockchain::blockchain_interface::Transaction;
@@ -294,7 +293,7 @@ impl ReceivableDaoReal {
     fn try_insert(&self, wallet: &Wallet, amount: i128) -> Result<(), String> {
         let timestamp = dao_utils::to_time_t(SystemTime::now());
         let mut stmt = self.conn.prepare("insert into receivable (wallet_address, balance, last_received_timestamp) values (?, ?, ?)").expect("Internal error");
-        let params: &[&dyn ToSql] = &[&wallet, &blob_i128(amount), &(timestamp as i64)];
+        let params: &[&dyn ToSql] = &[&wallet /*, &blob_i128(amount)*/, &(timestamp as i64)];
         match stmt.execute(params) {
             Ok(_) => Ok(()),
             Err(e) => Err(format!("{}", e)),

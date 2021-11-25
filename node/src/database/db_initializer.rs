@@ -793,11 +793,8 @@ mod tests {
             let mut flags = OpenFlags::empty();
             flags.insert(OpenFlags::SQLITE_OPEN_READ_WRITE);
             let conn = Connection::open_with_flags(&home_dir.join(DATABASE_FILE), flags).unwrap();
-            conn.execute(
-                "delete from config where name = 'schema_version'",
-                [],
-            )
-            .unwrap();
+            conn.execute("delete from config where name = 'schema_version'", [])
+                .unwrap();
         }
         let subject = DbInitializerReal::default();
 

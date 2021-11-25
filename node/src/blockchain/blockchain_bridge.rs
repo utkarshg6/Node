@@ -1,7 +1,7 @@
 // Copyright (c) 2019, MASQ (https://masq.ai) and/or its affiliates. All rights reserved.
 
+use crate::accountant::i128_to_unsigned;
 use crate::accountant::payable_dao::Payment;
-use crate::accountant::{i128_to_unsigned};
 use crate::blockchain::blockchain_interface::{
     BlockchainError, BlockchainInterface, BlockchainResult, Transaction,
 };

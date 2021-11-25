@@ -1,5 +1,4 @@
 // Copyright (c) 2019, MASQ (https://masq.ai) and/or its affiliates. All rights reserved.
-use crate::accountant::dao_shared_methods::blob_i128;
 use crate::accountant::{
     u128_to_signed, u64_to_signed, AccountantError, PayableError, SignConversionError,
 };
@@ -285,7 +284,7 @@ impl PayableDaoReal {
             .prepare("insert into payable (wallet_address, balance, last_paid_timestamp, pending_payment_transaction) values (:address, :balance, strftime('%s','now'), null) on conflict (wallet_address) do update set balance = balance + :balance where wallet_address = :address")
             .expect("Internal error");
         let amount = u128_to_signed(amount).map_err(|e| e.into_payable())?;
-        let params = named_params! {":address": &wallet, ":balance": &blob_i128(amount)};
+        let params = named_params! {":address": &wallet/*, ":balance": &blob_i128(amount)*/};
         match stmt.execute(params) {
             Ok(0) => Ok(false),
             Ok(_) => Ok(true),
@@ -306,7 +305,7 @@ impl PayableDaoReal {
             .expect("Internal error");
         let amount = u128_to_signed(amount).map_err(|e| e.into_payable())?;
         let params = named_params! {
-            ":balance": &blob_i128(amount),
+            /*":balance": &blob_i128(amount),*/
             ":last_paid": &dao_utils::to_time_t(last_paid_timestamp),
             ":transaction": &format!("{:#x}", &transaction_hash),
             ":address": &wallet
@@ -777,6 +776,4 @@ mod tests {
 
         assert_eq!(result, 0)
     }
-
-    fn read_blob_to_i128() {}
 }

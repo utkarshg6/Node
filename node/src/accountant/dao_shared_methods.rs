@@ -4,9 +4,10 @@ use crate::accountant::receivable_dao::ReceivableError;
 use crate::accountant::{AccountantError, PayableError};
 use crate::database::connection_wrapper::ConnectionWrapper;
 use rusqlite::types::Value;
-use rusqlite::{ToSql};
+use rusqlite::ToSql;
 use std::fmt::{Display, Formatter};
 
+#[derive(Clone)]
 pub struct InsertUpdateConfig<'a> {
     insert_sql: &'a str,
     update_sql: &'a str,
@@ -20,6 +21,7 @@ pub struct UpdateConfig<'a> {
     table: Table,
 }
 
+#[derive(PartialEq, Debug, Clone)]
 enum Table {
     Payable,
     Receivable,
@@ -34,74 +36,95 @@ impl Display for Table {
     }
 }
 
-fn insert_or_update(
-    conn: &dyn ConnectionWrapper,
-    wallet: &str,
-    amount: i128,
-    config: InsertUpdateConfig,
-) -> Result<(), String> {
-    let params = config.params;
-    let mut stm = conn
-        .prepare(config.insert_sql)
-        .expect("internal rusqlite error");
-    match stm.execute(&*params) {
-        Ok(rows) => return Ok(()),
-        Err(e) => {
-            let cause = e.to_string();
-            let constraint_failed_msg = "UNIQUE constraint failed";
-            if cause.len() >= constraint_failed_msg.len()
-                && &cause[..constraint_failed_msg.len()] == constraint_failed_msg
-            {
-                update(conn, wallet, amount, &config)
-            } else {
-                Err(format!("Updating balance after invalid insertion for {} of {} Wei to {}; failing on: '{}'",config.table,amount,wallet,cause))
+pub trait InsertUpdateCore {
+    fn update(
+        &self,
+        conn: &dyn ConnectionWrapper,
+        wallet: &str,
+        amount: i128,
+        config: &dyn UpdateConfiguration,
+    ) -> Result<(), String>;
+    fn insert_or_update<'a>(
+        &self,
+        conn: &dyn ConnectionWrapper,
+        wallet: &str,
+        amount: i128,
+        config: InsertUpdateConfig<'a>,
+    ) -> Result<(), String>;
+}
+
+struct InsertUpdateCoreReal;
+
+impl InsertUpdateCore for InsertUpdateCoreReal {
+    fn update(
+        &self,
+        conn: &dyn ConnectionWrapper,
+        wallet: &str,
+        amount: i128,
+        config: &dyn UpdateConfiguration,
+    ) -> Result<(), String> {
+        let mut statement = conn
+            .prepare(config.select_sql().as_str())
+            .expect("internal rusqlite error");
+        match statement.query_row([wallet], |row| {
+            let balance_result: rusqlite::Result<i128> = row.get(0);
+            match balance_result {
+                Ok(balance) => {
+                    let updated_balance = balance + amount;
+                    let blob = Self::blob_i128(updated_balance);
+                    let mut adjusted_params = config.update_params().to_vec();
+                    config.should_balance_param_be_removed(&mut adjusted_params);
+                    adjusted_params.insert(0, (":updated_balance", &blob));
+                    let mut stm = conn
+                        .prepare(config.update_sql())
+                        .expect("internal rusqlite error");
+                    stm.execute(&*adjusted_params)
+                }
+                Err(e) => Err(e),
+            }
+        }) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!(
+                "Updating balance for {} of {} Wei to {}; failing on: '{}'",
+                config.table(),
+                amount,
+                wallet,
+                e
+            )),
+        }
+    }
+
+    fn insert_or_update(
+        &self,
+        conn: &dyn ConnectionWrapper,
+        wallet: &str,
+        amount: i128,
+        config: InsertUpdateConfig,
+    ) -> Result<(), String> {
+        let params = config.params;
+        let mut stm = conn
+            .prepare(config.insert_sql)
+            .expect("internal rusqlite error");
+        match stm.execute(&*params) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                let cause = e.to_string();
+                let constraint_failed_msg = "UNIQUE constraint failed";
+                if cause.len() >= constraint_failed_msg.len()
+                    && &cause[..constraint_failed_msg.len()] == constraint_failed_msg
+                {
+                    self.update(conn, wallet, amount, &config)
+                } else {
+                    Err(format!("Updating balance after invalid insertion for {} of {} Wei to {}; failing on: '{}'", config.table, amount, wallet, cause))
+                }
             }
         }
     }
 }
 
-pub fn blob_i128(amount: i128) -> Value {
-    amount.into()
-}
-
-fn update(
-    conn: &dyn ConnectionWrapper,
-    wallet: &str,
-    amount: i128,
-    config: &dyn UpdateConfiguration,
-) -> Result<(), String> {
-    let mut statement = conn
-        .prepare(config.select_sql().as_str())
-        .expect("internal rusqlite error");
-    match statement.query_row([wallet], |row| {
-        eprintln!("sssssssssss");
-        let balance_result: rusqlite::Result<i128> = row.get(0);
-        match balance_result {
-            Ok(balance) => {
-                eprintln!("bbbb{}",balance);
-                let updated_balance = balance + amount;
-                let blob = blob_i128(updated_balance);
-                let mut adjusted_params = config.update_params().to_vec();
-                config.should_balance_param_be_removed(&mut adjusted_params);
-                adjusted_params.insert(0, (":updated_balance", &blob));
-                let mut stm = conn
-                    .prepare(config.update_sql())
-                    .expect("internal rusqlite error");
-                stm.execute(&*adjusted_params)
-            }
-            Err(e) => {
-               Err(e)
-            }
-        }
-    }) {
-        Ok(_) => Ok(()),
-        Err(e) => Err(format!(
-            "Updating balance for {} of {} Wei to {}; failing on: '{}'",
-            config.table(),
-            amount,
-            wallet,
-            e
-        )),
+impl InsertUpdateCoreReal {
+    pub fn blob_i128(amount: i128) -> Value {
+        amount.into()
     }
 }
 
@@ -144,7 +167,6 @@ impl<'a> UpdateConfiguration<'a> for UpdateConfig<'a> {
     }
 
     fn select_sql(&self) -> String {
-        eprintln!("mmmmmmmmmmmmmmmmmmmmmmmmmmm");
         format!(
             "select balance from {} where wallet_address = :wallet",
             self.table
@@ -167,6 +189,7 @@ impl<'a> UpdateConfiguration<'a> for UpdateConfig<'a> {
 //update
 pub fn update_receivable(
     conn: &dyn ConnectionWrapper,
+    core: &dyn InsertUpdateCore,
     wallet: &str,
     amount: i128,
     last_received_time_stamp: i64,
@@ -176,12 +199,14 @@ pub fn update_receivable(
         params: &[(":wallet",&wallet),(":last_received",&last_received_time_stamp)],
         table: Table::Receivable
     };
-    update(conn, wallet, amount, &config).map_err(receivable_rusqlite_error)
+    core.update(conn, wallet, amount, &config)
+        .map_err(receivable_rusqlite_error)
 }
 
 //insert_update
 pub fn insert_or_update_receivable(
     conn: &dyn ConnectionWrapper,
+    core: &dyn InsertUpdateCore,
     wallet: &str,
     amount: i128,
 ) -> Result<(), AccountantError> {
@@ -191,11 +216,13 @@ pub fn insert_or_update_receivable(
         params: &[(":wallet", &wallet), (":balance", &amount)],
         table: Table::Receivable
     };
-    insert_or_update(conn, wallet, amount, config).map_err(receivable_rusqlite_error)
+    core.insert_or_update(conn, wallet, amount, config)
+        .map_err(receivable_rusqlite_error)
 }
 
 pub fn insert_or_update_payable(
     conn: &dyn ConnectionWrapper,
+    core: &dyn InsertUpdateCore,
     wallet: &str,
     amount: i128,
 ) -> Result<(), AccountantError> {
@@ -205,11 +232,13 @@ pub fn insert_or_update_payable(
         params: &[(":wallet", &wallet), (":balance", &amount)],
         table: Table::Payable
     };
-    insert_or_update(conn, wallet, amount, config).map_err(payable_rusqlite_error)
+    core.insert_or_update(conn, wallet, amount, config)
+        .map_err(payable_rusqlite_error)
 }
 
 pub fn insert_or_update_payable_from_our_payment(
     conn: &dyn ConnectionWrapper,
+    core: &dyn InsertUpdateCore,
     wallet: &str,
     amount: i128,
     last_paid_timestamp: i64,
@@ -221,7 +250,8 @@ pub fn insert_or_update_payable_from_our_payment(
         params: &[(":wallet", &wallet), (":balance", &amount), (":last_paid", &last_paid_timestamp), (":transaction", &transaction_hash)],
         table: Table::Payable
     };
-    insert_or_update(conn, wallet, amount, config).map_err(payable_rusqlite_error)
+    core.insert_or_update(conn, wallet, amount, config)
+        .map_err(payable_rusqlite_error)
 }
 
 fn receivable_rusqlite_error(err: String) -> AccountantError {
@@ -234,16 +264,120 @@ fn payable_rusqlite_error(err: String) -> AccountantError {
 
 #[cfg(test)]
 mod tests {
-    use crate::accountant::dao_shared_methods::{insert_or_update_payable, insert_or_update_payable_from_our_payment, insert_or_update_receivable, update_receivable, Table, update, InsertUpdateConfig, UpdateConfig};
+    use crate::accountant::dao_shared_methods::{
+        insert_or_update_payable, insert_or_update_payable_from_our_payment,
+        insert_or_update_receivable, update_receivable, InsertUpdateConfig, InsertUpdateCore,
+        InsertUpdateCoreReal, Table, UpdateConfig, UpdateConfiguration,
+    };
     use crate::accountant::receivable_dao::ReceivableError;
     use crate::accountant::{AccountantError, PayableError};
     use crate::database::connection_wrapper::{ConnectionWrapper, ConnectionWrapperReal};
     use crate::database::db_initializer::{DbInitializer, DbInitializerReal};
     use masq_lib::blockchains::chains::Chain;
     use masq_lib::test_utils::utils::ensure_node_home_directory_exists;
-    use rusqlite::{named_params, Connection, params};
-    use std::time::SystemTime;
+    use masq_lib::utils::SliceToVec;
     use rusqlite::types::Value;
+    use rusqlite::{named_params, params, Connection};
+    use std::cell::RefCell;
+    use std::ptr::addr_of;
+    use std::sync::{Arc, Mutex};
+    use std::time::SystemTime;
+
+    #[derive(Default)]
+    struct InsertUpdateCoreMock {
+        update_params: Arc<Mutex<Vec<(String, i128, (String, String, String, Vec<String>))>>>, //trait-object-like params tested specially
+        update_results: RefCell<Vec<Result<(), String>>>,
+        insert_or_update_params:
+            Arc<Mutex<Vec<(String, i128, (String, String, Table, Vec<String>))>>>, //I have to skip the sql params which cannot be handled in a test economically
+        insert_or_update_results: RefCell<Vec<Result<(), String>>>,
+        connection_wrapper_as_pointer_to_compare: Option<*const dyn ConnectionWrapper>,
+    }
+
+    impl InsertUpdateCore for InsertUpdateCoreMock {
+        fn update(
+            &self,
+            conn: &dyn ConnectionWrapper,
+            wallet: &str,
+            amount: i128,
+            config: &dyn UpdateConfiguration,
+        ) -> Result<(), String> {
+            let owned_params: Vec<String> = config
+                .update_params()
+                .into_iter()
+                .map(|(str, _to_sql)| str.to_string())
+                .collect();
+            self.update_params.lock().unwrap().push((
+                wallet.to_string(),
+                amount,
+                (
+                    config.select_sql(),
+                    config.update_sql().to_string(),
+                    config.table(),
+                    owned_params,
+                ),
+            ));
+            if let Some(conn_wrapp_pointer) = self.connection_wrapper_as_pointer_to_compare {
+                assert_eq!(conn_wrapp_pointer, addr_of!(*conn))
+            }
+            self.update_results.borrow_mut().remove(0)
+        }
+
+        fn insert_or_update(
+            &self,
+            conn: &dyn ConnectionWrapper,
+            wallet: &str,
+            amount: i128,
+            config: InsertUpdateConfig,
+        ) -> Result<(), String> {
+            let owned_params: Vec<String> = config
+                .params
+                .into_iter()
+                .map(|(str, _to_sql)| str.to_string())
+                .collect();
+            self.insert_or_update_params.lock().unwrap().push((
+                wallet.to_string(),
+                amount,
+                (
+                    config.update_sql.to_string(),
+                    config.insert_sql.to_string(),
+                    config.table,
+                    owned_params,
+                ),
+            ));
+            if let Some(conn_wrapp_pointer) = self.connection_wrapper_as_pointer_to_compare {
+                assert_eq!(conn_wrapp_pointer, addr_of!(*conn))
+            }
+            self.insert_or_update_results.borrow_mut().remove(0)
+        }
+    }
+
+    impl InsertUpdateCoreMock {
+        fn update_params(
+            mut self,
+            params: &Arc<Mutex<Vec<(String, i128, (String, String, String, Vec<String>))>>>,
+        ) -> Self {
+            self.update_params = params.clone();
+            self
+        }
+
+        fn update_result(self, result: Result<(), String>) -> Self {
+            self.update_results.borrow_mut().push(result);
+            self
+        }
+
+        fn insert_or_update_params(
+            mut self,
+            params: &Arc<Mutex<Vec<(String, i128, (String, String, Table, Vec<String>))>>>,
+        ) -> Self {
+            self.insert_or_update_params = params.clone();
+            self
+        }
+
+        fn insert_or_update_results(self, result: Result<(), String>) -> Self {
+            self.insert_or_update_results.borrow_mut().push(result);
+            self
+        }
+    }
 
     #[test]
     fn update_receivable_works_positive() {
@@ -265,6 +399,7 @@ mod tests {
 
         let result = update_receivable(
             conn_ref,
+            &InsertUpdateCoreReal,
             wallet_address,
             amount_wei,
             last_received_time_stamp_sec,
@@ -296,6 +431,7 @@ mod tests {
 
         let result = update_receivable(
             conn_ref,
+            &InsertUpdateCoreReal,
             wallet_address,
             amount_wei,
             last_received_time_stamp_sec,
@@ -325,13 +461,16 @@ mod tests {
         }
         let amount_wei = i128::MAX;
 
-        let result = insert_or_update_receivable(conn_ref, wallet_address, amount_wei);
+        let result = insert_or_update_receivable(
+            conn_ref,
+            &InsertUpdateCoreReal,
+            wallet_address,
+            amount_wei,
+        );
 
         assert_eq!(result, Ok(()));
         let (balance, last_timestamp) = read_row_receivable(conn_ref, wallet_address).unwrap();
-        assert!(
-            is_timely_around(last_timestamp)
-        );
+        assert!(is_timely_around(last_timestamp));
         assert_eq!(balance, amount_wei)
     }
 
@@ -353,13 +492,16 @@ mod tests {
         }
         let amount_wei = -125_125;
 
-        let result = insert_or_update_receivable(conn_ref, wallet_address, amount_wei);
+        let result = insert_or_update_receivable(
+            conn_ref,
+            &InsertUpdateCoreReal,
+            wallet_address,
+            amount_wei,
+        );
 
         assert_eq!(result, Ok(()));
         let (balance, last_timestamp) = read_row_receivable(conn_ref, wallet_address).unwrap();
-        assert!(
-            is_timely_around(last_timestamp)
-        );
+        assert!(is_timely_around(last_timestamp));
         assert_eq!(balance, -125_125)
     }
 
@@ -380,7 +522,12 @@ mod tests {
         assert_eq!(last_time_stamp, 100);
         let amount_wei = i128::MAX - 100;
 
-        let result = insert_or_update_receivable(conn_ref, wallet_address, amount_wei);
+        let result = insert_or_update_receivable(
+            conn_ref,
+            &InsertUpdateCoreReal,
+            wallet_address,
+            amount_wei,
+        );
 
         assert_eq!(result, Ok(()));
         let (balance, last_timestamp) = read_row_receivable(conn_ref, wallet_address).unwrap();
@@ -405,7 +552,12 @@ mod tests {
         assert_eq!(last_time_stamp, 100);
         let amount_wei = -123_100;
 
-        let result = insert_or_update_receivable(conn_ref, wallet_address, amount_wei);
+        let result = insert_or_update_receivable(
+            conn_ref,
+            &InsertUpdateCoreReal,
+            wallet_address,
+            amount_wei,
+        );
 
         assert_eq!(result, Ok(()));
         let (balance, last_timestamp) = read_row_receivable(conn_ref, wallet_address).unwrap();
@@ -431,14 +583,13 @@ mod tests {
         }
         let amount_wei = i128::MAX;
 
-        let result = insert_or_update_payable(conn_ref, wallet_address, amount_wei);
+        let result =
+            insert_or_update_payable(conn_ref, &InsertUpdateCoreReal, wallet_address, amount_wei);
 
         assert_eq!(result, Ok(()));
         let (balance, last_timestamp, pending_transaction_hash) =
             read_row_payable(conn_ref, wallet_address).unwrap();
-        assert!(
-            is_timely_around(last_timestamp)
-        );
+        assert!(is_timely_around(last_timestamp));
         assert_eq!(balance, amount_wei);
         assert_eq!(pending_transaction_hash, None)
     }
@@ -461,14 +612,13 @@ mod tests {
         }
         let amount_wei = -1_245_999;
 
-        let result = insert_or_update_payable(conn_ref, wallet_address, amount_wei);
+        let result =
+            insert_or_update_payable(conn_ref, &InsertUpdateCoreReal, wallet_address, amount_wei);
 
         assert_eq!(result, Ok(()));
         let (balance, last_timestamp, pending_transaction_hash) =
             read_row_payable(conn_ref, wallet_address).unwrap();
-        assert!(
-            is_timely_around(last_timestamp)
-        );
+        assert!(is_timely_around(last_timestamp));
         assert_eq!(balance, -1_245_999);
         assert_eq!(pending_transaction_hash, None)
     }
@@ -495,7 +645,8 @@ mod tests {
         assert_eq!(pending_transaction_hash, Some("abc".to_string()));
         let amount_wei = i128::MAX - 100;
 
-        let result = insert_or_update_payable(conn_ref, wallet_address, amount_wei);
+        let result =
+            insert_or_update_payable(conn_ref, &InsertUpdateCoreReal, wallet_address, amount_wei);
 
         assert_eq!(result, Ok(()));
         let (balance, last_timestamp, pending_transaction_hash) =
@@ -527,7 +678,8 @@ mod tests {
         assert_eq!(pending_transaction_hash, Some("abc".to_string()));
         let amount_wei = -90_333;
 
-        let result = insert_or_update_payable(conn_ref, wallet_address, amount_wei);
+        let result =
+            insert_or_update_payable(conn_ref, &InsertUpdateCoreReal, wallet_address, amount_wei);
 
         assert_eq!(result, Ok(()));
         let (balance, last_timestamp, pending_transaction_hash) =
@@ -559,6 +711,7 @@ mod tests {
 
         let result = insert_or_update_payable_from_our_payment(
             conn_ref,
+            &InsertUpdateCoreReal,
             wallet_address,
             amount_wei,
             last_paid_timestamp,
@@ -595,6 +748,7 @@ mod tests {
 
         let result = insert_or_update_payable_from_our_payment(
             conn_ref,
+            &InsertUpdateCoreReal,
             wallet_address,
             amount_wei,
             last_paid_timestamp,
@@ -635,6 +789,7 @@ mod tests {
 
         let result = insert_or_update_payable_from_our_payment(
             conn_ref,
+            &InsertUpdateCoreReal,
             wallet_address,
             amount_wei,
             last_paid_timestamp,
@@ -675,6 +830,7 @@ mod tests {
 
         let result = insert_or_update_payable_from_our_payment(
             conn_ref,
+            &InsertUpdateCoreReal,
             wallet_address,
             amount_wei,
             last_paid_timestamp,
@@ -690,101 +846,202 @@ mod tests {
     }
 
     #[test]
-    fn update_receivable_with_database_with_screwed_table() {
+    fn update_receivable_error_handling_and_params_assertion() {
+        let insert_or_update_params_arc = Arc::new(Mutex::new(vec![]));
         let wallet_address = "xyz123";
         let conn = Connection::open_in_memory().unwrap();
         create_broken_receivable(&conn);
         let wrapped_conn = ConnectionWrapperReal::new(conn);
-        let amount_wei = 100;
+        let supplied_amount_wei = 100;
         let last_received_time_stamp_sec = 123;
+        let insert_update_core = InsertUpdateCoreMock::default()
+            .update_params(&insert_or_update_params_arc)
+            .update_result(Err("SomethingWrong".to_string()));
 
         let result = update_receivable(
             &wrapped_conn,
+            &insert_update_core,
             wallet_address,
-            amount_wei,
+            supplied_amount_wei,
             last_received_time_stamp_sec,
         );
 
-        assert_eq!(result, Err(AccountantError::ReceivableError(ReceivableError::RusqliteError("Updating balance for receivable of 100 Wei to xyz123; failing on: 'Query returned no rows'".to_string()))));
+        assert_eq!(
+            result,
+            Err(AccountantError::ReceivableError(
+                ReceivableError::RusqliteError("SomethingWrong".to_string())
+            ))
+        );
+        let mut insert_or_update_params = insert_or_update_params_arc.lock().unwrap();
+        let (wallet, amount, (select_sql, update_sql, table, sql_param_names)) =
+            insert_or_update_params.remove(0);
+        assert!(insert_or_update_params.is_empty());
+        assert_eq!(wallet, wallet_address);
+        assert_eq!(amount, supplied_amount_wei);
+        assert_eq!(
+            select_sql,
+            "select balance from receivable where wallet_address = :wallet"
+        );
+        assert_eq!(update_sql, "update receivable set balance = :updated_balance, last_received_timestamp = :last_received where wallet_address = :wallet");
+        assert_eq!(table, Table::Receivable.to_string());
+        assert_eq!(
+            sql_param_names,
+            [":wallet", ":last_received"].array_of_borrows_to_vec()
+        )
     }
 
     #[test]
-    //TODO rewrite this so that it uses internally mocked insert_or_update()
-    fn insert_or_update_receivable_with_database_with_screwed_table() {
+    fn insert_or_update_receivable_error_handling_and_params_assertion() {
+        let insert_or_update_params_arc = Arc::new(Mutex::new(vec![]));
         let wallet_address = "xyz123";
         let conn = Connection::open_in_memory().unwrap();
         create_broken_receivable(&conn);
         let wrapped_conn = ConnectionWrapperReal::new(conn);
-        let amount_wei = 100;
+        let supplied_amount_wei = 100;
+        let insert_update_core = InsertUpdateCoreMock::default()
+            .insert_or_update_params(&insert_or_update_params_arc)
+            .insert_or_update_results(Err("SomethingWrong".to_string()));
 
-        let result = insert_or_update_receivable(&wrapped_conn, wallet_address, amount_wei);
+        let result = insert_or_update_receivable(
+            &wrapped_conn,
+            &insert_update_core,
+            wallet_address,
+            supplied_amount_wei,
+        );
 
-        assert_eq!(result, Err(AccountantError::ReceivableError(ReceivableError::RusqliteError("Updating balance after invalid insertion for receivable of 100 Wei to xyz123; failing on: 'datatype mismatch'".to_string()))));
+        assert_eq!(
+            result,
+            Err(AccountantError::ReceivableError(
+                ReceivableError::RusqliteError("SomethingWrong".to_string())
+            ))
+        );
+        let mut insert_or_update_params = insert_or_update_params_arc.lock().unwrap();
+        let (wallet, amount, (update_sql, insert_sql, table, sql_param_names)) =
+            insert_or_update_params.remove(0);
+        assert!(insert_or_update_params.is_empty());
+        assert_eq!(wallet, wallet_address);
+        assert_eq!(amount, supplied_amount_wei);
+        assert_eq!(
+            update_sql,
+            "update receivable set balance = :updated_balance where wallet_address = :wallet"
+        );
+        assert_eq!(insert_sql,"insert into receivable (wallet_address, balance, last_received_timestamp) values (:wallet,:balance,strftime('%s','now'))");
+        assert_eq!(table, Table::Receivable);
+        assert_eq!(
+            sql_param_names,
+            [":wallet", ":balance"].array_of_borrows_to_vec()
+        )
     }
 
     #[test]
-    //TODO rewrite this so that it uses internally mocked insert_or_update()
-    fn insert_or_update_payable_with_database_with_screwed_table() {
+    fn insert_or_update_payable_error_handling_and_params_assertion() {
+        let insert_or_update_params_arc = Arc::new(Mutex::new(vec![]));
         let wallet_address = "xyz123";
         let conn = Connection::open_in_memory().unwrap();
         create_broken_payable(&conn);
         let wrapped_conn = ConnectionWrapperReal::new(conn);
-        let amount_wei = 100;
+        let supplied_amount_wei = 100;
+        let insert_update_core = InsertUpdateCoreMock::default()
+            .insert_or_update_params(&insert_or_update_params_arc)
+            .insert_or_update_results(Err("SomethingWrong".to_string()));
 
-        let result = insert_or_update_payable(&wrapped_conn, wallet_address, amount_wei);
+        let result = insert_or_update_payable(
+            &wrapped_conn,
+            &insert_update_core,
+            wallet_address,
+            supplied_amount_wei,
+        );
 
-        assert_eq!(result, Err(AccountantError::PayableError(PayableError::RusqliteError("Updating balance after invalid insertion for payable of 100 Wei to xyz123; failing on: 'datatype mismatch'".to_string()))));
+        assert_eq!(
+            result,
+            Err(AccountantError::PayableError(PayableError::RusqliteError(
+                "SomethingWrong".to_string()
+            )))
+        );
+        let mut insert_or_update_params = insert_or_update_params_arc.lock().unwrap();
+        let (wallet, amount, (update_sql, insert_sql, table, sql_param_names)) =
+            insert_or_update_params.remove(0);
+        assert!(insert_or_update_params.is_empty());
+        assert_eq!(wallet, wallet_address);
+        assert_eq!(amount, supplied_amount_wei);
+        assert_eq!(
+            update_sql,
+            "update payable set balance = :updated_balance where wallet_address = :wallet"
+        );
+        assert_eq!(insert_sql,"insert into payable (wallet_address, balance, last_paid_timestamp, pending_payment_transaction) values (:wallet,:balance,strftime('%s','now'),null)");
+        assert_eq!(table, Table::Payable);
+        assert_eq!(
+            sql_param_names,
+            [":wallet", ":balance"].array_of_borrows_to_vec()
+        )
     }
 
     #[test]
-    //TODO rewrite this so that it uses internally mocked insert_or_update()
-    fn insert_or_update_payable_after_our_payment_with_database_with_screwed_table() {
+    fn insert_or_update_payable_after_our_payment_error_handling_and_params_assertion() {
+        let insert_or_update_params_arc = Arc::new(Mutex::new(vec![]));
         let wallet_address = "xyz123";
         let conn = Connection::open_in_memory().unwrap();
         create_broken_payable(&conn);
         let wrapped_conn = ConnectionWrapperReal::new(conn);
-        let amount_wei = 100;
+        let supplied_amount_wei = 100;
         let last_received_time_stamp_sec = 123;
         let tx_hash = "ab45cab45";
+        let insert_update_core = InsertUpdateCoreMock::default()
+            .insert_or_update_params(&insert_or_update_params_arc)
+            .insert_or_update_results(Err("SomethingWrong".to_string()));
 
         let result = insert_or_update_payable_from_our_payment(
             &wrapped_conn,
+            &insert_update_core,
             wallet_address,
-            amount_wei,
+            supplied_amount_wei,
             last_received_time_stamp_sec,
             tx_hash,
         );
 
-        assert_eq!(result, Err(AccountantError::PayableError(PayableError::RusqliteError("Updating balance after invalid insertion for payable of 100 Wei to xyz123; failing on: 'datatype mismatch'".to_string()))));
+        assert_eq!(
+            result,
+            Err(AccountantError::PayableError(PayableError::RusqliteError(
+                "SomethingWrong".to_string()
+            )))
+        );
+        let mut insert_or_update_params = insert_or_update_params_arc.lock().unwrap();
+        let (wallet, amount, (update_sql, insert_sql, table, sql_param_names)) =
+            insert_or_update_params.remove(0);
+        assert!(insert_or_update_params.is_empty());
+        assert_eq!(wallet, wallet_address);
+        assert_eq!(amount, supplied_amount_wei);
+        assert_eq!(update_sql,"update payable set balance = :updated_balance, last_paid_timestamp = :last_paid, pending_payment_transaction = :transaction where wallet_address = :wallet");
+        assert_eq!(insert_sql,"insert into payable (balance, last_paid_timestamp, pending_payment_transaction, wallet_address) values (:balance, :last_paid, :transaction, :wallet)");
+        assert_eq!(table, Table::Payable);
+        assert_eq!(
+            sql_param_names,
+            [":wallet", ":balance", ":last_paid", ":transaction"].array_of_borrows_to_vec()
+        )
     }
 
     #[test]
-    fn update_handles_error_with_insert_update_config(){
+    fn update_handles_error_for_insert_update_config() {
         let wallet_address = "a11122";
         let conn = Connection::open_in_memory().unwrap();
         create_broken_payable(&conn);
         let wrapped_conn = ConnectionWrapperReal::new(conn);
         let amount_wei = 100;
-        let last_received_time_stamp_sec = 123;
-        let update_config = InsertUpdateConfig{
+        let update_config = InsertUpdateConfig {
             insert_sql: "",
             update_sql: "",
             params: &[],
-            table: Table::Payable
+            table: Table::Payable,
         };
 
-        let result = update(
-            &wrapped_conn,
-            wallet_address,
-            amount_wei,
-            &update_config
-        );
+        let result =
+            InsertUpdateCoreReal.update(&wrapped_conn, wallet_address, amount_wei, &update_config);
 
         assert_eq!(result, Err("Updating balance for payable of 100 Wei to a11122; failing on: 'Query returned no rows'".to_string()));
     }
 
     #[test]
-    fn update_handles_error_on_a_row_due_to_unfitting_data_types(){
+    fn update_handles_error_on_a_row_due_to_unfitting_data_types() {
         let wallet_address = "a11122";
         let path = ensure_node_home_directory_exists(
             "dao_shared_methods",
@@ -794,28 +1051,26 @@ mod tests {
             .initialize(&path, Chain::PolyMainnet, true)
             .unwrap();
         let conn_ref = conn.as_ref();
-        insert_payable_balance_last_time_stamp_transaction_hash_with_bad_data_types(conn_ref, wallet_address);
+        insert_payable_balance_last_time_stamp_transaction_hash_with_bad_data_types(
+            conn_ref,
+            wallet_address,
+        );
         let amount_wei = 100;
         let last_received_time_stamp_sec = 123;
-        let null_value = Value::Null;
         let update_config = UpdateConfig {
             update_sql: "update receivable set balance = :updated_balance, last_received_timestamp = :last_received where wallet_address = :wallet",
             params: &[(":wallet",&wallet_address),(":last_received",&last_received_time_stamp_sec)],
             table: Table::Payable
         };
 
-        let result = update(
-            conn_ref,
-            wallet_address,
-            amount_wei,
-            &update_config
-        );
+        let result =
+            InsertUpdateCoreReal.update(conn_ref, wallet_address, amount_wei, &update_config);
 
         assert_eq!(result, Err("Updating balance for payable of 100 Wei to a11122; failing on: 'Invalid column type Text at index: 0, name: balance'".to_string()));
     }
 
     #[test]
-    fn update_handles_error_on_a_row_due_to_bad_sql_params(){
+    fn update_handles_error_on_a_row_due_to_bad_sql_params() {
         let wallet_address = "a11122";
         let path = ensure_node_home_directory_exists(
             "dao_shared_methods",
@@ -826,22 +1081,17 @@ mod tests {
             .unwrap();
         let conn_ref = conn.as_ref();
         let mut stm = conn_ref.prepare("insert into payable (wallet_address, balance, last_paid_timestamp, pending_payment_transaction) values (?,?,strftime('%s','now'),null)").unwrap();
-        stm.execute(params![wallet_address,45245_i128]).unwrap();
+        stm.execute(params![wallet_address, 45245_i128]).unwrap();
         let amount_wei = 100;
         let last_received_time_stamp_sec = 123;
-        let null_value = Value::Null;
         let update_config = UpdateConfig {
             update_sql: "update receivable set balance = ?, last_received_timestamp = ? where wallet_address = ?",
             params: &[(":woodstock",&wallet_address),(":hendrix",&last_received_time_stamp_sec)],
             table: Table::Payable
         };
 
-        let result = update(
-            conn_ref,
-            wallet_address,
-            amount_wei,
-            &update_config
-        );
+        let result =
+            InsertUpdateCoreReal.update(conn_ref, wallet_address, amount_wei, &update_config);
 
         assert_eq!(result, Err("Updating balance for payable of 100 Wei to a11122; failing on: 'Invalid parameter name: :updated_balance'".to_string()));
     }
@@ -912,20 +1162,6 @@ mod tests {
         stm.execute(params).unwrap();
     }
 
-    fn read_balance(conn: &dyn ConnectionWrapper, wallet: &str, table: Table) -> i128 {
-        let mut stm = conn
-            .prepare(&format!(
-                "select balance from {} where wallet_address = ?",
-                table
-            ))
-            .unwrap();
-        stm.query_row([wallet], |row| {
-            let balance: rusqlite::Result<i128> = row.get(0);
-            balance
-        })
-        .unwrap()
-    }
-
     fn read_row_receivable(
         conn: &dyn ConnectionWrapper,
         wallet_address: &str,
@@ -959,8 +1195,8 @@ mod tests {
         })
     }
 
-    fn is_timely_around(time_stamp: i64)->bool{
-        let new_now =   SystemTime::now()
+    fn is_timely_around(time_stamp: i64) -> bool {
+        let new_now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;

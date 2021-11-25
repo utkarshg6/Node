@@ -386,6 +386,11 @@ fn multi_insert_payment_error_logged(
     );
 }
 
+//TODO implement this
+pub trait TotalInnerEncapsulationReceivable{
+    fn total_inner(&self,dao:&dyn ReceivableDao)->Result<i128,AccountantError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -7,7 +7,7 @@ pub mod receivable_dao;
 #[cfg(test)]
 pub mod test_utils;
 
-use crate::accountant::payable_dao::{PayableAccount, PayableDaoFactory, Payment};
+use crate::accountant::payable_dao::{PayableAccount, PayableDaoFactory, Payment, TotalInnerEncapsulationPayableReal};
 use crate::accountant::receivable_dao::{ReceivableAccount, ReceivableDaoFactory, ReceivableError};
 use crate::banned_dao::{BannedDao, BannedDaoFactory};
 use crate::blockchain::blockchain_bridge::RetrieveTransactions;
@@ -79,9 +79,35 @@ pub enum AccountantError {
 
 impl Display for AccountantError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        todo!()
+        match self{
+            AccountantError::PayableError(msg) => write!(f,"Error from payable: {:?}",msg),
+            _ => unimplemented!()
+        }
     }
 }
+
+impl AccountantError{
+    pub fn extend(self,msg_extension:&str)->Self{
+        match self{
+            AccountantError::ReceivableError(ReceivableError::RusqliteError(msg)) => unimplemented!(),
+            AccountantError::ReceivableError(ReceivableError::ConfigurationError(msg)) => unimplemented!(),
+            AccountantError::PayableError(PayableError::RusqliteError(msg)) => AccountantError::PayableError(PayableError::RusqliteError(Self::add_str(msg,msg_extension))),
+            AccountantError::PayableError(PayableError::Owerflow(sign_conv_err)) =>
+                match sign_conv_err{
+                    SignConversionError::U128(msg) =>SignConversionError::U128(Self::add_str(msg,msg_extension)).into_payable(),
+                    SignConversionError::U64(msg) => unimplemented!(),
+                    SignConversionError::I128(msg) => unimplemented!()
+                },
+            x => x
+        }
+    }
+
+    fn add_str(msg: String,msg_extension:&str)-> String{
+        format!("{}; {}",msg,msg_extension)
+    }
+}
+
+
 
 #[derive(PartialEq, Debug)]
 pub enum PayableError {
@@ -98,7 +124,7 @@ pub enum SignConversionError {
 
 impl SignConversionError {
     fn into_payable(self) -> AccountantError {
-        unimplemented!()
+        AccountantError::PayableError(PayableError::Owerflow(self))
     }
     fn into_receivable(self) -> AccountantError {
         unimplemented!()
@@ -816,7 +842,10 @@ impl Accountant {
                     .map(|ppt| format!("0x{:0X}", ppt)),
             })
             .collect_vec();
-        let total_payable = self.payable_dao.total();
+        let total_payable = match self.payable_dao.total(&TotalInnerEncapsulationPayableReal){
+            Ok(total) => total,
+            Err(e) => unimplemented!()
+        };
         let receivables = self
             .receivable_dao
             .top_records(
@@ -885,7 +914,7 @@ pub fn u64_to_signed(value: u64) -> Result<i64, SignConversionError> {
 pub mod tests {
     use super::*;
     use crate::accountant::receivable_dao::{ReceivableAccount, ReceivableDaoFactory};
-    use crate::accountant::test_utils::make_receivable_account;
+    use crate::accountant::test_utils::{make_receivable_account, PayableDaoMock};
     use crate::blockchain::blockchain_interface::BlockchainError;
     use crate::blockchain::blockchain_interface::Transaction;
     use crate::database::dao_utils::from_time_t;
@@ -919,129 +948,6 @@ pub mod tests {
     use std::time::SystemTime;
     use web3::types::H256;
     use web3::types::U256;
-
-    #[derive(Debug, Default)]
-    pub struct PayableDaoMock {
-        account_status_parameters: Arc<Mutex<Vec<Wallet>>>,
-        account_status_results: RefCell<Vec<Option<PayableAccount>>>,
-        more_money_payable_parameters: Arc<Mutex<Vec<(Wallet, u128)>>>,
-        more_money_payable_results: RefCell<Vec<Result<(), AccountantError>>>,
-        non_pending_payables_results: RefCell<Vec<Vec<PayableAccount>>>,
-        payment_sent_parameters: Arc<Mutex<Vec<Payment>>>,
-        payment_sent_results: RefCell<Vec<Result<(), AccountantError>>>,
-        top_records_parameters: Arc<Mutex<Vec<(i128, u64)>>>,
-        top_records_results: RefCell<Vec<Result<Vec<PayableAccount>, AccountantError>>>,
-        total_results: RefCell<Vec<i128>>,
-    }
-
-    impl PayableDao for PayableDaoMock {
-        fn more_money_payable(&self, wallet: &Wallet, amount: u128) -> Result<(), AccountantError> {
-            self.more_money_payable_parameters
-                .lock()
-                .unwrap()
-                .push((wallet.clone(), amount));
-            self.more_money_payable_results.borrow_mut().remove(0)
-        }
-
-        fn payment_sent(&self, sent_payment: &Payment) -> Result<(), AccountantError> {
-            self.payment_sent_parameters
-                .lock()
-                .unwrap()
-                .push(sent_payment.clone());
-            self.payment_sent_results.borrow_mut().remove(0)
-        }
-
-        fn payment_confirmed(
-            &self,
-            _wallet: &Wallet,
-            _amount: u128,
-            _confirmation_noticed_timestamp: SystemTime,
-            _transaction_hash: H256,
-        ) -> Result<(), AccountantError> {
-            unimplemented!("SC-925: TODO")
-        }
-
-        fn account_status(&self, wallet: &Wallet) -> Option<PayableAccount> {
-            self.account_status_parameters
-                .lock()
-                .unwrap()
-                .push(wallet.clone());
-            self.account_status_results.borrow_mut().remove(0)
-        }
-
-        fn non_pending_payables(&self) -> Vec<PayableAccount> {
-            if self.non_pending_payables_results.borrow().is_empty() {
-                vec![]
-            } else {
-                self.non_pending_payables_results.borrow_mut().remove(0)
-            }
-        }
-
-        fn top_records(
-            &self,
-            minimum_amount: i128,
-            maximum_age: u64,
-        ) -> Result<Vec<PayableAccount>, AccountantError> {
-            self.top_records_parameters
-                .lock()
-                .unwrap()
-                .push((minimum_amount, maximum_age));
-            self.top_records_results.borrow_mut().remove(0)
-        }
-
-        fn total(&self) -> i128 {
-            self.total_results.borrow_mut().remove(0)
-        }
-    }
-
-    impl PayableDaoMock {
-        pub fn new() -> PayableDaoMock {
-            PayableDaoMock::default()
-        }
-
-        fn more_money_payable_parameters(
-            mut self,
-            parameters: Arc<Mutex<Vec<(Wallet, u128)>>>,
-        ) -> Self {
-            self.more_money_payable_parameters = parameters;
-            self
-        }
-
-        fn more_money_payable_result(self, result: Result<(), AccountantError>) -> Self {
-            self.more_money_payable_results.borrow_mut().push(result);
-            self
-        }
-
-        fn non_pending_payables_result(self, result: Vec<PayableAccount>) -> Self {
-            self.non_pending_payables_results.borrow_mut().push(result);
-            self
-        }
-
-        fn payment_sent_parameters(mut self, parameters: Arc<Mutex<Vec<Payment>>>) -> Self {
-            self.payment_sent_parameters = parameters;
-            self
-        }
-
-        fn payment_sent_result(self, result: Result<(), AccountantError>) -> Self {
-            self.payment_sent_results.borrow_mut().push(result);
-            self
-        }
-
-        fn top_records_parameters(mut self, parameters: &Arc<Mutex<Vec<(i128, u64)>>>) -> Self {
-            self.top_records_parameters = parameters.clone();
-            self
-        }
-
-        fn top_records_result(self, result: Result<Vec<PayableAccount>, AccountantError>) -> Self {
-            self.top_records_results.borrow_mut().push(result);
-            self
-        }
-
-        fn total_result(self, result: i128) -> Self {
-            self.total_results.borrow_mut().push(result);
-            self
-        }
-    }
 
     pub struct PayableDaoFactoryMock {
         called: Rc<RefCell<bool>>,
@@ -1430,7 +1336,7 @@ pub mod tests {
                     pending_payment_transaction: None,
                 },
             ]))
-            .total_result(23456789);
+            .total_result(Ok(23456789));
         let receivable_top_records_parameters_arc = Arc::new(Mutex::new(vec![]));
         let receivable_dao = ReceivableDaoMock::new()
             .top_records_parameters(&receivable_top_records_parameters_arc)

@@ -1,7 +1,9 @@
 // Copyright (c) 2019, MASQ (https://masq.ai) and/or its affiliates. All rights reserved.
+
 use crate::accountant::{
     u128_to_signed, u64_to_signed, AccountantError, PayableError, SignConversionError,
 };
+use std::borrow::Borrow;
 use crate::database::connection_wrapper::ConnectionWrapper;
 use crate::database::dao_utils;
 use crate::database::dao_utils::DaoFactoryReal;
@@ -12,7 +14,13 @@ use rusqlite::{named_params, Error, OptionalExtension};
 use serde_json::{self, json};
 use std::fmt::Debug;
 use std::time::SystemTime;
+use futures::Stream;
+use itertools::all;
 use web3::types::H256;
+use crate::accountant::dao_shared_methods::{insert_or_update_payable, insert_or_update_payable_after_our_payment, InsertUpdateCoreReal, reverse_sign};
+
+#[cfg(test)]
+use core::any::Any;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PayableAccount {
@@ -64,7 +72,9 @@ pub trait PayableDao: Debug + Send {
         maximum_age: u64,
     ) -> Result<Vec<PayableAccount>, AccountantError>;
 
-    fn total(&self) -> i128;
+    fn total(&self, inner: &dyn TotalInnerEncapsulationPayable) -> Result<i128,AccountantError>;
+
+    as_any_dcl!();
 }
 
 pub trait PayableDaoFactory {
@@ -83,19 +93,26 @@ pub struct PayableDaoReal {
 }
 
 impl PayableDao for PayableDaoReal {
+    //TODO we maybe can get rid of the impl of ToSql for Wallet
     fn more_money_payable(&self, wallet: &Wallet, amount: u128) -> Result<(), AccountantError> {
-        match self.try_increase_balance(wallet, amount) {
+        let amount_signed = u128_to_signed(amount).map_err(|e|e.into_payable().extend("on more money payable"))?;
+        match insert_or_update_payable(self.conn.as_ref(),&InsertUpdateCoreReal,&wallet.to_string(),amount_signed)
+        {
             Ok(_) => Ok(()),
             Err(e) => unimplemented!(),
         }
     }
 
     fn payment_sent(&self, payment: &Payment) -> Result<(), AccountantError> {
-        match self.try_decrease_balance(
-            &payment.to,
-            payment.amount,
-            payment.timestamp,
-            payment.transaction,
+        let amount_signed = u128_to_signed(payment.amount).map_err(|e|e.into_payable().extend("on payment sent"))?;
+        let reversed =reverse_sign(amount_signed).expect("should be within correct range after the previous operation");
+        match insert_or_update_payable_after_our_payment(
+            self.conn.as_ref(),
+            &InsertUpdateCoreReal,
+            &payment.to.to_string(),
+            reversed,
+            dao_utils::to_time_t(payment.timestamp),
+            &format!("{:#x}", payment.transaction)
         ) {
             Ok(_) => Ok(()),
             Err(e) => unimplemented!(),
@@ -243,34 +260,11 @@ impl PayableDao for PayableDaoReal {
         .wrap_to_ok()
     }
 
-    fn total(&self) -> i128 {
-        let mut stmt = self
-            .conn
-            .prepare("select sum(balance) from payable")
-            .expect("Internal error");
-        match stmt.query_row([], |row| {
-            let total_balance_result_signed: Result<i128, rusqlite::Error> = row.get(0);
-            match total_balance_result_signed {
-                Ok(total_balance) => Ok(total_balance),
-                Err(e)
-                    if e == rusqlite::Error::InvalidColumnType(
-                        0,
-                        "sum(balance)".to_string(),
-                        Type::Null,
-                    ) =>
-                {
-                    Ok(0_i128)
-                }
-                Err(e) => panic!(
-                    "Database is corrupt: PAYABLE table columns and/or types: {:?}",
-                    e
-                ),
-            }
-        }) {
-            Ok(value) => value,
-            Err(e) => panic!("Database is corrupt: {:?}", e),
-        }
+    fn total(&self, inner:&dyn TotalInnerEncapsulationPayable) -> Result<i128,AccountantError> {
+        inner.total_inner(self)
     }
+
+    as_any_impl!();
 }
 
 impl PayableDaoReal {
@@ -278,48 +272,70 @@ impl PayableDaoReal {
         PayableDaoReal { conn }
     }
 
-    fn try_increase_balance(&self, wallet: &Wallet, amount: u128) -> Result<bool, AccountantError> {
-        let mut stmt = self
-            .conn
-            .prepare("insert into payable (wallet_address, balance, last_paid_timestamp, pending_payment_transaction) values (:address, :balance, strftime('%s','now'), null) on conflict (wallet_address) do update set balance = balance + :balance where wallet_address = :address")
-            .expect("Internal error");
-        let amount = u128_to_signed(amount).map_err(|e| e.into_payable())?;
-        let params = named_params! {":address": &wallet/*, ":balance": &blob_i128(amount)*/};
-        match stmt.execute(params) {
-            Ok(0) => Ok(false),
-            Ok(_) => Ok(true),
-            Err(e) => unimplemented!(), //Err(AccountantError::PayableError(PayableError::StatementExecution(format!("increasing balance: {}", e)))),
-        }
-    }
+    // fn try_increase_balance(&self, wallet: &Wallet, amount: u128) -> Result<bool, AccountantError> {
+    //     let mut stmt = self
+    //         .conn
+    //         .prepare("insert into payable (wallet_address, balance, last_paid_timestamp, pending_payment_transaction) values (:address, :balance, strftime('%s','now'), null) on conflict (wallet_address) do update set balance = balance + :balance where wallet_address = :address")
+    //         .expect("Internal error");
+    //     let amount = u128_to_signed(amount).map_err(|e| e.into_payable())?;
+    //     let params = named_params! {":address": &wallet/*, ":balance": &blob_i128(amount)*/};
+    //     match stmt.execute(params) {
+    //         Ok(0) => Ok(false),
+    //         Ok(_) => Ok(true),
+    //         Err(e) => unimplemented!(), //Err(AccountantError::PayableError(PayableError::StatementExecution(format!("increasing balance: {}", e)))),
+    //     }
+    // }
+    //
+    // fn try_decrease_balance(
+    //     &self,
+    //     wallet: &Wallet,
+    //     amount: u128,
+    //     last_paid_timestamp: SystemTime,
+    //     transaction_hash: H256,
+    // ) -> Result<bool, AccountantError> {
+    //     let mut stmt = self
+    //         .conn
+    //         .prepare("insert into payable (balance, last_paid_timestamp, pending_payment_transaction, wallet_address) values (:balance, :last_paid, :transaction, :address) on conflict (wallet_address) do update set balance = balance - :balance, last_paid_timestamp = :last_paid, pending_payment_transaction = :transaction where wallet_address = :address")
+    //         .expect("Internal error");
+    //     let amount = u128_to_signed(amount).map_err(|e| e.into_payable())?;
+    //     let params = named_params! {
+    //         /*":balance": &blob_i128(amount),*/
+    //         ":last_paid": &dao_utils::to_time_t(last_paid_timestamp),
+    //         ":transaction": &format!("{:#x}", &transaction_hash),
+    //         ":address": &wallet
+    //     };
+    //     match stmt.execute(params) {
+    //         Ok(0) => Ok(false),
+    //         Ok(_) => Ok(true),
+    //         Err(e) => unimplemented!(), // Err(format!("{}", e)),
+    //     }
+    // }
+}
 
-    fn try_decrease_balance(
-        &self,
-        wallet: &Wallet,
-        amount: u128,
-        last_paid_timestamp: SystemTime,
-        transaction_hash: H256,
-    ) -> Result<bool, AccountantError> {
-        let mut stmt = self
-            .conn
-            .prepare("insert into payable (balance, last_paid_timestamp, pending_payment_transaction, wallet_address) values (:balance, :last_paid, :transaction, :address) on conflict (wallet_address) do update set balance = balance - :balance, last_paid_timestamp = :last_paid, pending_payment_transaction = :transaction where wallet_address = :address")
-            .expect("Internal error");
-        let amount = u128_to_signed(amount).map_err(|e| e.into_payable())?;
-        let params = named_params! {
-            /*":balance": &blob_i128(amount),*/
-            ":last_paid": &dao_utils::to_time_t(last_paid_timestamp),
-            ":transaction": &format!("{:#x}", &transaction_hash),
-            ":address": &wallet
+pub trait TotalInnerEncapsulationPayable{
+    fn total_inner(&self,dao:&dyn PayableDao)->Result<i128,AccountantError>;
+}
+
+pub struct TotalInnerEncapsulationPayableReal;
+
+impl TotalInnerEncapsulationPayable for TotalInnerEncapsulationPayableReal{
+    fn total_inner(&self, dao: &dyn PayableDao) -> Result<i128, AccountantError> {
+        let all_records = match dao.top_records(i128::MIN,u64::MAX/2){
+            Ok(records) => records,
+            Err(e) => return Err(e.extend("on calling total()"))
         };
-        match stmt.execute(params) {
-            Ok(0) => Ok(false),
-            Ok(_) => Ok(true),
-            Err(e) => unimplemented!(), // Err(format!("{}", e)),
-        }
+        let init = 0_i128;
+        let total = all_records.into_iter().fold(init,|so_far,current_one|{
+            so_far + current_one.balance
+        });
+        Ok(total)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::ptr::addr_of;
     use super::*;
     use crate::database::dao_utils::from_time_t;
     use crate::database::db_initializer;
@@ -329,7 +345,11 @@ mod tests {
     use masq_lib::test_utils::utils::{ensure_node_home_directory_exists, TEST_DEFAULT_CHAIN};
     use rusqlite::{Connection, OpenFlags};
     use std::str::FromStr;
+    use std::sync::{Arc, Mutex};
     use web3::types::U256;
+    use crate::accountant::test_utils::PayableDaoMock;
+    use crate::database::connection_wrapper::ConnectionWrapperReal;
+    use crate::database::db_initializer::test_utils::ConnectionWrapperMock;
 
     #[test]
     fn more_money_payable_works_for_new_address() {
@@ -423,7 +443,8 @@ mod tests {
         assert_eq!(
             result,
             Err(AccountantError::PayableError(PayableError::Owerflow(
-                SignConversionError::U128("blah".to_string())
+                SignConversionError::U128("conversion of 340282366920938463463374607431768211455 \
+                 from u128 to i128 failed on: out of range integral type conversion attempted; on more money payable".to_string())
             )))
         );
     }
@@ -655,7 +676,8 @@ mod tests {
         assert_eq!(
             result,
             Err(AccountantError::PayableError(PayableError::Owerflow(
-                SignConversionError::U128("blah".to_string())
+                SignConversionError::U128("conversion of 340282366920938463463374607431768211455 \
+                 from u128 to i128 failed on: out of range integral type conversion attempted; on more money payable".to_string())
             )))
         )
     }
@@ -681,62 +703,40 @@ mod tests {
         assert_eq!(
             result,
             Err(AccountantError::PayableError(PayableError::Owerflow(
-                SignConversionError::U128("blah".to_string())
+                SignConversionError::U128("conversion of 340282366920938463463374607431768211455 \
+                 from u128 to i128 failed on: out of range integral type conversion attempted; on payment sent".to_string())
             )))
         )
     }
 
     #[test]
-    fn top_records_and_total() {
-        let home_dir = ensure_node_home_directory_exists("payable_dao", "top_records_and_total");
+    fn top_records_works(){
+        let home_dir = ensure_node_home_directory_exists("payable_dao", "top_records_works");
         let conn = DbInitializerReal::default()
             .initialize(&home_dir, TEST_DEFAULT_CHAIN, true)
             .unwrap();
-        let insert = |wallet: &str,
-                      balance: i64,
-                      timestamp: i64,
-                      pending_payment_transaction: Option<&str>| {
-            let params: &[&dyn ToSql] =
-                &[&wallet, &balance, &timestamp, &pending_payment_transaction];
-            conn
-                .prepare("insert into payable (wallet_address, balance, last_paid_timestamp, pending_payment_transaction) values (?, ?, ?, ?)")
-                .unwrap()
-                .execute(params)
-                .unwrap();
-        };
-        let timestamp1 = dao_utils::now_time_t() - 80_000;
-        let timestamp2 = dao_utils::now_time_t() - 86_401;
-        let timestamp3 = dao_utils::now_time_t() - 86_000;
-        let timestamp4 = dao_utils::now_time_t() - 86_001;
-        insert(
-            "0x1111111111111111111111111111111111111111",
-            999_999_999, // below minimum amount - reject
-            timestamp1,  // below maximum age
-            None,
+        let balance1 = 999_999_999; // below minimum amount - reject
+        let balance2 = 1_000_000_000; // minimum amount
+        let balance3 = 1_000_000_000; // minimum amount
+        let balance4 = 1_000_000_001; // above minimum amount
+        let timestamp1 = dao_utils::now_time_t() - 80_000; // below maximum age
+        let timestamp2 = dao_utils::now_time_t() - 86_401; // above maximum age - reject
+        let timestamp3 = dao_utils::now_time_t() - 86_000; // below maximum age
+        let timestamp4 = dao_utils::now_time_t() - 86_001; // below maximum age
+        make_multiple_insertions_with_balances_and_timestamps_opt(
+            conn.as_ref(),
+            balance1,
+            balance2,
+            balance3,
+            balance4,
+            Some(timestamp1),
+            Some(timestamp2),
+            Some(timestamp3),
+            Some(timestamp4)
         );
-        insert(
-            "0x2222222222222222222222222222222222222222",
-            1_000_000_000, // minimum amount
-            timestamp2,    // above maximum age - reject
-            None,
-        );
-        insert(
-            "0x3333333333333333333333333333333333333333",
-            1_000_000_000, // minimum amount
-            timestamp3,    // below maximum age
-            None,
-        );
-        insert(
-            "0x4444444444444444444444444444444444444444",
-            1_000_000_001, // above minimum amount
-            timestamp4,    // below maximum age
-            Some("0x1111111122222222333333334444444455555555666666667777777788888888"),
-        );
-
         let subject = PayableDaoReal::new(conn);
 
         let top_records = subject.top_records(1_000_000_000, 86400).unwrap();
-        let total = subject.total();
 
         assert_eq!(
             top_records,
@@ -760,7 +760,67 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(total, 4_000_000_000)
+    }
+
+    #[test]
+    fn total_works_real(){
+        let home_dir = ensure_node_home_directory_exists("payable_dao", "total_works");
+        let conn = DbInitializerReal::default()
+            .initialize(&home_dir, TEST_DEFAULT_CHAIN, true)
+            .unwrap();
+        let balance1 = 999_999_999;
+        let balance2 = 1_000_000_000;
+        let balance3 = 1_000_000_000;
+        let balance4 = 1_000_000_001;
+        make_multiple_insertions_with_balances_and_timestamps_opt(
+            conn.as_ref(),
+            balance1,
+            balance2,
+            balance3,
+            balance4,
+            None,
+            None,
+            None,
+            None
+        );
+        let subject = PayableDaoReal::new(conn);
+
+        let result = subject.total(&TotalInnerEncapsulationPayableReal).unwrap();
+
+        assert_eq!(result,4_000_000_000)
+    }
+
+    #[test]
+    fn total_inner_handles_error_producing_list_of_records_to_sum_up_the_balances_for(){
+        let top_records_parameters_arc = Arc::new(Mutex::new(vec![]));
+        let dao_mock = PayableDaoMock::new()
+            .top_records_parameters(&top_records_parameters_arc)
+            .top_records_result(Result::Err(AccountantError::PayableError(PayableError::RusqliteError("broken".to_string()))));
+        let subject = TotalInnerEncapsulationPayableReal;
+
+        let result = subject.total_inner(&dao_mock);
+
+        assert_eq!(result,Err(AccountantError::PayableError(PayableError::RusqliteError("broken; on calling total()".to_string()))));
+        let top_records_parameters = top_records_parameters_arc.lock().unwrap();
+        assert_eq!(*top_records_parameters,vec![(i128::MIN,u64::MAX/2)])
+    }
+
+    #[test]
+    fn total_inner_is_hooked_to_total_public(){
+       let prepare_params_arc = Arc::new(Mutex::new(vec![]));
+       let fake_conn = ConnectionWrapperMock::default()
+           .prepare_params(&prepare_params_arc)
+           .prepare_result(Err(rusqlite::Error::BlobSizeError)); //this error is imposed, has nothing to do with the goal of this test
+       let subject = PayableDaoReal::new(Box::new(fake_conn));
+       let mut inner = TotalInnerEncapsulationPayableMock::default()
+           .total_inner_result(Ok(-45678));
+       inner.testing_real_dao = true;
+
+       let result = subject.total(&inner);
+
+       assert_eq!(result,Ok(-45678));
+       let prepare_params = prepare_params_arc.lock().unwrap();
+       assert_eq!(*prepare_params,vec!["Yes, I'm hooked"])
     }
 
     #[test]
@@ -772,8 +832,89 @@ mod tests {
             .unwrap();
         let subject = PayableDaoReal::new(conn);
 
-        let result = subject.total();
+        let result = subject.total(&TotalInnerEncapsulationPayableReal).unwrap();
 
         assert_eq!(result, 0)
+    }
+
+    fn make_multiple_insertions_with_balances_and_timestamps_opt(
+        conn:&dyn ConnectionWrapper,
+        balance1:i128,
+        balance2:i128,
+        balance3:i128,
+        balance4:i128,
+        timestamp1: Option<i64>,
+        timestamp2:Option<i64>,
+        timestamp3:Option<i64>,
+        timestamp4:Option<i64>)
+    {
+        insert_into_payable(
+            conn,
+            "0x1111111111111111111111111111111111111111",
+            balance1,
+            timestamp1.unwrap_or(0),
+            None,
+        );
+        insert_into_payable(
+            conn,
+            "0x2222222222222222222222222222222222222222",
+            balance2,
+            timestamp2.unwrap_or(1),
+            None,
+        );
+        insert_into_payable(
+            conn,
+            "0x3333333333333333333333333333333333333333",
+            balance3,
+            timestamp3.unwrap_or(2),
+            None,
+        );
+        insert_into_payable(
+            conn,
+            "0x4444444444444444444444444444444444444444",
+            balance4,
+            timestamp4.unwrap_or(3),
+            Some("0x1111111122222222333333334444444455555555666666667777777788888888"),
+        );
+    }
+
+    fn insert_into_payable(
+        conn: &dyn ConnectionWrapper,
+        wallet: &str,
+        balance: i128,
+        timestamp: i64,
+        pending_payment_transaction: Option<&str>)
+    {
+        let params: &[&dyn ToSql] =
+            &[&wallet, &balance, &timestamp, &pending_payment_transaction];
+        conn
+            .prepare("insert into payable (wallet_address, balance, last_paid_timestamp, pending_payment_transaction) values (?, ?, ?, ?)")
+            .unwrap()
+            .execute(params)
+            .unwrap();
+    }
+
+    #[derive(Default)]
+    struct TotalInnerEncapsulationPayableMock{
+        testing_real_dao: bool,
+        total_inner_results: RefCell<Vec<Result<i128,AccountantError>>>
+
+    }
+
+    impl TotalInnerEncapsulationPayable for TotalInnerEncapsulationPayableMock{
+        fn total_inner(&self, dao: &dyn PayableDao) -> Result<i128, AccountantError> {
+            if self.testing_real_dao {
+                let dao = dao.as_any().downcast_ref::<PayableDaoReal>().unwrap();
+                let _ = dao.conn.prepare("Yes, I'm hooked"); //special test; a single use
+            }
+            self.total_inner_results.borrow_mut().remove(0)
+        }
+    }
+
+    impl TotalInnerEncapsulationPayableMock{
+        fn total_inner_result(self,result: Result<i128,AccountantError>)->Self{
+            self.total_inner_results.borrow_mut().push(result);
+            self
+        }
     }
 }

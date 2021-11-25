@@ -6,25 +6,23 @@ use crate::database::connection_wrapper::ConnectionWrapper;
 use rusqlite::types::Value;
 use rusqlite::ToSql;
 use std::fmt::{Display, Formatter};
-use web3::types::Res;
-use crate::accountant::payable_dao::PayableDao;
 
 #[derive(Clone)]
 pub struct InsertUpdateConfig<'a> {
-    insert_sql: &'a str,
-    update_sql: &'a str,
-    params: &'a [(&'static str, &'a dyn ToSql)],
-    table: Table,
+    pub insert_sql: &'a str,
+    pub update_sql: &'a str,
+    pub params: &'a [(&'static str, &'a dyn ToSql)],
+    pub table: Table,
 }
 
 pub struct UpdateConfig<'a> {
-    update_sql: &'a str,
-    params: &'a [(&'static str, &'a dyn ToSql)],
-    table: Table,
+    pub update_sql: &'a str,
+    pub params: &'a [(&'static str, &'a dyn ToSql)],
+    pub table: Table,
 }
 
 #[derive(PartialEq, Debug, Clone)]
-enum Table {
+pub enum Table {
     Payable,
     Receivable,
 }
@@ -238,7 +236,7 @@ pub fn insert_or_update_payable(
         .map_err(payable_rusqlite_error)
 }
 
-pub fn insert_or_update_payable_after_our_payment(
+pub fn insert_or_update_payable_for_our_payment(
     conn: &dyn ConnectionWrapper,
     core: &dyn InsertUpdateCore,
     wallet: &str,
@@ -264,121 +262,32 @@ fn payable_rusqlite_error(err: String) -> AccountantError {
     AccountantError::PayableError(PayableError::RusqliteError(err))
 }
 
-pub fn reverse_sign(amount:i128)->Result<i128,SignConversionError>{
-    amount.checked_abs().map(|val|-val).ok_or_else(||SignConversionError::I128(format!("Reversing the sign for value: {}",amount)))
+pub fn reverse_sign(amount: i128) -> Result<i128, SignConversionError> {
+    amount.checked_abs().map(|val| -val).ok_or_else(|| {
+        SignConversionError::I128(format!("Reversing the sign for value: {}", amount))
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::accountant::dao_shared_methods::{insert_or_update_payable, insert_or_update_payable_after_our_payment, insert_or_update_receivable, update_receivable, InsertUpdateConfig, InsertUpdateCore, InsertUpdateCoreReal, Table, UpdateConfig, UpdateConfiguration, reverse_sign};
+    use crate::accountant::dao_shared_methods::{
+        insert_or_update_payable, insert_or_update_payable_for_our_payment,
+        insert_or_update_receivable, reverse_sign, update_receivable, InsertUpdateConfig,
+        InsertUpdateCore, InsertUpdateCoreReal, Table, UpdateConfig, UpdateConfiguration,
+    };
     use crate::accountant::receivable_dao::ReceivableError;
+    use crate::accountant::test_utils::InsertUpdateCoreMock;
     use crate::accountant::{AccountantError, PayableError, SignConversionError};
     use crate::database::connection_wrapper::{ConnectionWrapper, ConnectionWrapperReal};
     use crate::database::db_initializer::{DbInitializer, DbInitializerReal};
     use masq_lib::blockchains::chains::Chain;
     use masq_lib::test_utils::utils::ensure_node_home_directory_exists;
     use masq_lib::utils::SliceToVec;
-    use rusqlite::types::Value;
     use rusqlite::{named_params, params, Connection};
     use std::cell::RefCell;
     use std::ptr::addr_of;
     use std::sync::{Arc, Mutex};
     use std::time::SystemTime;
-    #[derive(Default)]
-    struct InsertUpdateCoreMock {
-        update_params: Arc<Mutex<Vec<(String, i128, (String, String, String, Vec<String>))>>>, //trait-object-like params tested specially
-        update_results: RefCell<Vec<Result<(), String>>>,
-        insert_or_update_params:
-            Arc<Mutex<Vec<(String, i128, (String, String, Table, Vec<String>))>>>, //I have to skip the sql params which cannot be handled in a test economically
-        insert_or_update_results: RefCell<Vec<Result<(), String>>>,
-        connection_wrapper_as_pointer_to_compare: Option<*const dyn ConnectionWrapper>,
-    }
-
-    impl InsertUpdateCore for InsertUpdateCoreMock {
-        fn update(
-            &self,
-            conn: &dyn ConnectionWrapper,
-            wallet: &str,
-            amount: i128,
-            config: &dyn UpdateConfiguration,
-        ) -> Result<(), String> {
-            let owned_params: Vec<String> = config
-                .update_params()
-                .into_iter()
-                .map(|(str, _to_sql)| str.to_string())
-                .collect();
-            self.update_params.lock().unwrap().push((
-                wallet.to_string(),
-                amount,
-                (
-                    config.select_sql(),
-                    config.update_sql().to_string(),
-                    config.table(),
-                    owned_params,
-                ),
-            ));
-            if let Some(conn_wrapp_pointer) = self.connection_wrapper_as_pointer_to_compare {
-                assert_eq!(conn_wrapp_pointer, addr_of!(*conn))
-            }
-            self.update_results.borrow_mut().remove(0)
-        }
-
-        fn insert_or_update(
-            &self,
-            conn: &dyn ConnectionWrapper,
-            wallet: &str,
-            amount: i128,
-            config: InsertUpdateConfig,
-        ) -> Result<(), String> {
-            let owned_params: Vec<String> = config
-                .params
-                .into_iter()
-                .map(|(str, _to_sql)| str.to_string())
-                .collect();
-            self.insert_or_update_params.lock().unwrap().push((
-                wallet.to_string(),
-                amount,
-                (
-                    config.update_sql.to_string(),
-                    config.insert_sql.to_string(),
-                    config.table,
-                    owned_params,
-                ),
-            ));
-            if let Some(conn_wrapp_pointer) = self.connection_wrapper_as_pointer_to_compare {
-                assert_eq!(conn_wrapp_pointer, addr_of!(*conn))
-            }
-            self.insert_or_update_results.borrow_mut().remove(0)
-        }
-    }
-
-    impl InsertUpdateCoreMock {
-        fn update_params(
-            mut self,
-            params: &Arc<Mutex<Vec<(String, i128, (String, String, String, Vec<String>))>>>,
-        ) -> Self {
-            self.update_params = params.clone();
-            self
-        }
-
-        fn update_result(self, result: Result<(), String>) -> Self {
-            self.update_results.borrow_mut().push(result);
-            self
-        }
-
-        fn insert_or_update_params(
-            mut self,
-            params: &Arc<Mutex<Vec<(String, i128, (String, String, Table, Vec<String>))>>>,
-        ) -> Self {
-            self.insert_or_update_params = params.clone();
-            self
-        }
-
-        fn insert_or_update_results(self, result: Result<(), String>) -> Self {
-            self.insert_or_update_results.borrow_mut().push(result);
-            self
-        }
-    }
 
     #[test]
     fn update_receivable_works_positive() {
@@ -691,11 +600,11 @@ mod tests {
     }
 
     #[test]
-    fn insert_or_update_payable_after_our_payment_works_for_insert_positive() {
+    fn insert_or_update_payable_for_our_payment_works_for_insert_positive() {
         let wallet_address = "xyz2211";
         let path = ensure_node_home_directory_exists(
             "dao_shared_methods",
-            "insert_or_update_payable_after_our_payment_works_for_insert_positive",
+            "insert_or_update_payable_for_our_payment_works_for_insert_positive",
         );
         let conn = DbInitializerReal::default()
             .initialize(&path, Chain::PolyMainnet, true)
@@ -710,7 +619,7 @@ mod tests {
         let last_paid_timestamp = 10_000_000;
         let transaction_hash = "ce5456ed";
 
-        let result = insert_or_update_payable_after_our_payment(
+        let result = insert_or_update_payable_for_our_payment(
             conn_ref,
             &InsertUpdateCoreReal,
             wallet_address,
@@ -728,11 +637,11 @@ mod tests {
     }
 
     #[test]
-    fn insert_or_update_payable_after_our_payment_works_for_insert_negative() {
+    fn insert_or_update_payable_for_our_payment_works_for_insert_negative() {
         let wallet_address = "xyz2211";
         let path = ensure_node_home_directory_exists(
             "dao_shared_methods",
-            "insert_or_update_payable_after_our_payment_works_for_insert_negative",
+            "insert_or_update_payable_for_our_payment_works_for_insert_negative",
         );
         let conn = DbInitializerReal::default()
             .initialize(&path, Chain::PolyMainnet, true)
@@ -747,7 +656,7 @@ mod tests {
         let last_paid_timestamp = 890_000_000;
         let transaction_hash = "ce5456ed";
 
-        let result = insert_or_update_payable_after_our_payment(
+        let result = insert_or_update_payable_for_our_payment(
             conn_ref,
             &InsertUpdateCoreReal,
             wallet_address,
@@ -765,11 +674,11 @@ mod tests {
     }
 
     #[test]
-    fn insert_or_update_payable_after_our_payment_works_for_update_positive() {
+    fn insert_or_update_payable_for_our_payment_works_for_update_positive() {
         let wallet_address = "xyz7894";
         let path = ensure_node_home_directory_exists(
             "dao_shared_methods",
-            "insert_or_update_payable_after_our_payment_works_for_update_positive",
+            "insert_or_update_payable_for_our_payment_works_for_update_positive",
         );
         let conn = DbInitializerReal::default()
             .initialize(&path, Chain::PolyMainnet, true)
@@ -788,7 +697,7 @@ mod tests {
         let last_paid_timestamp = 5_000;
         let transaction_hash = "ed78acc54";
 
-        let result = insert_or_update_payable_after_our_payment(
+        let result = insert_or_update_payable_for_our_payment(
             conn_ref,
             &InsertUpdateCoreReal,
             wallet_address,
@@ -806,11 +715,11 @@ mod tests {
     }
 
     #[test]
-    fn insert_or_update_payable_after_our_payment_works_for_update_negative() {
+    fn insert_or_update_payable_for_our_payment_works_for_update_negative() {
         let wallet_address = "xyz7894";
         let path = ensure_node_home_directory_exists(
             "dao_shared_methods",
-            "insert_or_update_payable_after_our_payment_works_for_update_negative",
+            "insert_or_update_payable_for_our_payment_works_for_update_negative",
         );
         let conn = DbInitializerReal::default()
             .initialize(&path, Chain::PolyMainnet, true)
@@ -829,7 +738,7 @@ mod tests {
         let last_paid_timestamp = 5_000;
         let transaction_hash = "ed78acc54";
 
-        let result = insert_or_update_payable_after_our_payment(
+        let result = insert_or_update_payable_for_our_payment(
             conn_ref,
             &InsertUpdateCoreReal,
             wallet_address,
@@ -978,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn insert_or_update_payable_after_our_payment_error_handling_and_params_assertion() {
+    fn insert_or_update_payable_for_our_payment_error_handling_and_params_assertion() {
         let insert_or_update_params_arc = Arc::new(Mutex::new(vec![]));
         let wallet_address = "xyz123";
         let conn = Connection::open_in_memory().unwrap();
@@ -991,7 +900,7 @@ mod tests {
             .insert_or_update_params(&insert_or_update_params_arc)
             .insert_or_update_results(Err("SomethingWrong".to_string()));
 
-        let result = insert_or_update_payable_after_our_payment(
+        let result = insert_or_update_payable_for_our_payment(
             &wrapped_conn,
             &insert_update_core,
             wallet_address,
@@ -1098,33 +1007,40 @@ mod tests {
     }
 
     #[test]
-    fn reverse_sign_works_for_min_value(){
+    fn reverse_sign_works_for_min_value() {
         let result = reverse_sign(i128::MIN);
 
-        assert_eq!(result,Err(SignConversionError::I128(String::from("Reversing the sign for value: -170141183460469231731687303715884105728"))))
+        assert_eq!(
+            result,
+            Err(SignConversionError::I128(String::from(
+                "Reversing the sign for value: -170141183460469231731687303715884105728"
+            )))
+        )
     }
 
     fn create_broken_receivable(conn: &dyn ConnectionWrapper) {
-        let mut stm = conn.prepare(
-            "create table receivable (
+        let mut stm = conn
+            .prepare(
+                "create table receivable (
                 wallet_address integer primary key,
                 balance text null,
                 last_received_timestamp integer not null
-            )"
-        )
-        .unwrap();
+            )",
+            )
+            .unwrap();
         stm.execute([]).unwrap();
     }
 
     fn create_broken_payable(conn: &dyn ConnectionWrapper) {
-        let mut stm = conn.prepare(
-            "create table payable (
+        let mut stm = conn
+            .prepare(
+                "create table payable (
                 wallet_address integer primary key,
                 balance text not null,
                 last_paid_timestamp integer not null,
                 pending_payment_transaction integer null
-            )"
-        )
+            )",
+            )
             .unwrap();
         stm.execute([]).unwrap();
     }

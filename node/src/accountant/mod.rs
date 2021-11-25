@@ -7,7 +7,10 @@ pub mod receivable_dao;
 #[cfg(test)]
 pub mod test_utils;
 
-use crate::accountant::payable_dao::{PayableAccount, PayableDaoFactory, Payment, TotalInnerEncapsulationPayableReal};
+use crate::accountant::dao_shared_methods::InsertUpdateCoreReal;
+use crate::accountant::payable_dao::{
+    PayableAccount, PayableDaoFactory, Payment, TotalInnerEncapsulationPayableReal,
+};
 use crate::accountant::receivable_dao::{ReceivableAccount, ReceivableDaoFactory, ReceivableError};
 use crate::banned_dao::{BannedDao, BannedDaoFactory};
 use crate::blockchain::blockchain_bridge::RetrieveTransactions;
@@ -79,35 +82,45 @@ pub enum AccountantError {
 
 impl Display for AccountantError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self{
-            AccountantError::PayableError(msg) => write!(f,"Error from payable: {:?}",msg),
-            _ => unimplemented!()
+        match self {
+            AccountantError::PayableError(msg) => write!(f, "Error from payable: {:?}", msg),
+            _ => unimplemented!(),
         }
     }
 }
 
-impl AccountantError{
-    pub fn extend(self,msg_extension:&str)->Self{
-        match self{
-            AccountantError::ReceivableError(ReceivableError::RusqliteError(msg)) => unimplemented!(),
-            AccountantError::ReceivableError(ReceivableError::ConfigurationError(msg)) => unimplemented!(),
-            AccountantError::PayableError(PayableError::RusqliteError(msg)) => AccountantError::PayableError(PayableError::RusqliteError(Self::add_str(msg,msg_extension))),
-            AccountantError::PayableError(PayableError::Owerflow(sign_conv_err)) =>
-                match sign_conv_err{
-                    SignConversionError::U128(msg) =>SignConversionError::U128(Self::add_str(msg,msg_extension)).into_payable(),
+impl AccountantError {
+    pub fn extend(self, msg_extension: &str) -> Self {
+        match self {
+            AccountantError::ReceivableError(ReceivableError::RusqliteError(msg)) => {
+                unimplemented!()
+            }
+            AccountantError::ReceivableError(ReceivableError::ConfigurationError(msg)) => {
+                unimplemented!()
+            }
+            AccountantError::PayableError(PayableError::RusqliteError(msg)) => {
+                AccountantError::PayableError(PayableError::RusqliteError(Self::add_str(
+                    msg,
+                    msg_extension,
+                )))
+            }
+            AccountantError::PayableError(PayableError::Owerflow(sign_conv_err)) => {
+                match sign_conv_err {
+                    SignConversionError::U128(msg) => {
+                        SignConversionError::U128(Self::add_str(msg, msg_extension)).into_payable()
+                    }
                     SignConversionError::U64(msg) => unimplemented!(),
-                    SignConversionError::I128(msg) => unimplemented!()
-                },
-            x => x
+                    SignConversionError::I128(msg) => unimplemented!(),
+                }
+            }
+            x => x,
         }
     }
 
-    fn add_str(msg: String,msg_extension:&str)-> String{
-        format!("{}; {}",msg,msg_extension)
+    fn add_str(msg: String, msg_extension: &str) -> String {
+        format!("{}; {}", msg, msg_extension)
     }
 }
-
-
 
 #[derive(PartialEq, Debug)]
 pub enum PayableError {
@@ -588,8 +601,9 @@ impl Accountant {
         if !self.our_wallet(wallet) {
             match self.payable_dao
                 .as_ref()
-                .more_money_payable(wallet, total_charge) {
+                .more_money_payable(wallet, total_charge,&InsertUpdateCoreReal) {
                 Ok(_) => (),
+                //TODO extend this - it may not be only overflow
                 Err(e) => error! (
                     self.logger,
                     "Overflow error trying to record service consumed from Node with earning wallet {}: service rate {}, byte rate {}, payload size {}. Skipping",
@@ -717,7 +731,7 @@ impl Accountant {
             .payments
             .iter()
             .for_each(|payment| match payment {
-                Ok(payment) => match self.payable_dao.as_mut().payment_sent(payment) {
+                Ok(payment) => match self.payable_dao.as_mut().payment_sent(payment,&InsertUpdateCoreReal) {
                     Ok(()) => (),
                     Err(e) => error! (
                         self.logger,
@@ -842,9 +856,9 @@ impl Accountant {
                     .map(|ppt| format!("0x{:0X}", ppt)),
             })
             .collect_vec();
-        let total_payable = match self.payable_dao.total(&TotalInnerEncapsulationPayableReal){
+        let total_payable = match self.payable_dao.total(&TotalInnerEncapsulationPayableReal) {
             Ok(total) => total,
-            Err(e) => unimplemented!()
+            Err(e) => unimplemented!(),
         };
         let receivables = self
             .receivable_dao

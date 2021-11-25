@@ -2,18 +2,23 @@
 
 #![cfg(test)]
 
-use std::cell::RefCell;
-use std::sync::{Arc, Mutex};
-use crate::accountant::payable_dao::{PayableAccount, PayableDao, Payment, TotalInnerEncapsulationPayable};
+use crate::accountant::dao_shared_methods::{
+    InsertUpdateConfig, InsertUpdateCore, Table, UpdateConfiguration,
+};
+use crate::accountant::payable_dao::{
+    PayableAccount, PayableDao, Payment, TotalInnerEncapsulationPayable,
+};
 use crate::accountant::receivable_dao::ReceivableAccount;
-use crate::database::dao_utils::{from_time_t, to_time_t};
-use crate::test_utils::make_wallet;
-use std::time::SystemTime;
-use ethereum_types::H256;
-use rusqlite::Connection;
 use crate::accountant::AccountantError;
 use crate::database::connection_wrapper::ConnectionWrapper;
+use crate::database::dao_utils::{from_time_t, to_time_t};
 use crate::sub_lib::wallet::Wallet;
+use crate::test_utils::make_wallet;
+use ethereum_types::H256;
+use std::cell::RefCell;
+use std::ptr::addr_of;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 pub fn make_receivable_account(n: u64, expected_delinquent: bool) -> ReceivableAccount {
     let now = to_time_t(SystemTime::now());
@@ -49,11 +54,16 @@ pub struct PayableDaoMock {
     payment_sent_results: RefCell<Vec<Result<(), AccountantError>>>,
     top_records_parameters: Arc<Mutex<Vec<(i128, u64)>>>,
     top_records_results: RefCell<Vec<Result<Vec<PayableAccount>, AccountantError>>>,
-    total_results: RefCell<Vec<Result<i128,AccountantError>>>
+    total_results: RefCell<Vec<Result<i128, AccountantError>>>,
 }
 
 impl PayableDao for PayableDaoMock {
-    fn more_money_payable(&self, wallet: &Wallet, amount: u128) -> Result<(), AccountantError> {
+    fn more_money_payable(
+        &self,
+        wallet: &Wallet,
+        amount: u128,
+        insert_update_core: &dyn InsertUpdateCore,
+    ) -> Result<(), AccountantError> {
         self.more_money_payable_parameters
             .lock()
             .unwrap()
@@ -61,7 +71,11 @@ impl PayableDao for PayableDaoMock {
         self.more_money_payable_results.borrow_mut().remove(0)
     }
 
-    fn payment_sent(&self, sent_payment: &Payment) -> Result<(), AccountantError> {
+    fn payment_sent(
+        &self,
+        sent_payment: &Payment,
+        insert_update_core: &dyn InsertUpdateCore,
+    ) -> Result<(), AccountantError> {
         self.payment_sent_parameters
             .lock()
             .unwrap()
@@ -107,7 +121,7 @@ impl PayableDao for PayableDaoMock {
         self.top_records_results.borrow_mut().remove(0)
     }
 
-    fn total(&self,inner: &dyn TotalInnerEncapsulationPayable) -> Result<i128,AccountantError> {
+    fn total(&self, inner: &dyn TotalInnerEncapsulationPayable) -> Result<i128, AccountantError> {
         self.total_results.borrow_mut().remove(0)
     }
 }
@@ -155,8 +169,103 @@ impl PayableDaoMock {
         self
     }
 
-    pub fn total_result(self, result: Result<i128,AccountantError>) -> Self {
+    pub fn total_result(self, result: Result<i128, AccountantError>) -> Self {
         self.total_results.borrow_mut().push(result);
+        self
+    }
+}
+
+#[derive(Default)]
+pub struct InsertUpdateCoreMock {
+    update_params: Arc<Mutex<Vec<(String, i128, (String, String, String, Vec<String>))>>>, //trait-object-like params tested specially
+    update_results: RefCell<Vec<Result<(), String>>>,
+    insert_or_update_params: Arc<Mutex<Vec<(String, i128, (String, String, Table, Vec<String>))>>>, //I have to skip the sql params which cannot be handled in a test economically
+    insert_or_update_results: RefCell<Vec<Result<(), String>>>,
+    connection_wrapper_as_pointer_to_compare: Option<*const dyn ConnectionWrapper>,
+}
+
+impl InsertUpdateCore for InsertUpdateCoreMock {
+    fn update(
+        &self,
+        conn: &dyn ConnectionWrapper,
+        wallet: &str,
+        amount: i128,
+        config: &dyn UpdateConfiguration,
+    ) -> Result<(), String> {
+        let owned_params: Vec<String> = config
+            .update_params()
+            .into_iter()
+            .map(|(str, _to_sql)| str.to_string())
+            .collect();
+        self.update_params.lock().unwrap().push((
+            wallet.to_string(),
+            amount,
+            (
+                config.select_sql(),
+                config.update_sql().to_string(),
+                config.table(),
+                owned_params,
+            ),
+        ));
+        if let Some(conn_wrapp_pointer) = self.connection_wrapper_as_pointer_to_compare {
+            assert_eq!(conn_wrapp_pointer, addr_of!(*conn))
+        }
+        self.update_results.borrow_mut().remove(0)
+    }
+
+    fn insert_or_update(
+        &self,
+        conn: &dyn ConnectionWrapper,
+        wallet: &str,
+        amount: i128,
+        config: InsertUpdateConfig,
+    ) -> Result<(), String> {
+        let owned_params: Vec<String> = config
+            .params
+            .into_iter()
+            .map(|(str, _to_sql)| str.to_string())
+            .collect();
+        self.insert_or_update_params.lock().unwrap().push((
+            wallet.to_string(),
+            amount,
+            (
+                config.update_sql.to_string(),
+                config.insert_sql.to_string(),
+                config.table,
+                owned_params,
+            ),
+        ));
+        if let Some(conn_wrapp_pointer) = self.connection_wrapper_as_pointer_to_compare {
+            assert_eq!(conn_wrapp_pointer, addr_of!(*conn))
+        }
+        self.insert_or_update_results.borrow_mut().remove(0)
+    }
+}
+
+impl InsertUpdateCoreMock {
+    pub fn update_params(
+        mut self,
+        params: &Arc<Mutex<Vec<(String, i128, (String, String, String, Vec<String>))>>>,
+    ) -> Self {
+        self.update_params = params.clone();
+        self
+    }
+
+    pub fn update_result(self, result: Result<(), String>) -> Self {
+        self.update_results.borrow_mut().push(result);
+        self
+    }
+
+    pub fn insert_or_update_params(
+        mut self,
+        params: &Arc<Mutex<Vec<(String, i128, (String, String, Table, Vec<String>))>>>,
+    ) -> Self {
+        self.insert_or_update_params = params.clone();
+        self
+    }
+
+    pub fn insert_or_update_results(self, result: Result<(), String>) -> Self {
+        self.insert_or_update_results.borrow_mut().push(result);
         self
     }
 }

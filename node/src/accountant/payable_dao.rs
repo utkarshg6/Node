@@ -114,7 +114,7 @@ impl PayableDao for PayableDaoReal {
             amount: u128,
         ) -> AccountantError {
             e.extend(&format!(
-                "on calling more_money_payable(); for wallet '{}' and amount {}",
+                "on calling more_money_payable(); for wallet '{}' and amount '{}'",
                 wallet, amount
             ))
         }
@@ -145,7 +145,7 @@ impl PayableDao for PayableDaoReal {
         let amount_signed = u128_to_signed(payment.amount)
             .map_err(|e| payment_sent_err(e.into_payable(), payment))?;
         let reversed = reverse_sign(amount_signed)
-            .expect("should be within correct range after the previous operation");
+            .expect("should be within the correct range after the previous operation");
         match insert_or_update_payable_for_our_payment(
             self.conn.as_ref(),
             insert_update_core,
@@ -240,7 +240,7 @@ impl PayableDao for PayableDaoReal {
         maximum_age: u64,
     ) -> Result<Vec<PayableAccount>, AccountantError> {
         let max_age = u64_to_signed(maximum_age)
-            .map_err(|e| AccountantError::PayableError(PayableError::Owerflow(e)))?;
+            .map_err(|e| AccountantError::PayableError(PayableError::Overflow(e)))?;
         let min_timestamp = dao_utils::now_time_t() - max_age;
         let mut stmt = self
             .conn
@@ -447,10 +447,10 @@ mod tests {
 
         assert_eq!(
             result,
-            Err(AccountantError::PayableError(PayableError::Owerflow(
+            Err(AccountantError::PayableError(PayableError::Overflow(
                 SignConversionError::U128("conversion of 340282366920938463463374607431768211455 \
                  from u128 to i128 failed on: out of range integral type conversion attempted; on calling more_money_payable(); \
-                 for wallet '0x000000000000000000000000000000626f6f6761' and amount 340282366920938463463374607431768211455".to_string())
+                 for wallet '0x000000000000000000000000000000626f6f6761' and amount '340282366920938463463374607431768211455'".to_string())
             )))
         );
     }
@@ -469,7 +469,7 @@ mod tests {
             result,
             Err(AccountantError::PayableError(PayableError::RusqliteError(
                 "SQL crashed; on calling more_money_payable(); for wallet \
-                 '0x000000000000000000000000000000626f6f6761' and amount 4565"
+                 '0x000000000000000000000000000000626f6f6761' and amount '4565'"
                     .to_string()
             )))
         );
@@ -582,7 +582,7 @@ mod tests {
 
         let err_msg = match result {
             Ok(_) => panic!("we expected an err, but got Ok"),
-            Err(AccountantError::PayableError(PayableError::Owerflow(
+            Err(AccountantError::PayableError(PayableError::Overflow(
                 SignConversionError::U128(msg),
             ))) => msg,
             x => panic!("we got an different error than expected: {:?}", x),
@@ -706,10 +706,10 @@ out of range integral type conversion attempted; on calling payment_sent(); for 
 
         assert_eq!(
             result,
-            Err(AccountantError::PayableError(PayableError::Owerflow(
+            Err(AccountantError::PayableError(PayableError::Overflow(
                 SignConversionError::U128("conversion of 340282366920938463463374607431768211455 \
                  from u128 to i128 failed on: out of range integral type conversion attempted; on calling more_money_payable(); \
-                 for wallet '0x0000000000000000000000000000666f6f626172' and amount 340282366920938463463374607431768211455".to_string())
+                 for wallet '0x0000000000000000000000000000666f6f626172' and amount '340282366920938463463374607431768211455'".to_string())
             )))
         )
     }
@@ -737,7 +737,7 @@ out of range integral type conversion attempted; on calling payment_sent(); for 
 
         let err_msg = match result {
             Ok(_) => panic!("we expected an err, but got Ok"),
-            Err(AccountantError::PayableError(PayableError::Owerflow(
+            Err(AccountantError::PayableError(PayableError::Overflow(
                 SignConversionError::U128(msg),
             ))) => msg,
             x => panic!("we got an different error than expected: {:?}", x),

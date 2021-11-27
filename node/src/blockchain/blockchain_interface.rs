@@ -33,7 +33,7 @@ const TRANSFER_METHOD_ID: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
 pub struct Transaction {
     pub block_number: u64,
     pub from: Wallet,
-    pub gwei_amount: u128,
+    pub wei_amount: u128,
 }
 
 impl fmt::Display for Transaction {
@@ -41,7 +41,7 @@ impl fmt::Display for Transaction {
         write!(
             f,
             "{}gw from {} ({})",
-            self.gwei_amount, self.from, self.block_number
+            self.wei_amount, self.from, self.block_number
         )
     }
 }
@@ -225,7 +225,7 @@ where
                                             block_number: u64::try_from(block_number)
                                                 .expect("Internal Error"), // TODO: back to testing for overflow
                                             from: Wallet::from(log.topics[1]),
-                                            gwei_amount,
+                                            wei_amount: gwei_amount,
                                         })
                                     }
                                     None => None,
@@ -478,7 +478,7 @@ mod tests {
             vec![Transaction {
                 block_number: 4_974_179u64,
                 from: Wallet::from_str("0x3f69f9efd4f2592fd70be8c32ecd9dce71c472fc").unwrap(),
-                gwei_amount: 4_503_599_u128,
+                wei_amount: 4_503_599_u128,
             }]
         )
     }

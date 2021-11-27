@@ -11,7 +11,9 @@ use crate::accountant::dao_shared_methods::InsertUpdateCoreReal;
 use crate::accountant::payable_dao::{
     PayableAccount, PayableDaoFactory, Payment, TotalInnerEncapsulationPayableReal,
 };
-use crate::accountant::receivable_dao::{ReceivableAccount, ReceivableDaoFactory, ReceivableError};
+use crate::accountant::receivable_dao::{
+    ReceivableAccount, ReceivableDaoFactory, ReceivableDaoReal, ReceivableError,
+};
 use crate::banned_dao::{BannedDao, BannedDaoFactory};
 use crate::blockchain::blockchain_bridge::RetrieveTransactions;
 use crate::blockchain::blockchain_interface::{BlockchainError, Transaction};
@@ -98,13 +100,23 @@ impl AccountantError {
             AccountantError::ReceivableError(ReceivableError::ConfigurationError(msg)) => {
                 unimplemented!()
             }
+            AccountantError::ReceivableError(ReceivableError::Overflow(sign_conv_err)) => {
+                match sign_conv_err {
+                    SignConversionError::U128(msg) => {
+                        SignConversionError::U128(Self::add_str(msg, msg_extension))
+                            .into_receivable()
+                    }
+                    SignConversionError::U64(msg) => unimplemented!(),
+                    SignConversionError::I128(msg) => unimplemented!(),
+                }
+            }
             AccountantError::PayableError(PayableError::RusqliteError(msg)) => {
                 AccountantError::PayableError(PayableError::RusqliteError(Self::add_str(
                     msg,
                     msg_extension,
                 )))
             }
-            AccountantError::PayableError(PayableError::Owerflow(sign_conv_err)) => {
+            AccountantError::PayableError(PayableError::Overflow(sign_conv_err)) => {
                 match sign_conv_err {
                     SignConversionError::U128(msg) => {
                         SignConversionError::U128(Self::add_str(msg, msg_extension)).into_payable()
@@ -124,7 +136,7 @@ impl AccountantError {
 
 #[derive(PartialEq, Debug)]
 pub enum PayableError {
-    Owerflow(SignConversionError),
+    Overflow(SignConversionError),
     RusqliteError(String),
 }
 
@@ -137,10 +149,10 @@ pub enum SignConversionError {
 
 impl SignConversionError {
     fn into_payable(self) -> AccountantError {
-        AccountantError::PayableError(PayableError::Owerflow(self))
+        AccountantError::PayableError(PayableError::Overflow(self))
     }
     fn into_receivable(self) -> AccountantError {
-        unimplemented!()
+        AccountantError::ReceivableError(ReceivableError::Overflow(self))
     }
 }
 
@@ -570,7 +582,7 @@ impl Accountant {
         if !self.our_wallet(wallet) {
             match self.receivable_dao
                 .as_ref()
-                .more_money_receivable(wallet, total_charge) {
+                .more_money_receivable(wallet, total_charge, &InsertUpdateCoreReal) {
                 Ok(_) => (),
                 Err(e) => error! (
                     self.logger,
@@ -702,6 +714,28 @@ impl Accountant {
         String::from("Paying qualified debts:\n").add(&list)
     }
 
+    fn multi_insert_payment_log_error(
+        payments: &[Transaction],
+        logger: &Logger,
+        error: AccountantError,
+    ) {
+        let mut report_lines = vec![format!("{:10} {:42} {:18}", "Block #", "Wallet", "Amount")];
+        let mut sum = 0_u128;
+        payments.iter().for_each(|t| {
+            report_lines.push(format!(
+                "{:10} {:42} {:18}",
+                t.block_number, t.from, t.wei_amount
+            ));
+            sum += t.wei_amount;
+        });
+        report_lines.push(format!("{:10} {:42} {:18}", "TOTAL", "", sum));
+        let report = report_lines.join("\n");
+        error!(
+            logger,
+            "Payment reception failed, rolling back: Multi insert payment: {:?}\n{}", error, report
+        );
+    }
+
     fn handle_bind_message(&mut self, msg: BindMessage) {
         self.report_accounts_payable_sub =
             Some(msg.peer_actors.blockchain_bridge.report_accounts_payable);
@@ -723,7 +757,10 @@ impl Accountant {
     fn handle_received_payments(&mut self, received_payments: ReceivedPayments) {
         self.receivable_dao
             .as_mut()
-            .more_money_received(received_payments.payments);
+            .more_money_received(&received_payments.payments, &InsertUpdateCoreReal)
+            .unwrap_or_else(|e| {
+                Self::multi_insert_payment_log_error(&received_payments.payments, &self.logger, e)
+            })
     }
 
     fn handle_sent_payments(&mut self, sent_payments: SentPayments) {
@@ -927,13 +964,17 @@ pub fn u64_to_signed(value: u64) -> Result<i64, SignConversionError> {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::accountant::receivable_dao::{ReceivableAccount, ReceivableDaoFactory};
-    use crate::accountant::test_utils::{make_receivable_account, PayableDaoMock};
+    use crate::accountant::test_utils::{
+        make_accountant, make_receivable_account, BannedDaoFactoryMock, BannedDaoMock,
+        ConfigDaoFactoryMock, PayableDaoFactoryMock, PayableDaoMock, ReceivableDaoFactoryMock,
+        ReceivableDaoMock,
+    };
     use crate::blockchain::blockchain_interface::BlockchainError;
     use crate::blockchain::blockchain_interface::Transaction;
     use crate::database::dao_utils::from_time_t;
     use crate::database::dao_utils::to_time_t;
-    use crate::db_config::config_dao::ConfigDao;
+    use crate::database::db_initializer::test_utils::ConnectionWrapperMock;
+    use crate::database::db_initializer::{DbInitializer, DbInitializerReal};
     use crate::db_config::mocks::ConfigDaoMock;
     use crate::db_config::persistent_configuration::PersistentConfigError;
     use crate::sub_lib::accountant::ReportRoutingServiceConsumedMessage;
@@ -941,16 +982,19 @@ pub mod tests {
     use crate::sub_lib::wallet::Wallet;
     use crate::test_utils::logging::init_test_logging;
     use crate::test_utils::logging::TestLogHandler;
-    use crate::test_utils::make_wallet;
     use crate::test_utils::persistent_configuration_mock::PersistentConfigurationMock;
     use crate::test_utils::recorder::make_recorder;
     use crate::test_utils::recorder::peer_actors_builder;
     use crate::test_utils::recorder::Recorder;
+    use crate::test_utils::{logging, make_wallet};
     use actix::System;
     use ethereum_types::BigEndianHash;
     use ethsign_crypto::Keccak256;
+    use masq_lib::blockchains::chains::Chain;
+    use masq_lib::test_utils::utils::ensure_node_home_directory_exists;
     use masq_lib::ui_gateway::MessagePath::{Conversation, FireAndForget};
     use masq_lib::ui_gateway::{MessageBody, MessageTarget, NodeFromUiMessage, NodeToUiMessage};
+    use rusqlite::Error;
     use std::cell::RefCell;
     use std::convert::TryFrom;
     use std::ops::Sub;
@@ -962,340 +1006,6 @@ pub mod tests {
     use std::time::SystemTime;
     use web3::types::H256;
     use web3::types::U256;
-
-    pub struct PayableDaoFactoryMock {
-        called: Rc<RefCell<bool>>,
-        mock: RefCell<Option<PayableDaoMock>>,
-    }
-
-    impl PayableDaoFactory for PayableDaoFactoryMock {
-        fn make(&self) -> Box<dyn PayableDao> {
-            *self.called.borrow_mut() = true;
-            Box::new(self.mock.borrow_mut().take().unwrap())
-        }
-    }
-
-    impl PayableDaoFactoryMock {
-        fn new(mock: PayableDaoMock) -> Self {
-            Self {
-                called: Rc::new(RefCell::new(false)),
-                mock: RefCell::new(Some(mock)),
-            }
-        }
-
-        fn called(mut self, called: &Rc<RefCell<bool>>) -> Self {
-            self.called = called.clone();
-            self
-        }
-    }
-
-    #[derive(Debug, Default)]
-    pub struct ReceivableDaoMock {
-        account_status_parameters: Arc<Mutex<Vec<Wallet>>>,
-        account_status_results: RefCell<Vec<Option<ReceivableAccount>>>,
-        more_money_receivable_parameters: Arc<Mutex<Vec<(Wallet, u128)>>>,
-        more_money_receivable_results: RefCell<Vec<Result<(), AccountantError>>>,
-        more_money_received_parameters: Arc<Mutex<Vec<Vec<Transaction>>>>,
-        more_money_received_results: RefCell<Vec<Result<(), AccountantError>>>,
-        receivables_results: RefCell<Vec<Vec<ReceivableAccount>>>,
-        new_delinquencies_parameters: Arc<Mutex<Vec<(SystemTime, PaymentCurves)>>>,
-        new_delinquencies_results: RefCell<Vec<Result<Vec<ReceivableAccount>, AccountantError>>>,
-        paid_delinquencies_parameters: Arc<Mutex<Vec<PaymentCurves>>>,
-        paid_delinquencies_results: RefCell<Vec<Result<Vec<ReceivableAccount>, AccountantError>>>,
-        top_records_parameters: Arc<Mutex<Vec<(i128, u64)>>>,
-        top_records_results: RefCell<Vec<Result<Vec<ReceivableAccount>, AccountantError>>>,
-        total_results: RefCell<Vec<i128>>,
-    }
-
-    impl ReceivableDao for ReceivableDaoMock {
-        fn more_money_receivable(
-            &self,
-            wallet: &Wallet,
-            amount: u128,
-        ) -> Result<(), AccountantError> {
-            self.more_money_receivable_parameters
-                .lock()
-                .unwrap()
-                .push((wallet.clone(), amount));
-            self.more_money_receivable_results.borrow_mut().remove(0)
-        }
-
-        fn more_money_received(&mut self, transactions: Vec<Transaction>) {
-            self.more_money_received_parameters
-                .lock()
-                .unwrap()
-                .push(transactions);
-        }
-
-        fn single_account_status(&self, wallet: &Wallet) -> Option<ReceivableAccount> {
-            self.account_status_parameters
-                .lock()
-                .unwrap()
-                .push(wallet.clone());
-
-            self.account_status_results.borrow_mut().remove(0)
-        }
-
-        fn all_receivable_accounts(&self) -> Vec<ReceivableAccount> {
-            self.receivables_results.borrow_mut().remove(0)
-        }
-
-        fn new_delinquencies(
-            &self,
-            now: SystemTime,
-            payment_curves: &PaymentCurves,
-        ) -> Result<Vec<ReceivableAccount>, AccountantError> {
-            self.new_delinquencies_parameters
-                .lock()
-                .unwrap()
-                .push((now, payment_curves.clone()));
-            if self.new_delinquencies_results.borrow().is_empty() {
-                Ok(vec![])
-            } else {
-                self.new_delinquencies_results.borrow_mut().remove(0)
-            }
-        }
-
-        fn paid_delinquencies(
-            &self,
-            payment_curves: &PaymentCurves,
-        ) -> Result<Vec<ReceivableAccount>, AccountantError> {
-            self.paid_delinquencies_parameters
-                .lock()
-                .unwrap()
-                .push(payment_curves.clone());
-            if self.paid_delinquencies_results.borrow().is_empty() {
-                Ok(vec![])
-            } else {
-                self.paid_delinquencies_results.borrow_mut().remove(0)
-            }
-        }
-
-        fn top_records(
-            &self,
-            minimum_amount: i128,
-            maximum_age: u64,
-        ) -> Result<Vec<ReceivableAccount>, AccountantError> {
-            self.top_records_parameters
-                .lock()
-                .unwrap()
-                .push((minimum_amount, maximum_age));
-            self.top_records_results.borrow_mut().remove(0)
-        }
-
-        fn total(&self) -> i128 {
-            self.total_results.borrow_mut().remove(0)
-        }
-    }
-
-    impl ReceivableDaoMock {
-        pub fn new() -> ReceivableDaoMock {
-            Self::default()
-        }
-
-        fn more_money_receivable_parameters(
-            mut self,
-            parameters: &Arc<Mutex<Vec<(Wallet, u128)>>>,
-        ) -> Self {
-            self.more_money_receivable_parameters = parameters.clone();
-            self
-        }
-
-        fn more_money_receivable_result(self, result: Result<(), AccountantError>) -> Self {
-            self.more_money_receivable_results.borrow_mut().push(result);
-            self
-        }
-
-        fn more_money_received_parameters(
-            mut self,
-            parameters: &Arc<Mutex<Vec<Vec<Transaction>>>>,
-        ) -> Self {
-            self.more_money_received_parameters = parameters.clone();
-            self
-        }
-
-        fn more_money_received_result(self, result: Result<(), AccountantError>) -> Self {
-            self.more_money_received_results.borrow_mut().push(result);
-            self
-        }
-
-        fn new_delinquencies_parameters(
-            mut self,
-            parameters: &Arc<Mutex<Vec<(SystemTime, PaymentCurves)>>>,
-        ) -> Self {
-            self.new_delinquencies_parameters = parameters.clone();
-            self
-        }
-
-        fn new_delinquencies_result(
-            self,
-            result: Result<Vec<ReceivableAccount>, AccountantError>,
-        ) -> ReceivableDaoMock {
-            self.new_delinquencies_results.borrow_mut().push(result);
-            self
-        }
-
-        fn paid_delinquencies_parameters(
-            mut self,
-            parameters: &Arc<Mutex<Vec<PaymentCurves>>>,
-        ) -> Self {
-            self.paid_delinquencies_parameters = parameters.clone();
-            self
-        }
-
-        fn paid_delinquencies_result(
-            self,
-            result: Result<Vec<ReceivableAccount>, AccountantError>,
-        ) -> ReceivableDaoMock {
-            self.paid_delinquencies_results.borrow_mut().push(result);
-            self
-        }
-
-        fn top_records_parameters(mut self, parameters: &Arc<Mutex<Vec<(i128, u64)>>>) -> Self {
-            self.top_records_parameters = parameters.clone();
-            self
-        }
-
-        fn top_records_result(
-            self,
-            result: Result<Vec<ReceivableAccount>, AccountantError>,
-        ) -> Self {
-            self.top_records_results.borrow_mut().push(result);
-            self
-        }
-
-        fn total_result(self, result: i128) -> Self {
-            self.total_results.borrow_mut().push(result);
-            self
-        }
-    }
-
-    pub struct ReceivableDaoFactoryMock {
-        called: Rc<RefCell<bool>>,
-        mock: RefCell<Option<ReceivableDaoMock>>,
-    }
-
-    impl ReceivableDaoFactory for ReceivableDaoFactoryMock {
-        fn make(&self) -> Box<dyn ReceivableDao> {
-            *self.called.borrow_mut() = true;
-            Box::new(self.mock.borrow_mut().take().unwrap())
-        }
-    }
-
-    impl ReceivableDaoFactoryMock {
-        fn new(mock: ReceivableDaoMock) -> Self {
-            Self {
-                called: Rc::new(RefCell::new(false)),
-                mock: RefCell::new(Some(mock)),
-            }
-        }
-
-        fn called(mut self, called: &Rc<RefCell<bool>>) -> Self {
-            self.called = called.clone();
-            self
-        }
-    }
-
-    #[derive(Debug, Default)]
-    struct BannedDaoMock {
-        ban_list_parameters: Arc<Mutex<Vec<()>>>,
-        ban_list_results: RefCell<Vec<Vec<Wallet>>>,
-        ban_parameters: Arc<Mutex<Vec<Wallet>>>,
-        unban_parameters: Arc<Mutex<Vec<Wallet>>>,
-    }
-
-    impl BannedDao for BannedDaoMock {
-        fn ban_list(&self) -> Vec<Wallet> {
-            self.ban_list_parameters.lock().unwrap().push(());
-            self.ban_list_results.borrow_mut().remove(0)
-        }
-
-        fn ban(&self, wallet: &Wallet) {
-            self.ban_parameters.lock().unwrap().push(wallet.clone());
-        }
-
-        fn unban(&self, wallet: &Wallet) {
-            self.unban_parameters.lock().unwrap().push(wallet.clone());
-        }
-    }
-
-    impl BannedDaoMock {
-        pub fn new() -> Self {
-            Self {
-                ban_list_parameters: Arc::new(Mutex::new(vec![])),
-                ban_list_results: RefCell::new(vec![]),
-                ban_parameters: Arc::new(Mutex::new(vec![])),
-                unban_parameters: Arc::new(Mutex::new(vec![])),
-            }
-        }
-
-        pub fn ban_list_result(self, result: Vec<Wallet>) -> Self {
-            self.ban_list_results.borrow_mut().push(result);
-            self
-        }
-
-        pub fn ban_parameters(mut self, parameters: &Arc<Mutex<Vec<Wallet>>>) -> Self {
-            self.ban_parameters = parameters.clone();
-            self
-        }
-
-        pub fn unban_parameters(mut self, parameters: &Arc<Mutex<Vec<Wallet>>>) -> Self {
-            self.unban_parameters = parameters.clone();
-            self
-        }
-    }
-
-    pub struct BannedDaoFactoryMock {
-        called: Rc<RefCell<bool>>,
-        mock: RefCell<Option<BannedDaoMock>>,
-    }
-
-    impl BannedDaoFactory for BannedDaoFactoryMock {
-        fn make(&self) -> Box<dyn BannedDao> {
-            *self.called.borrow_mut() = true;
-            Box::new(self.mock.borrow_mut().take().unwrap())
-        }
-    }
-
-    impl BannedDaoFactoryMock {
-        fn new(mock: BannedDaoMock) -> Self {
-            Self {
-                called: Rc::new(RefCell::new(false)),
-                mock: RefCell::new(Some(mock)),
-            }
-        }
-
-        fn called(mut self, called: &Rc<RefCell<bool>>) -> Self {
-            self.called = called.clone();
-            self
-        }
-    }
-
-    pub struct ConfigDaoFactoryMock {
-        called: Rc<RefCell<bool>>,
-        mock: RefCell<Option<ConfigDaoMock>>,
-    }
-
-    impl ConfigDaoFactory for ConfigDaoFactoryMock {
-        fn make(&self) -> Box<dyn ConfigDao> {
-            *self.called.borrow_mut() = true;
-            Box::new(self.mock.borrow_mut().take().unwrap())
-        }
-    }
-
-    impl ConfigDaoFactoryMock {
-        fn new(mock: ConfigDaoMock) -> Self {
-            Self {
-                called: Rc::new(RefCell::new(false)),
-                mock: RefCell::new(Some(mock)),
-            }
-        }
-
-        fn called(mut self, called: &Rc<RefCell<bool>>) -> Self {
-            self.called = called.clone();
-            self
-        }
-    }
 
     #[test]
     fn new_calls_factories_properly() {
@@ -1368,7 +1078,7 @@ pub mod tests {
             ]))
             .total_result(98765432);
         let system = System::new("test");
-        let subject = make_subject(
+        let subject = make_accountant(
             Some(bc_from_ac_plus_earning_wallet(
                 AccountantConfig {
                     payable_scan_interval: Duration::from_millis(10_000),
@@ -1453,7 +1163,7 @@ pub mod tests {
     fn unexpected_ui_message_is_ignored() {
         init_test_logging();
         let system = System::new("test");
-        let subject = make_subject(
+        let subject = make_accountant(
             Some(bc_from_ac_plus_earning_wallet(
                 AccountantConfig {
                     payable_scan_interval: Duration::from_millis(10_000),
@@ -1503,7 +1213,7 @@ pub mod tests {
 
         let system = System::new("accountant_calls_payable_dao_payment_sent_when_sent_payments");
 
-        let accountant = make_subject(
+        let accountant = make_accountant(
             Some(bc_from_ac_plus_earning_wallet(
                 AccountantConfig {
                     payable_scan_interval: Duration::from_millis(100),
@@ -1551,7 +1261,7 @@ pub mod tests {
 
         let system = System::new("accountant_calls_payable_dao_payment_sent_when_sent_payments");
 
-        let accountant = make_subject(
+        let accountant = make_accountant(
             Some(bc_from_ac_plus_earning_wallet(
                 AccountantConfig {
                     payable_scan_interval: Duration::from_millis(100),
@@ -1628,7 +1338,7 @@ pub mod tests {
                 .blockchain_bridge(blockchain_bridge)
                 .accountant(accountant_mock)
                 .build();
-            let subject = make_subject(
+            let subject = make_accountant(
                 Some(bc_from_ac_plus_earning_wallet(
                     AccountantConfig {
                         payable_scan_interval: Duration::from_millis(100),
@@ -1704,7 +1414,7 @@ pub mod tests {
                 .blockchain_bridge(blockchain_bridge)
                 .accountant(accountant_mock)
                 .build();
-            let subject = make_subject(
+            let subject = make_accountant(
                 Some(bc_from_ac_plus_earning_wallet(
                     AccountantConfig {
                         payable_scan_interval: Duration::from_millis(100),
@@ -1741,7 +1451,7 @@ pub mod tests {
         let expected_transactions = vec![Transaction {
             block_number: 7u64,
             from: paying_wallet.clone(),
-            gwei_amount: amount,
+            wei_amount: amount,
         }];
         let blockchain_bridge =
             Recorder::new().retrieve_transactions_response(Ok(expected_transactions.clone()));
@@ -1765,7 +1475,7 @@ pub mod tests {
                 .new_delinquencies_result(Ok(vec![]))
                 .paid_delinquencies_result(Ok(vec![]));
             let config_mock = PersistentConfigurationMock::new().start_block_result(Ok(5));
-            let subject = make_subject(
+            let subject = make_accountant(
                 Some(config),
                 Some(payable_dao),
                 Some(receivable_dao),
@@ -1810,6 +1520,75 @@ pub mod tests {
     }
 
     #[test]
+    fn handle_received_payments_logs_when_no_payment_are_given() {
+        logging::init_test_logging();
+        let home_dir = ensure_node_home_directory_exists(
+            "receivable_dao",
+            "handle_received_payments_logs_when_no_payment_are_given",
+        );
+        let conn = DbInitializerReal::default()
+            .initialize(&home_dir, Chain::PolyMainnet, true)
+            .unwrap();
+        let receivable_dao = ReceivableDaoReal::new(conn);
+        let mut accountant = make_accountant(None, None, None, None, None);
+        accountant.receivable_dao = Box::new(receivable_dao);
+        let system = System::new("received_payments_test");
+        let addr = accountant.start();
+        let msg = ReceivedPayments { payments: vec![] };
+
+        let _ = addr.try_send(msg).unwrap();
+
+        System::current().stop();
+        system.run();
+        TestLogHandler::new().exists_log_containing(
+            "ERROR: Accountant: Payment reception failed, rolling back: Multi insert payment: ReceivableError(Other(\"no payments given\"))",
+        );
+    }
+
+    #[test]
+    fn handle_received_payments_logs_when_transaction_fails() {
+        logging::init_test_logging();
+        let conn_mock =
+            ConnectionWrapperMock::default().transaction_result(Err(Error::InvalidQuery));
+        let receivable_dao = ReceivableDaoReal::new(Box::new(conn_mock));
+        let mut accountant = make_accountant(None, None, None, None, None);
+        accountant.receivable_dao = Box::new(receivable_dao);
+        let system = System::new("received_payments_test");
+        let addr = accountant.start();
+        let payments = vec![
+            Transaction {
+                block_number: 1234567890,
+                from: Wallet::new("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+                wei_amount: 123456789123456789,
+            },
+            Transaction {
+                block_number: 2345678901,
+                from: Wallet::new("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"),
+                wei_amount: 234567891234567891,
+            },
+            Transaction {
+                block_number: 3456789012,
+                from: Wallet::new("0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"),
+                wei_amount: 345678912345678912,
+            },
+        ];
+        let msg = ReceivedPayments { payments };
+
+        let _ = addr.try_send(msg).unwrap();
+
+        System::current().stop();
+        system.run();
+        TestLogHandler::new().exists_log_containing(&format!(
+            "ERROR: Accountant: Payment reception failed, rolling back: Multi insert payment: ReceivableError(Other(\"Query is not read-only\"))\n\
+            Block #    Wallet                                     Amount            \n\
+            1234567890 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 123456789123456789\n\
+            2345678901 0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 234567891234567891\n\
+            3456789012 0xcccccccccccccccccccccccccccccccccccccccc 345678912345678912\n\
+            TOTAL                                                 703703592703703592"
+        ));
+    }
+
+    #[test]
     fn accountant_logs_if_no_transactions_were_detected() {
         init_test_logging();
         let earning_wallet = make_wallet("earner3000");
@@ -1832,7 +1611,7 @@ pub mod tests {
                 .new_delinquencies_result(Ok(vec![]))
                 .paid_delinquencies_result(Ok(vec![]));
             let config_mock = PersistentConfigurationMock::new().start_block_result(Ok(5));
-            let subject = make_subject(
+            let subject = make_accountant(
                 Some(config),
                 Some(payable_dao),
                 Some(receivable_dao),
@@ -1895,7 +1674,7 @@ pub mod tests {
                 .new_delinquencies_result(Ok(vec![]))
                 .paid_delinquencies_result(Ok(vec![]));
             let config_mock = PersistentConfigurationMock::new().start_block_result(Ok(0));
-            let subject = make_subject(
+            let subject = make_accountant(
                 Some(config),
                 Some(payable_dao),
                 Some(receivable_dao),
@@ -1933,14 +1712,14 @@ pub mod tests {
         let expected_payment = Transaction {
             block_number: 7u64,
             from: wallet.clone(),
-            gwei_amount,
+            wei_amount: gwei_amount,
         };
         let more_money_received_params_arc = Arc::new(Mutex::new(vec![]));
         let receivable_dao = ReceivableDaoMock::new()
             .more_money_received_parameters(&more_money_received_params_arc)
             .more_money_received_result(Ok(()))
             .more_money_received_result(Ok(()));
-        let accountant = make_subject(
+        let accountant = make_accountant(
             Some(bc_from_ac_plus_earning_wallet(
                 AccountantConfig {
                     payable_scan_interval: Duration::from_secs(10_000),
@@ -1972,10 +1751,10 @@ pub mod tests {
 
         let first_payment = more_money_received_params.get(0).unwrap();
         assert_eq!(expected_payment.from, first_payment.from);
-        assert_eq!(gwei_amount, first_payment.gwei_amount);
+        assert_eq!(gwei_amount, first_payment.wei_amount);
         let second_payment = more_money_received_params.get(1).unwrap();
         assert_eq!(expected_payment.from, second_payment.from);
-        assert_eq!(gwei_amount, second_payment.gwei_amount);
+        assert_eq!(gwei_amount, second_payment.wei_amount);
     }
 
     #[test]
@@ -2017,7 +1796,7 @@ pub mod tests {
             let payable_dao = PayableDaoMock::new()
                 .non_pending_payables_result(vec![account0, account1])
                 .non_pending_payables_result(vec![]);
-            let subject = make_subject(Some(config), Some(payable_dao), None, None, None);
+            let subject = make_accountant(Some(config), Some(payable_dao), None, None, None);
             let peer_actors = peer_actors_builder()
                 .blockchain_bridge(blockchain_bridge)
                 .build();
@@ -2048,7 +1827,7 @@ pub mod tests {
             make_wallet("buy"),
             make_wallet("hi"),
         );
-        let subject = make_subject(Some(config), None, None, None, None);
+        let subject = make_accountant(Some(config), None, None, None, None);
         let peer_actors = peer_actors_builder()
             .blockchain_bridge(blockchain_bridge)
             .build();
@@ -2121,7 +1900,7 @@ pub mod tests {
         let blockchain_bridge_addr: Addr<Recorder> = blockchain_bridge.start();
         let report_accounts_payable_sub =
             blockchain_bridge_addr.recipient::<ReportAccountsPayable>();
-        let mut subject = make_subject(Some(config), Some(payable_dao), None, None, None);
+        let mut subject = make_accountant(Some(config), Some(payable_dao), None, None, None);
         subject.report_accounts_payable_sub = Some(report_accounts_payable_sub);
 
         subject.scan_for_payables();
@@ -2181,7 +1960,7 @@ pub mod tests {
             let peer_actors = peer_actors_builder()
                 .blockchain_bridge(blockchain_bridge)
                 .build();
-            let subject = make_subject(Some(config), Some(payable_dao), None, None, None);
+            let subject = make_accountant(Some(config), Some(payable_dao), None, None, None);
             let subject_addr = subject.start();
             let accountant_subs = Accountant::make_subs_from(&subject_addr);
 
@@ -2221,7 +2000,7 @@ pub mod tests {
             let banned_dao = BannedDaoMock::new()
                 .ban_list_result(vec![])
                 .ban_parameters(&ban_parameters_arc_inner);
-            let subject = make_subject(
+            let subject = make_accountant(
                 Some(config),
                 Some(payable_dao),
                 Some(receivable_dao),
@@ -2254,7 +2033,7 @@ pub mod tests {
         init_test_logging();
         let persistent_config = PersistentConfigurationMock::new()
             .start_block_result(Err(PersistentConfigError::NotPresent));
-        let mut subject = make_subject(None, None, None, None, Some(persistent_config));
+        let mut subject = make_accountant(None, None, None, None, Some(persistent_config));
 
         subject.scan_for_received_payments();
 
@@ -2293,7 +2072,7 @@ pub mod tests {
             .ban_list_result(vec![])
             .ban_parameters(&ban_parameters_arc)
             .unban_parameters(&unban_parameters_arc);
-        let mut subject = make_subject(
+        let mut subject = make_accountant(
             Some(config),
             Some(payable_dao),
             Some(receivable_dao),
@@ -2339,7 +2118,7 @@ pub mod tests {
         let receivable_dao_mock = ReceivableDaoMock::new()
             .more_money_receivable_parameters(&more_money_receivable_parameters_arc)
             .more_money_receivable_result(Ok(()));
-        let subject = make_subject(
+        let subject = make_accountant(
             Some(config),
             Some(payable_dao_mock),
             Some(receivable_dao_mock),
@@ -2393,7 +2172,7 @@ pub mod tests {
         let payable_dao_mock = PayableDaoMock::new().non_pending_payables_result(vec![]);
         let receivable_dao_mock = ReceivableDaoMock::new()
             .more_money_receivable_parameters(&more_money_receivable_parameters_arc);
-        let subject = make_subject(
+        let subject = make_accountant(
             Some(config),
             Some(payable_dao_mock),
             Some(receivable_dao_mock),
@@ -2445,7 +2224,7 @@ pub mod tests {
         let payable_dao_mock = PayableDaoMock::new().non_pending_payables_result(vec![]);
         let receivable_dao_mock = ReceivableDaoMock::new()
             .more_money_receivable_parameters(&more_money_receivable_parameters_arc);
-        let subject = make_subject(
+        let subject = make_accountant(
             Some(config),
             Some(payable_dao_mock),
             Some(receivable_dao_mock),
@@ -2497,7 +2276,7 @@ pub mod tests {
             .non_pending_payables_result(vec![])
             .more_money_payable_parameters(more_money_payable_parameters_arc.clone())
             .more_money_payable_result(Ok(()));
-        let subject = make_subject(Some(config), Some(payable_dao_mock), None, None, None);
+        let subject = make_accountant(Some(config), Some(payable_dao_mock), None, None, None);
         let system = System::new("report_routing_service_consumed_message_is_received");
         let subject_addr: Addr<Accountant> = subject.start();
         subject_addr
@@ -2544,7 +2323,7 @@ pub mod tests {
         let payable_dao_mock = PayableDaoMock::new()
             .non_pending_payables_result(vec![])
             .more_money_payable_parameters(more_money_payable_parameters_arc.clone());
-        let subject = make_subject(Some(config), Some(payable_dao_mock), None, None, None);
+        let subject = make_accountant(Some(config), Some(payable_dao_mock), None, None, None);
         let system = System::new("report_routing_service_consumed_message_is_received");
         let subject_addr: Addr<Accountant> = subject.start();
         subject_addr
@@ -2587,7 +2366,7 @@ pub mod tests {
         let payable_dao_mock = PayableDaoMock::new()
             .non_pending_payables_result(vec![])
             .more_money_payable_parameters(more_money_payable_parameters_arc.clone());
-        let subject = make_subject(Some(config), Some(payable_dao_mock), None, None, None);
+        let subject = make_accountant(Some(config), Some(payable_dao_mock), None, None, None);
         let system = System::new("report_routing_service_consumed_message_is_received");
         let subject_addr: Addr<Accountant> = subject.start();
         subject_addr
@@ -2630,7 +2409,7 @@ pub mod tests {
         let receivable_dao_mock = ReceivableDaoMock::new()
             .more_money_receivable_parameters(&more_money_receivable_parameters_arc)
             .more_money_receivable_result(Ok(()));
-        let subject = make_subject(
+        let subject = make_accountant(
             Some(config),
             Some(payable_dao_mock),
             Some(receivable_dao_mock),
@@ -2684,7 +2463,7 @@ pub mod tests {
         let payable_dao_mock = PayableDaoMock::new().non_pending_payables_result(vec![]);
         let receivable_dao_mock = ReceivableDaoMock::new()
             .more_money_receivable_parameters(&more_money_receivable_parameters_arc);
-        let subject = make_subject(
+        let subject = make_accountant(
             Some(config),
             Some(payable_dao_mock),
             Some(receivable_dao_mock),
@@ -2736,7 +2515,7 @@ pub mod tests {
         let payable_dao_mock = PayableDaoMock::new().non_pending_payables_result(vec![]);
         let receivable_dao_mock = ReceivableDaoMock::new()
             .more_money_receivable_parameters(&more_money_receivable_parameters_arc);
-        let subject = make_subject(
+        let subject = make_accountant(
             Some(config),
             Some(payable_dao_mock),
             Some(receivable_dao_mock),
@@ -2788,7 +2567,7 @@ pub mod tests {
             .non_pending_payables_result(vec![])
             .more_money_payable_parameters(more_money_payable_parameters_arc.clone())
             .more_money_payable_result(Ok(()));
-        let subject = make_subject(Some(config), Some(payable_dao_mock), None, None, None);
+        let subject = make_accountant(Some(config), Some(payable_dao_mock), None, None, None);
         let system = System::new("report_exit_service_consumed_message_is_received");
         let subject_addr: Addr<Accountant> = subject.start();
         subject_addr
@@ -2836,7 +2615,7 @@ pub mod tests {
         let payable_dao_mock = PayableDaoMock::new()
             .non_pending_payables_result(vec![])
             .more_money_payable_parameters(more_money_payable_parameters_arc.clone());
-        let subject = make_subject(Some(config), Some(payable_dao_mock), None, None, None);
+        let subject = make_accountant(Some(config), Some(payable_dao_mock), None, None, None);
         let system = System::new("report_exit_service_consumed_message_is_received");
         let subject_addr: Addr<Accountant> = subject.start();
         subject_addr
@@ -2879,7 +2658,7 @@ pub mod tests {
         let payable_dao_mock = PayableDaoMock::new()
             .non_pending_payables_result(vec![])
             .more_money_payable_parameters(more_money_payable_parameters_arc.clone());
-        let subject = make_subject(Some(config), Some(payable_dao_mock), None, None, None);
+        let subject = make_accountant(Some(config), Some(payable_dao_mock), None, None, None);
         let system = System::new("report_exit_service_consumed_message_is_received");
         let subject_addr: Addr<Accountant> = subject.start();
         subject_addr
@@ -2911,7 +2690,7 @@ pub mod tests {
     fn record_service_provided_handles_overflow() {
         init_test_logging();
         let wallet = make_wallet("booga");
-        let subject = make_subject(
+        let subject = make_accountant(
             None,
             None,
             Some(ReceivableDaoMock::new().more_money_receivable_result(Err(
@@ -2936,7 +2715,7 @@ pub mod tests {
     fn record_service_consumed_handles_overflow() {
         init_test_logging();
         let wallet = make_wallet("booga");
-        let subject = make_subject(
+        let subject = make_accountant(
             None,
             Some(PayableDaoMock::new().more_money_payable_result(Err(
                 AccountantError::RecordServiceDataOverflow(SignConversionError::U64(
@@ -2968,11 +2747,11 @@ pub mod tests {
                 H256::from_uint(&U256::from(1)),
             ))],
         };
-        let mut subject = make_subject(
+        let mut subject = make_accountant(
             None,
             Some(
                 PayableDaoMock::new().payment_sent_result(Err(AccountantError::PayableError(
-                    PayableError::Owerflow(SignConversionError::U128("owerflow".to_string())),
+                    PayableError::Overflow(SignConversionError::U128("owerflow".to_string())),
                 ))),
             ),
             None,
@@ -3099,33 +2878,5 @@ pub mod tests {
         bc.consuming_wallet = Some(consuming_wallet);
         bc.earning_wallet = earning_wallet;
         bc
-    }
-
-    fn make_subject(
-        config_opt: Option<BootstrapperConfig>,
-        payable_dao_opt: Option<PayableDaoMock>,
-        receivable_dao_opt: Option<ReceivableDaoMock>,
-        banned_dao_opt: Option<BannedDaoMock>,
-        persistent_config_opt: Option<PersistentConfigurationMock>,
-    ) -> Accountant {
-        let payable_dao_factory =
-            PayableDaoFactoryMock::new(payable_dao_opt.unwrap_or(PayableDaoMock::new()));
-        let receivable_dao_factory =
-            ReceivableDaoFactoryMock::new(receivable_dao_opt.unwrap_or(ReceivableDaoMock::new()));
-        let banned_dao_factory =
-            BannedDaoFactoryMock::new(banned_dao_opt.unwrap_or(BannedDaoMock::new()));
-        let mut subject = Accountant::new(
-            &config_opt.unwrap_or(BootstrapperConfig::new()),
-            Box::new(payable_dao_factory),
-            Box::new(receivable_dao_factory),
-            Box::new(banned_dao_factory),
-            Box::new(ConfigDaoFactoryMock::new(ConfigDaoMock::new())),
-        );
-        subject.persistent_configuration = if let Some(persistent_config) = persistent_config_opt {
-            Box::new(persistent_config)
-        } else {
-            Box::new(PersistentConfigurationMock::new())
-        };
-        subject
     }
 }

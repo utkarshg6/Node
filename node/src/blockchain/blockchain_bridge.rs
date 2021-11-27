@@ -370,7 +370,7 @@ mod tests {
         let expected_results = vec![Transaction {
             block_number: 42u64,
             from: make_wallet("some_address"),
-            gwei_amount: 21,
+            wei_amount: 21,
         }];
         let result = Ok(expected_results.clone());
         let wallet = make_wallet("smelly");

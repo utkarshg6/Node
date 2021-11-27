@@ -1,4 +1,7 @@
 // Copyright (c) 2019, MASQ (https://masq.ai) and/or its affiliates. All rights reserved.
+use crate::accountant::dao_shared_methods::{
+    insert_or_update_receivable, reverse_sign, update_receivable, InsertUpdateCore,
+};
 use crate::accountant::u128_to_signed;
 use crate::accountant::{u64_to_signed, AccountantError, PaymentCurves, SignConversionError};
 use crate::blockchain::blockchain_interface::Transaction;
@@ -44,9 +47,18 @@ pub struct ReceivableAccount {
 }
 
 pub trait ReceivableDao: Send {
-    fn more_money_receivable(&self, wallet: &Wallet, amount: u128) -> Result<(), AccountantError>;
+    fn more_money_receivable(
+        &self,
+        wallet: &Wallet,
+        amount: u128,
+        insert_update_core: &dyn InsertUpdateCore,
+    ) -> Result<(), AccountantError>;
 
-    fn more_money_received(&mut self, transactions: Vec<Transaction>);
+    fn more_money_received(
+        &mut self,
+        transactions: &[Transaction],
+        insert_update_core: &dyn InsertUpdateCore,
+    ) -> Result<(), AccountantError>;
 
     fn single_account_status(&self, wallet: &Wallet) -> Option<ReceivableAccount>;
 
@@ -88,25 +100,35 @@ pub struct ReceivableDaoReal {
 }
 
 impl ReceivableDao for ReceivableDaoReal {
-    fn more_money_receivable(&self, wallet: &Wallet, amount: u128) -> Result<(), AccountantError> {
-        let signed_amount = u128_to_signed(amount).map_err(|e| e.into_receivable())?;
-        match self.try_update(wallet, signed_amount) {
-            Ok(true) => Ok(()),
-            Ok(false) => match self.try_insert(wallet, signed_amount) {
-                Ok(_) => Ok(()),
-                Err(e) => {
-                    fatal!(self.logger, "Couldn't insert; database is corrupt: {}", e);
-                }
-            },
-            Err(e) => {
-                fatal!(self.logger, "Couldn't update: database is corrupt: {}", e);
-            }
+    fn more_money_receivable(
+        &self,
+        wallet: &Wallet,
+        amount: u128,
+        insert_update_core: &dyn InsertUpdateCore,
+    ) -> Result<(), AccountantError> {
+        let signed_amount = u128_to_signed(amount).map_err(|e| {
+            e.into_receivable().extend(&format!(
+                "on calling more_money_receivable(); for wallet '{}' and amount '{}'",
+                wallet, amount
+            ))
+        })?;
+        match insert_or_update_receivable(
+            self.conn.as_ref(),
+            insert_update_core,
+            &wallet.to_string(),
+            signed_amount,
+        ) {
+            Ok(_) => Ok(()),
+            Err(e) => unimplemented!(), //e.extend(&format!("on calling more_money_receivable(); for wallet '{}' and amount '{}'",wallet,amount)).wrap_to_err() //TODO you can make this compatible with the error from payables
         }
     }
 
-    fn more_money_received(&mut self, payments: Vec<Transaction>) {
-        self.try_multi_insert_payment(&payments)
-            .unwrap_or_else(|e| multi_insert_payment_error_logged(payments, &self.logger, e))
+    fn more_money_received(
+        &mut self,
+        payments: &[Transaction],
+        insert_update_core: &dyn InsertUpdateCore,
+    ) -> Result<(), AccountantError> {
+        self.try_multi_insert_payment(payments, insert_update_core)
     }
 
     fn single_account_status(&self, wallet: &Wallet) -> Option<ReceivableAccount> {
@@ -276,44 +298,57 @@ impl ReceivableDaoReal {
             logger: Logger::new("ReceivableDaoReal"),
         }
     }
-
-    fn try_update(&self, wallet: &Wallet, amount: i128) -> Result<bool, String> {
-        let mut stmt = self
-            .conn
-            .prepare("update receivable set balance = balance + ? where wallet_address = ?")
-            .expect("Internal error");
-        let params: &[&dyn ToSql] = &[&amount, &wallet];
-        match stmt.execute(params) {
-            Ok(0) => Ok(false),
-            Ok(_) => Ok(true),
-            Err(e) => Err(format!("{}", e)),
-        }
-    }
-
-    fn try_insert(&self, wallet: &Wallet, amount: i128) -> Result<(), String> {
-        let timestamp = dao_utils::to_time_t(SystemTime::now());
-        let mut stmt = self.conn.prepare("insert into receivable (wallet_address, balance, last_received_timestamp) values (?, ?, ?)").expect("Internal error");
-        let params: &[&dyn ToSql] = &[&wallet /*, &blob_i128(amount)*/, &(timestamp as i64)];
-        match stmt.execute(params) {
-            Ok(_) => Ok(()),
-            Err(e) => Err(format!("{}", e)),
-        }
-    }
+    //
+    // fn try_update(&self, wallet: &Wallet, amount: i128,insert_update_core: &dyn InsertUpdateCore) -> Result<bool, AccountantError> {
+    //     insert_or_update_receivable(self.conn.as_ref(),insert_update_core,&wallet.to_string(),amount)
+    //
+    //
+    //     // let mut stmt = self
+    //     //     .conn
+    //     //     .prepare("update receivable set balance = balance + ? where wallet_address = ?")
+    //     //     .expect("Internal error");
+    //     // let params: &[&dyn ToSql] = &[&amount, &wallet];
+    //     // match stmt.execute(params) {
+    //     //     Ok(0) => Ok(false),
+    //     //     Ok(_) => Ok(true),
+    //     //     Err(e) => Err(format!("{}", e)),
+    //     // }
+    // }
+    //
+    // fn try_insert(&self, wallet: &Wallet, amount: i128) -> Result<(), String> {
+    //     let timestamp = dao_utils::to_time_t(SystemTime::now());
+    //     let mut stmt = self.conn.prepare("insert into receivable (wallet_address, balance, last_received_timestamp) values (?, ?, ?)").expect("Internal error");
+    //     let params: &[&dyn ToSql] = &[&wallet /*, &blob_i128(amount)*/, &(timestamp as i64)];
+    //     match stmt.execute(params) {
+    //         Ok(_) => Ok(()),
+    //         Err(e) => Err(format!("{}", e)),
+    //     }
+    // }
 
     fn try_multi_insert_payment(
         &mut self,
         payments: &[Transaction],
-    ) -> Result<(), ReceivableError> {
+        insert_update_core: &dyn InsertUpdateCore,
+    ) -> Result<(), AccountantError> {
+        //this function is also tested from a higher level in accountant/mod.rs, at mentions of handle_received_payments
         let tx = match self.conn.transaction() {
             Ok(t) => t,
-            Err(e) => unimplemented!("test drive me back"), // return Err(ReceivableError::Other(e.to_string())),
+            Err(e) => {
+                return Err(AccountantError::ReceivableError(ReceivableError::Other(
+                    e.to_string(),
+                )))
+            }
         };
 
         let block_number = payments
             .iter()
             .map(|t| t.block_number)
             .max()
-            .ok_or_else(|| "no payments given".to_string())?;
+            .ok_or_else(|| {
+                AccountantError::ReceivableError(ReceivableError::Other(
+                    "no payments given".to_string(),
+                ))
+            })?;
 
         let mut writer = ConfigDaoWriteableReal::new(tx);
         match writer.set("start_block", Some(block_number.to_string())) {
@@ -325,11 +360,9 @@ impl ReceivableDaoReal {
             .expect("Transaction disappeared from writer");
 
         {
-            let mut stmt = tx.prepare("update receivable set balance = balance - ?, last_received_timestamp = ? where wallet_address = ?")
-                .expect ("Internal SQL error");
             for transaction in payments {
                 let timestamp = dao_utils::now_time_t();
-                let gwei_amount = match u128_to_signed(transaction.gwei_amount) {
+                let wei_amount = match u128_to_signed(transaction.wei_amount) {
                     Ok(amount) => amount,
                     Err(e) => unimplemented!("test drive me back"), //     {
                                                                     //     return Err(ReceivableError::Other(format!(
@@ -338,8 +371,16 @@ impl ReceivableDaoReal {
                                                                     //     )))
                                                                     // }
                 };
-                let params: &[&dyn ToSql] = &[&gwei_amount, &timestamp, &transaction.from];
-                stmt.execute(params).map_err(|e| e.to_string())?;
+                let sign_reversed_amount = reverse_sign(wei_amount)
+                    .expect("should be within the correct range after the previous operation");
+                update_receivable(
+                    &tx,
+                    insert_update_core,
+                    &transaction.from.to_string(),
+                    sign_reversed_amount,
+                    timestamp,
+                )
+                .map_err(|e| unimplemented!())?;
             }
         }
         match tx.commit() {
@@ -364,28 +405,6 @@ impl ReceivableDaoReal {
     }
 }
 
-fn multi_insert_payment_error_logged(
-    payments: Vec<Transaction>,
-    logger: &Logger,
-    error: ReceivableError,
-) {
-    let mut report_lines = vec![format!("{:10} {:42} {:18}", "Block #", "Wallet", "Amount")];
-    let mut sum = 0_u128;
-    payments.iter().for_each(|t| {
-        report_lines.push(format!(
-            "{:10} {:42} {:18}",
-            t.block_number, t.from, t.gwei_amount
-        ));
-        sum += t.gwei_amount;
-    });
-    report_lines.push(format!("{:10} {:42} {:18}", "TOTAL", "", sum));
-    let report = report_lines.join("\n");
-    error!(
-        logger,
-        "Payment reception failed, rolling back: {:?}\n{}", error, report
-    );
-}
-
 //TODO implement this
 pub trait TotalInnerEncapsulationReceivable {
     fn total_inner(&self, dao: &dyn ReceivableDao) -> Result<i128, AccountantError>;
@@ -394,8 +413,8 @@ pub trait TotalInnerEncapsulationReceivable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::accountant::dao_shared_methods::InsertUpdateCoreReal;
     use crate::accountant::test_utils::make_receivable_account;
-    use crate::accountant::PayableError;
     use crate::database::dao_utils::{from_time_t, now_time_t, to_time_t};
     use crate::database::db_initializer;
     use crate::database::db_initializer::test_utils::ConnectionWrapperMock;
@@ -428,7 +447,7 @@ mod tests {
     fn conversion_from_string_works() {
         let subject = ReceivableError::from("booga".to_string());
 
-        unimplemented!("test drive me back");
+        todo!("when all is green, try to discard this function if it was really needed");
         assert_eq!(subject, ReceivableError::Other("booga".to_string()));
     }
 
@@ -446,17 +465,17 @@ mod tests {
         let payments = vec![Transaction {
             block_number: 42u64,
             from: make_wallet("some_address"),
-            gwei_amount: 18446744073709551615,
+            wei_amount: 18446744073709551615,
         }];
 
-        let result = subject.try_multi_insert_payment(&payments.as_slice());
+        let result = subject.try_multi_insert_payment(&payments.as_slice(), &InsertUpdateCoreReal);
 
         unimplemented!("test drive me back");
         assert_eq!(
             result,
-            Err(ReceivableError::Other(
+            Err(AccountantError::ReceivableError(ReceivableError::Other(
                 "Amount too large: SignConversion(18446744073709551615)".to_string()
-            ))
+            )))
         )
     }
 
@@ -478,17 +497,17 @@ mod tests {
         let payments = vec![Transaction {
             block_number: 42u64,
             from: make_wallet("some_address"),
-            gwei_amount: 18446744073709551615,
+            wei_amount: 18446744073709551615,
         }];
 
-        let result = subject.try_multi_insert_payment(&payments.as_slice());
+        let result = subject.try_multi_insert_payment(&payments.as_slice(), &InsertUpdateCoreReal);
 
         unimplemented!("test drive me back");
         assert_eq!(
             result,
-            Err(ReceivableError::Other(
+            Err(AccountantError::ReceivableError(ReceivableError::Other(
                 "DatabaseError(\"no such table: config\")".to_string()
-            ))
+            )))
         )
     }
 
@@ -511,10 +530,10 @@ mod tests {
         let payments = vec![Transaction {
             block_number: 42u64,
             from: make_wallet("some_address"),
-            gwei_amount: 18446744073709551615,
+            wei_amount: 18446744073709551615,
         }];
 
-        let _ = subject.try_multi_insert_payment(payments.as_slice());
+        let _ = subject.try_multi_insert_payment(payments.as_slice(), &InsertUpdateCoreReal);
     }
 
     #[test]
@@ -532,7 +551,9 @@ mod tests {
                     .unwrap(),
             );
 
-            subject.more_money_receivable(&wallet, 1234).unwrap();
+            subject
+                .more_money_receivable(&wallet, 1234, &InsertUpdateCoreReal)
+                .unwrap();
             subject.single_account_status(&wallet).unwrap()
         };
 
@@ -567,7 +588,9 @@ mod tests {
                     .initialize(&home_dir, TEST_DEFAULT_CHAIN, true)
                     .unwrap(),
             );
-            subject.more_money_receivable(&wallet, 1234).unwrap();
+            subject
+                .more_money_receivable(&wallet, 1234, &InsertUpdateCoreReal)
+                .unwrap();
             let mut flags = OpenFlags::empty();
             flags.insert(OpenFlags::SQLITE_OPEN_READ_WRITE);
             let conn =
@@ -582,7 +605,9 @@ mod tests {
         };
 
         let status = {
-            subject.more_money_receivable(&wallet, 2345).unwrap();
+            subject
+                .more_money_receivable(&wallet, 2345, &InsertUpdateCoreReal)
+                .unwrap();
             subject.single_account_status(&wallet).unwrap()
         };
 
@@ -603,12 +628,13 @@ mod tests {
                 .unwrap(),
         );
 
-        let result = subject.more_money_receivable(&make_wallet("booga"), u128::MAX);
+        let result =
+            subject.more_money_receivable(&make_wallet("booga"), u128::MAX, &InsertUpdateCoreReal);
 
         assert_eq!(
             result,
-            Err(AccountantError::PayableError(PayableError::Owerflow(
-                SignConversionError::U128("blah".to_string())
+            Err(AccountantError::ReceivableError(ReceivableError::Overflow(
+                SignConversionError::U128("conversion of 340282366920938463463374607431768211455 from u128 to i128 failed on: out of range integral type conversion attempted; on calling more_money_receivable(); for wallet '0x000000000000000000000000000000626f6f6761' and amount '340282366920938463463374607431768211455'".to_string())
             )))
         )
     }
@@ -628,8 +654,12 @@ mod tests {
                     .initialize(&home_dir, TEST_DEFAULT_CHAIN, true)
                     .unwrap(),
             );
-            subject.more_money_receivable(&debtor1, 1234).unwrap();
-            subject.more_money_receivable(&debtor2, 2345).unwrap();
+            subject
+                .more_money_receivable(&debtor1, 1234, &InsertUpdateCoreReal)
+                .unwrap();
+            subject
+                .more_money_receivable(&debtor2, 2345, &InsertUpdateCoreReal)
+                .unwrap();
             let mut flags = OpenFlags::empty();
             flags.insert(OpenFlags::SQLITE_OPEN_READ_WRITE);
             subject
@@ -639,17 +669,18 @@ mod tests {
             let transactions = vec![
                 Transaction {
                     from: debtor1.clone(),
-                    gwei_amount: 1200u128,
+                    wei_amount: 1200u128,
                     block_number: 35u64,
                 },
                 Transaction {
                     from: debtor2.clone(),
-                    gwei_amount: 2300u128,
+                    wei_amount: 2300u128,
                     block_number: 57u64,
                 },
             ];
 
-            subject.more_money_received(transactions);
+            subject.more_money_received(&transactions, &InsertUpdateCoreReal);
+
             (
                 subject.single_account_status(&debtor1).unwrap(),
                 subject.single_account_status(&debtor2).unwrap(),
@@ -694,73 +725,14 @@ mod tests {
         let status = {
             let transactions = vec![Transaction {
                 from: debtor.clone(),
-                gwei_amount: 2300u128,
+                wei_amount: 2300u128,
                 block_number: 33u64,
             }];
-            subject.more_money_received(transactions);
+            subject.more_money_received(&transactions, &InsertUpdateCoreReal);
             subject.single_account_status(&debtor)
         };
 
         assert!(status.is_none());
-    }
-
-    #[test]
-    fn more_money_received_logs_when_transaction_fails() {
-        logging::init_test_logging();
-
-        let conn_mock =
-            ConnectionWrapperMock::default().transaction_result(Err(Error::InvalidQuery));
-        let mut receivable_dao = ReceivableDaoReal::new(Box::new(conn_mock));
-        let payments = vec![
-            Transaction {
-                block_number: 1234567890,
-                from: Wallet::new("0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
-                gwei_amount: 123456789123456789,
-            },
-            Transaction {
-                block_number: 2345678901,
-                from: Wallet::new("0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"),
-                gwei_amount: 234567891234567891,
-            },
-            Transaction {
-                block_number: 3456789012,
-                from: Wallet::new("0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"),
-                gwei_amount: 345678912345678912,
-            },
-        ];
-
-        receivable_dao.more_money_received(payments);
-
-        TestLogHandler::new().exists_log_containing(&format!(
-            "ERROR: ReceivableDaoReal: Payment reception failed, rolling back: Other(\"Query is not read-only\")\n\
-            Block #    Wallet                                     Amount            \n\
-            1234567890 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 123456789123456789\n\
-            2345678901 0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 234567891234567891\n\
-            3456789012 0xcccccccccccccccccccccccccccccccccccccccc 345678912345678912\n\
-            TOTAL                                                 703703592703703592"
-        ));
-    }
-
-    #[test]
-    fn more_money_received_logs_when_no_payment_are_given() {
-        logging::init_test_logging();
-
-        let home_dir = ensure_node_home_directory_exists(
-            "receivable_dao",
-            "more_money_received_logs_when_no_payment_are_given",
-        );
-
-        let mut receivable_dao = ReceivableDaoReal::new(
-            DbInitializerReal::default()
-                .initialize(&home_dir, TEST_DEFAULT_CHAIN, true)
-                .unwrap(),
-        );
-
-        receivable_dao.more_money_received(vec![]);
-
-        TestLogHandler::new().exists_log_containing(
-            "ERROR: ReceivableDaoReal: Payment reception failed, rolling back: Other(\"no payments given\")",
-        );
     }
 
     #[test]
@@ -797,8 +769,12 @@ mod tests {
                 .unwrap(),
         );
 
-        subject.more_money_receivable(&wallet1, 1234).unwrap();
-        subject.more_money_receivable(&wallet2, 2345).unwrap();
+        subject
+            .more_money_receivable(&wallet1, 1234, &InsertUpdateCoreReal)
+            .unwrap();
+        subject
+            .more_money_receivable(&wallet2, 2345, &InsertUpdateCoreReal)
+            .unwrap();
 
         let accounts = subject
             .all_receivable_accounts()

@@ -86,6 +86,7 @@ impl Display for AccountantError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             AccountantError::PayableError(msg) => write!(f, "Error from payable: {:?}", msg),
+            AccountantError::ReceivableError(msg) => write!(f,"Error from receivable: {:?}",msg),
             _ => unimplemented!(),
         }
     }
@@ -94,8 +95,9 @@ impl Display for AccountantError {
 impl AccountantError {
     pub fn extend(self, msg_extension: &str) -> Self {
         match self {
+            //TODO maybe write a test that both sides are always of the same kind
             AccountantError::ReceivableError(ReceivableError::RusqliteError(msg)) => {
-                unimplemented!()
+                AccountantError::ReceivableError(ReceivableError::RusqliteError(Self::add_str(msg,msg_extension)))
             }
             AccountantError::ReceivableError(ReceivableError::ConfigurationError(msg)) => {
                 unimplemented!()
@@ -772,7 +774,8 @@ impl Accountant {
                     Ok(()) => (),
                     Err(e) => error! (
                         self.logger,
-                        "Overflow error trying to record payment of {} sent to earning wallet {} (transaction {}). Skipping",
+                        "{}; amount {} to address {} on transaction {}",
+                        e,
                         payment.amount,
                         payment.to,
                         payment.transaction,
@@ -2761,12 +2764,9 @@ pub mod tests {
 
         subject.handle_sent_payments(payments);
 
-        TestLogHandler::new().exists_log_containing(&format!(
-            "ERROR: Accountant: Overflow error trying to record payment of {} sent to earning wallet {} (transaction {}). Skipping",
-            std::u64::MAX,
-            wallet,
-            H256::from_uint(&U256::from(1))
-        ));
+        TestLogHandler::new().exists_log_containing(
+            "ERROR: Accountant: Error from payable: Overflow(U128(\"owerflow\")); amount 340282366920938463463374607431768211455 to address 0x000000000000000000000000000000626f6f6761 on transaction 0x0000…0001"
+        );
     }
 
     #[test]
@@ -2840,15 +2840,24 @@ pub mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "blah")]
-    fn u128_to_signed_panics_verbosely_on_an_error() {
-        let _ = u128_to_signed(u128::MAX);
+    fn u128_to_signed_gives_a_verbose_error_at_overflow() {
+        let result = u128_to_signed(u128::MAX);
+
+        assert_eq!(result,Err(SignConversionError::U128("conversion of 340282366920938463463374607431768211455 from u128 to i128 failed on: out of range integral type conversion attempted".to_string())))
     }
 
     #[test]
-    #[should_panic(expected = "blah")]
-    fn u64_to_signed_panics_verbosely_on_an_error() {
-        let _ = u64_to_signed(u64::MAX);
+    fn u64_to_signed_gives_a_verbose_error_at_overflow() {
+        let result = u64_to_signed(u64::MAX);
+
+        assert_eq!(result,Err(SignConversionError::U64("conversion of 18446744073709551615 from u64 to i64 failed on: out of range integral type conversion attempted".to_string())))
+    }
+
+    #[test]
+    fn i128_to_unsigned_gives_a_verbose_error_at_overflow() {
+        let result = i128_to_unsigned(i128::MIN);
+
+        assert_eq!(result,Err(SignConversionError::I128("conversion of -170141183460469231731687303715884105728 from i128 to u128 failed on: out of range integral type conversion attempted".to_string())))
     }
 
     #[test]

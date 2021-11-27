@@ -156,6 +156,13 @@ impl ReceivableDao for ReceivableDaoReal {
             .collect()
     }
 
+    // let m = -((PAYMENT_CURVES.balance_to_decrease_from_wei as f64
+    // - PAYMENT_CURVES.permanent_debt_allowed_wei as f64)
+    // / (PAYMENT_CURVES.balance_decreases_for_sec as f64
+    // - PAYMENT_CURVES.payment_suggested_after_sec as f64));
+    // let b = PAYMENT_CURVES.balance_to_decrease_from_wei as f64
+    // - m * PAYMENT_CURVES.payment_suggested_after_sec as f64;
+
     fn new_delinquencies(
         &self,
         system_now: SystemTime,
@@ -353,7 +360,7 @@ impl ReceivableDaoReal {
         let mut writer = ConfigDaoWriteableReal::new(tx);
         match writer.set("start_block", Some(block_number.to_string())) {
             Ok(_) => (),
-            Err(e) => unimplemented!("test drive me back"), //return Err(ReceivableError::Other(format!("{:?}", e))),
+            Err(e) => return Err(AccountantError::ReceivableError(ReceivableError::ConfigurationError(format!("{:?}", e)))),
         }
         let tx = writer
             .extract()
@@ -364,23 +371,19 @@ impl ReceivableDaoReal {
                 let timestamp = dao_utils::now_time_t();
                 let wei_amount = match u128_to_signed(transaction.wei_amount) {
                     Ok(amount) => amount,
-                    Err(e) => unimplemented!("test drive me back"), //     {
-                                                                    //     return Err(ReceivableError::Other(format!(
-                                                                    //         "Amount too large: {:?}",
-                                                                    //         e
-                                                                    //     )))
-                                                                    // }
-                };
+                    Err(e) => return Err(e.into_receivable().extend("on calling try_multi_insert_payment()"))};
                 let sign_reversed_amount = reverse_sign(wei_amount)
                     .expect("should be within the correct range after the previous operation");
+                let wallet = transaction.from.to_string();
                 update_receivable(
                     &tx,
                     insert_update_core,
-                    &transaction.from.to_string(),
+                    &wallet,
                     sign_reversed_amount,
                     timestamp,
                 )
-                .map_err(|e| unimplemented!())?;
+                .map_err(|e| e
+                    .extend("couldn't update an account calling try_multi_insert_payment()"))?;
             }
         }
         match tx.commit() {
@@ -430,6 +433,7 @@ mod tests {
     use crate::test_utils::make_wallet;
     use masq_lib::test_utils::utils::{ensure_node_home_directory_exists, TEST_DEFAULT_CHAIN};
     use rusqlite::{Connection, Error, OpenFlags};
+    use crate::database::connection_wrapper::ConnectionWrapperReal;
 
     #[test]
     fn conversion_from_pce_works() {
@@ -452,10 +456,10 @@ mod tests {
     }
 
     #[test]
-    fn try_multi_insert_payment_handles_error_of_number_sign_check() {
+    fn try_multi_insert_payment_handles_error_from_amount_overflow() {
         let home_dir = ensure_node_home_directory_exists(
             "receivable_dao",
-            "try_multi_insert_payment_handles_error_of_number_sign_check",
+            "try_multi_insert_payment_handles_error_from_amount_overflow",
         );
         let mut subject = ReceivableDaoReal::new(
             DbInitializerReal::default()
@@ -465,17 +469,16 @@ mod tests {
         let payments = vec![Transaction {
             block_number: 42u64,
             from: make_wallet("some_address"),
-            wei_amount: 18446744073709551615,
+            wei_amount: u128::MAX,
         }];
 
         let result = subject.try_multi_insert_payment(&payments.as_slice(), &InsertUpdateCoreReal);
 
-        unimplemented!("test drive me back");
         assert_eq!(
             result,
-            Err(AccountantError::ReceivableError(ReceivableError::Other(
-                "Amount too large: SignConversion(18446744073709551615)".to_string()
-            )))
+            Err(AccountantError::ReceivableError(ReceivableError::Overflow(SignConversionError::U128(
+                "conversion of 340282366920938463463374607431768211455 from u128 to i128 failed on: out of range integral type conversion attempted; on calling try_multi_insert_payment()".to_string()
+            ))))
         )
     }
 
@@ -485,15 +488,9 @@ mod tests {
             "receivable_dao",
             "try_multi_insert_payment_handles_error_setting_start_block",
         );
-        let conn = DbInitializerReal::default()
-            .initialize(&home_dir, TEST_DEFAULT_CHAIN, true)
-            .unwrap();
-        {
-            let mut stmt = conn.prepare("drop table config").unwrap();
-            stmt.execute([]).unwrap();
-        }
-        let mut subject = ReceivableDaoReal::new(conn);
-
+        let conn = Connection::open_in_memory().unwrap();
+        let conn_wrapped = ConnectionWrapperReal::new(conn);
+        let mut subject = ReceivableDaoReal::new(Box::new(conn_wrapped));
         let payments = vec![Transaction {
             block_number: 42u64,
             from: make_wallet("some_address"),
@@ -502,10 +499,9 @@ mod tests {
 
         let result = subject.try_multi_insert_payment(&payments.as_slice(), &InsertUpdateCoreReal);
 
-        unimplemented!("test drive me back");
         assert_eq!(
             result,
-            Err(AccountantError::ReceivableError(ReceivableError::Other(
+            Err(AccountantError::ReceivableError(ReceivableError::ConfigurationError(
                 "DatabaseError(\"no such table: config\")".to_string()
             )))
         )
@@ -721,17 +717,18 @@ mod tests {
                 .initialize(&home_dir, TEST_DEFAULT_CHAIN, true)
                 .unwrap(),
         );
-
-        let status = {
-            let transactions = vec![Transaction {
+        let transactions = vec![Transaction {
                 from: debtor.clone(),
                 wei_amount: 2300u128,
                 block_number: 33u64,
-            }];
-            subject.more_money_received(&transactions, &InsertUpdateCoreReal);
-            subject.single_account_status(&debtor)
-        };
+        }];
 
+        let result = subject.more_money_received(&transactions, &InsertUpdateCoreReal);
+
+        assert_eq!(result,Err(AccountantError::ReceivableError(ReceivableError::RusqliteError("Updating balance \
+for receivable of -2300 Wei to 0x000000000000756e6b6e6f776e5f77616c6c6574; failing on: 'Query returned no \
+rows'; couldn't update an account calling try_multi_insert_payment()".to_string()))));
+        let status = subject.single_account_status(&debtor);
         assert!(status.is_none());
     }
 

@@ -7,7 +7,7 @@ use crate::accountant::{u64_to_signed, AccountantError, PaymentCurves, SignConve
 use crate::blockchain::blockchain_interface::Transaction;
 use crate::database::connection_wrapper::ConnectionWrapper;
 use crate::database::dao_utils;
-use crate::database::dao_utils::{to_time_t, DaoFactoryReal};
+use crate::database::dao_utils::{to_time_t, DaoFactoryReal, now_time_t};
 use crate::db_config::config_dao::{ConfigDaoWrite, ConfigDaoWriteableReal};
 use crate::db_config::persistent_configuration::PersistentConfigError;
 use crate::sub_lib::logger::Logger;
@@ -17,7 +17,8 @@ use masq_lib::utils::WrapResult;
 use rusqlite::named_params;
 use rusqlite::types::{ToSql, Type};
 use rusqlite::{OptionalExtension, Row};
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
+use crate::accountant::receivable_dao::ReceivableError::RusqliteError;
 
 #[derive(Debug, PartialEq)]
 pub enum ReceivableError {
@@ -156,39 +157,26 @@ impl ReceivableDao for ReceivableDaoReal {
             .collect()
     }
 
-    // let m = -((PAYMENT_CURVES.balance_to_decrease_from_wei as f64
-    // - PAYMENT_CURVES.permanent_debt_allowed_wei as f64)
-    // / (PAYMENT_CURVES.balance_decreases_for_sec as f64
-    // - PAYMENT_CURVES.payment_suggested_after_sec as f64));
-    // let b = PAYMENT_CURVES.balance_to_decrease_from_wei as f64
-    // - m * PAYMENT_CURVES.payment_suggested_after_sec as f64;
-
     fn new_delinquencies(
         &self,
         system_now: SystemTime,
         payment_curves: &PaymentCurves,
     ) -> Result<Vec<ReceivableAccount>, AccountantError> {
-        let now = to_time_t(system_now);
-        let slope = (payment_curves.permanent_debt_allowed_wei as f64
-            - payment_curves.balance_to_decrease_from_wei as f64)
-            / (payment_curves.balance_decreases_for_sec as f64);
+        self.create_temporary_table_with_metadata_for_yet_unbanned(payment_curves)?;
         let sql = indoc!(
             r"
             select r.wallet_address, r.balance, r.last_received_timestamp
-            from receivable r left outer join banned b on r.wallet_address = b.wallet_address
+            from receivable r left outer join delinquency_metadata d on r.wallet_address = d.wallet_address
             where
                 r.last_received_timestamp < :sugg_and_grace
-                and r.balance > :balance_to_decrease_from + :slope * (:sugg_and_grace - r.last_received_timestamp)
+                and r.balance > d.curve_point
                 and r.balance > :permanent_debt
-                and b.wallet_address is null
         "
         );
         let mut stmt = self.conn.prepare(sql).expect("Couldn't prepare statement");
         stmt.query_map(
             named_params! {
-                ":slope": slope,
-                ":sugg_and_grace": payment_curves.sugg_and_grace(now),
-                ":balance_to_decrease_from": u128_to_signed(payment_curves.balance_to_decrease_from_wei).map_err(|e|e.into_receivable())?,
+                ":sugg_and_grace": payment_curves.sugg_and_grace(to_time_t(system_now)),
                 ":permanent_debt": u128_to_signed(payment_curves.permanent_debt_allowed_wei).map_err(|e|e.into_receivable())?,
             },
             Self::row_to_account,
@@ -305,32 +293,44 @@ impl ReceivableDaoReal {
             logger: Logger::new("ReceivableDaoReal"),
         }
     }
-    //
-    // fn try_update(&self, wallet: &Wallet, amount: i128,insert_update_core: &dyn InsertUpdateCore) -> Result<bool, AccountantError> {
-    //     insert_or_update_receivable(self.conn.as_ref(),insert_update_core,&wallet.to_string(),amount)
-    //
-    //
-    //     // let mut stmt = self
-    //     //     .conn
-    //     //     .prepare("update receivable set balance = balance + ? where wallet_address = ?")
-    //     //     .expect("Internal error");
-    //     // let params: &[&dyn ToSql] = &[&amount, &wallet];
-    //     // match stmt.execute(params) {
-    //     //     Ok(0) => Ok(false),
-    //     //     Ok(_) => Ok(true),
-    //     //     Err(e) => Err(format!("{}", e)),
-    //     // }
-    // }
-    //
-    // fn try_insert(&self, wallet: &Wallet, amount: i128) -> Result<(), String> {
-    //     let timestamp = dao_utils::to_time_t(SystemTime::now());
-    //     let mut stmt = self.conn.prepare("insert into receivable (wallet_address, balance, last_received_timestamp) values (?, ?, ?)").expect("Internal error");
-    //     let params: &[&dyn ToSql] = &[&wallet /*, &blob_i128(amount)*/, &(timestamp as i64)];
-    //     match stmt.execute(params) {
-    //         Ok(_) => Ok(()),
-    //         Err(e) => Err(format!("{}", e)),
-    //     }
-    // }
+
+    fn create_temporary_table_with_metadata_for_yet_unbanned(&self, payment_curves:&PaymentCurves) ->Result<(),AccountantError>{
+        let sql = indoc!(
+            r"
+            create temp table delinquency_metadata(
+                wallet_address text not null,
+                curve_point blob not null
+            )");
+        let mut temp_table_stm = self.conn.prepare(sql).expect("internal error");
+        temp_table_stm.execute([]).expect("creation of a temporary table failed");
+        let slope = (payment_curves.permanent_debt_allowed_wei as f64
+            - payment_curves.balance_to_decrease_from_wei as f64)
+            / (payment_curves.balance_decreases_for_sec as f64);
+        let mut select_stm = self.conn.prepare("select r.wallet_address, r.last_received_timestamp from receivable r left outer join banned b on r.wallet_address = b.wallet_address where b.wallet_address is null").expect("internal error");
+        let mut insert_stm = self.conn.prepare("insert into delinquency_metadata (wallet_address, curve_point) values (:wallet_address, :curve_point)").expect("internal error");
+        select_stm.query_map([],|row|{
+            let wallet_address:rusqlite::Result<String> = row.get(0);
+            let timestamp:rusqlite::Result<i64> = row.get(1);
+            match (wallet_address,timestamp) {
+                (Ok(wallet_address),Ok(timestamp)) => {
+                    let declining_curve_boarder = Self::delinquency_curve_height_detection(payment_curves, now_time_t(), timestamp, slope).map_err(|e|{unimplemented!();rusqlite::Error::BlobSizeError})?;
+                    eprintln!("declining boarder {}\n, {}",declining_curve_boarder, wallet_address);
+                    let insert_params = named_params!(":wallet_address":&wallet_address,":curve_point":&declining_curve_boarder);
+                    insert_stm.execute(insert_params).map_err(|e|{unimplemented!();rusqlite::Error::BlobSizeError})?;
+                    Ok(())
+                }
+                _ => unimplemented!()
+            }
+        })
+            .expect("internal error")
+            .collect::<Vec<rusqlite::Result<()>>>();
+        Ok(())
+    }
+
+    fn delinquency_curve_height_detection(payment_curves:&PaymentCurves,now: i64,timestamp:i64,slope: f64)->Result<i128,AccountantError>{
+        Ok(u128_to_signed(payment_curves.balance_to_decrease_from_wei).map_err(|e|unimplemented!())?
+        + slope as i128 * (payment_curves.sugg_and_grace( now) - timestamp) as i128)
+    }
 
     fn try_multi_insert_payment(
         &mut self,
@@ -797,6 +797,73 @@ rows'; couldn't update an account calling try_multi_insert_payment()".to_string(
             ],
             accounts
         )
+    }
+
+    #[test]
+    fn fetching_potential_new_delinquencies_and_their_curve_heights() {
+        //these values are actually irrelevant because the decision
+        //is made based on whether the wallet is listed among the current known delinquents;
+        //we would judge the quality of the debt in the next step
+        let pcs = PaymentCurves {
+            payment_suggested_after_sec: 25,
+            payment_grace_before_ban_sec: 50,
+            permanent_debt_allowed_wei: 100,
+            balance_to_decrease_from_wei: 200,
+            balance_decreases_for_sec: 100,
+            unban_when_balance_below_wei: 0,
+        };
+        let slope = (pcs.permanent_debt_allowed_wei as f64
+            - pcs.balance_to_decrease_from_wei as f64)
+            / (pcs.balance_decreases_for_sec as f64);
+        let home_dir =
+            ensure_node_home_directory_exists("accountant", "fetching_potential_new_delinquencies_and_their_curve_heights");
+        let conn = DbInitializerReal::default()
+            .initialize(&home_dir,TEST_DEFAULT_CHAIN,true).unwrap();
+        let wallet_banned = make_wallet("wallet_banned");
+        let wallet_1 = make_wallet("wallet_1");
+        let wallet_2 = make_wallet("wallet_2");
+        let unbanned_account_1_timestamp = from_time_t(38_400_000_000);
+        let unbanned_account_2_timestamp = SystemTime::now();
+        let banned_account= ReceivableAccount{
+            wallet: wallet_banned,
+            balance: 80057,
+            last_received_timestamp: from_time_t(26_500_000_000)
+        };
+        let unbanned_account_1 = ReceivableAccount{
+            wallet: wallet_1.clone(),
+            balance: 8500,
+            last_received_timestamp: unbanned_account_1_timestamp
+        };
+        let unbanned_account_2 = ReceivableAccount{
+            wallet: wallet_2.clone(),
+            balance: 30,
+            last_received_timestamp:unbanned_account_2_timestamp
+        };
+        add_receivable_account(&conn,&banned_account);
+        add_banned_account(&conn, &banned_account);
+        add_receivable_account(&conn,&unbanned_account_1);
+        add_receivable_account(&conn,&unbanned_account_2);
+        let subject =  ReceivableDaoReal::new(conn);
+
+        subject.create_temporary_table_with_metadata_for_yet_unbanned(&pcs);
+
+        let now = now_time_t();
+        let mut captured = capture_rows(subject.conn.as_ref(),"delinquency_metadata");
+        let expected_point_height_for_unbanned_1 =
+            ReceivableDaoReal::delinquency_curve_height_detection(&pcs,now,to_time_t(unbanned_account_1_timestamp),slope).unwrap();
+        let expected_point_height_for_unbanned_2 =
+            ReceivableDaoReal::delinquency_curve_height_detection(&pcs,now,to_time_t(unbanned_account_2_timestamp),slope).unwrap();
+        assert_eq!(captured,vec![(wallet_1.to_string(), expected_point_height_for_unbanned_1), (wallet_2.to_string(),expected_point_height_for_unbanned_2)]);
+    }
+
+    fn capture_rows(conn:&dyn ConnectionWrapper, table:&str)-> Vec<(String,i128)>{
+        let mut stm = conn.prepare(&format!("select * from {}",table)).unwrap();
+
+        stm.query_map([],|row|{
+            let wallet:String = row.get(0).unwrap();
+            let curve_value:i128 = row.get(1).unwrap();
+            Ok((wallet,curve_value))
+        }).unwrap().flat_map(|val|val).collect::<Vec<(String,i128)>>()
     }
 
     #[test]

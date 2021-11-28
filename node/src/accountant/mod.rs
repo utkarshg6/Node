@@ -86,7 +86,7 @@ impl Display for AccountantError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             AccountantError::PayableError(msg) => write!(f, "Error from payable: {:?}", msg),
-            AccountantError::ReceivableError(msg) => write!(f,"Error from receivable: {:?}",msg),
+            AccountantError::ReceivableError(msg) => write!(f, "Error from receivable: {:?}", msg),
             _ => unimplemented!(),
         }
     }
@@ -97,7 +97,10 @@ impl AccountantError {
         match self {
             //TODO maybe write a test that both sides are always of the same kind
             AccountantError::ReceivableError(ReceivableError::RusqliteError(msg)) => {
-                AccountantError::ReceivableError(ReceivableError::RusqliteError(Self::add_str(msg,msg_extension)))
+                AccountantError::ReceivableError(ReceivableError::RusqliteError(Self::add_str(
+                    msg,
+                    msg_extension,
+                )))
             }
             AccountantError::ReceivableError(ReceivableError::ConfigurationError(msg)) => {
                 unimplemented!()
@@ -770,9 +773,13 @@ impl Accountant {
             .payments
             .iter()
             .for_each(|payment| match payment {
-                Ok(payment) => match self.payable_dao.as_mut().payment_sent(payment,&InsertUpdateCoreReal) {
+                Ok(payment) => match self
+                    .payable_dao
+                    .as_mut()
+                    .payment_sent(payment, &InsertUpdateCoreReal)
+                {
                     Ok(()) => (),
-                    Err(e) => error! (
+                    Err(e) => error!(
                         self.logger,
                         "{}; amount {} to address {} on transaction {}",
                         e,

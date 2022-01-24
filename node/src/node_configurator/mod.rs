@@ -3,6 +3,7 @@
 pub mod configurator;
 pub mod node_configurator_initialization;
 pub mod node_configurator_standard;
+
 use crate::bootstrapper::RealUser;
 use crate::database::db_initializer::{DbInitializer, DbInitializerReal, DATABASE_FILE};
 use crate::database::db_migrations::MigratorConfig;
@@ -19,8 +20,9 @@ use masq_lib::shared_schema::{
     chain_arg, config_file_arg, data_directory_arg, real_user_arg, ConfiguratorError,
 };
 use masq_lib::utils::{localhost, ExpectValue, WrapResult};
-use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
+use std::net::{SocketAddr, TcpListener};
+use socket2::{Socket, Domain, Type};
 
 pub trait NodeConfigurator<T> {
     fn configure(&self, multi_config: &MultiConfig) -> Result<T, ConfiguratorError>;
@@ -163,12 +165,15 @@ impl DirsWrapper for DirsWrapperReal {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::MaybeUninit;
     use super::*;
     use crate::node_test_utils::DirsWrapperMock;
     use crate::test_utils::ArgsBuilder;
     use masq_lib::test_utils::environment_guard::EnvironmentGuard;
     use masq_lib::utils::find_free_port;
-    use std::net::{SocketAddr, TcpListener};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
+    use socket2::Protocol;
+    use socket2::MaybeUninitSlice;
 
     fn determine_config_file_path_app() -> App<'static, 'static> {
         App::new("test")
@@ -220,7 +225,7 @@ mod tests {
             &determine_config_file_path_app(),
             args_vec.as_slice(),
         )
-        .unwrap();
+            .unwrap();
 
         assert_eq!(
             &format!("{}", config_file_path.parent().unwrap().display()),
@@ -243,7 +248,7 @@ mod tests {
             &determine_config_file_path_app(),
             args_vec.as_slice(),
         )
-        .unwrap();
+            .unwrap();
 
         assert_eq!(
             "data_dir",
@@ -267,7 +272,7 @@ mod tests {
             &determine_config_file_path_app(),
             args_vec.as_slice(),
         )
-        .unwrap();
+            .unwrap();
 
         assert_eq!(
             "/tmp/booga.toml",
@@ -290,7 +295,7 @@ mod tests {
             &determine_config_file_path_app(),
             args_vec.as_slice(),
         )
-        .unwrap();
+            .unwrap();
 
         assert_eq!(
             r"\tmp\booga.toml",
@@ -313,7 +318,7 @@ mod tests {
             &determine_config_file_path_app(),
             args_vec.as_slice(),
         )
-        .unwrap();
+            .unwrap();
 
         assert_eq!(
             r"c:\tmp\booga.toml",
@@ -336,7 +341,7 @@ mod tests {
             &determine_config_file_path_app(),
             args_vec.as_slice(),
         )
-        .unwrap();
+            .unwrap();
 
         assert_eq!(
             r"\\TMP\booga.toml",
@@ -347,8 +352,7 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn determine_config_file_path_ignores_data_dir_if_config_file_has_drive_letter_but_no_separator(
-    ) {
+    fn determine_config_file_path_ignores_data_dir_if_config_file_has_drive_letter_but_no_separator() {
         let _guard = EnvironmentGuard::new();
         let args = ArgsBuilder::new()
             .param("--data-directory", "data-dir")
@@ -360,7 +364,7 @@ mod tests {
             &determine_config_file_path_app(),
             args_vec.as_slice(),
         )
-        .unwrap();
+            .unwrap();
 
         assert_eq!(
             r"c:tmp\booga.toml",
@@ -386,5 +390,113 @@ mod tests {
         let result = port_is_busy(port);
 
         assert_eq!(result, true);
+    }
+
+    #[test]
+    fn udp_loopback_receiver_works_ipv4_stdnet() {
+        let port = find_free_port();
+        let ip = Ipv4Addr::new(127, 0, 0, 1);
+        let socket_addr = SocketAddr::new(IpAddr::from(ip), port);
+        let socket = UdpSocket::bind(socket_addr).expect("couldn't bind to address");
+
+        handle_socket_error(&socket);
+        assert_eq!(socket.local_addr().unwrap(), socket_addr);
+        socket.connect(socket_addr).expect("connect function failed");
+
+        socket.send(&[0; 10]).expect("couldn't send message");
+
+        handle_socket_receive(&socket);
+    }
+
+    #[test]
+    #[should_panic]
+    fn udp_loopback_receiver_handles_buffer_overflow() {
+        let port = find_free_port();
+        let ip = Ipv4Addr::new(127, 0, 0, 1);
+        let socket_addr = SocketAddr::new(IpAddr::from(ip), port);
+        let socket = UdpSocket::bind(socket_addr).expect("couldn't bind to address");
+
+        handle_socket_error(&socket);
+        assert_eq!(socket.local_addr().unwrap(), socket_addr);
+
+        socket.connect(socket_addr).expect("connect function failed");
+        socket.send(&[0; 50]).expect("couldn't send data");
+
+        handle_socket_receive(&socket);
+    }
+
+    fn handle_socket_receive(socket: &UdpSocket) {
+        let mut buf = [0; 10];
+        match socket.recv(&mut buf) {
+            Ok(received) => println!("received {} bytes {:?}", received, &buf[..received]),
+            Err(e) => panic!("recv function failed: {:?}", e),
+        }
+    }
+
+    fn handle_socket_error(socket: &UdpSocket) {
+        match socket.take_error() {
+            Ok(Some(error)) => eprintln!("UdpSocket error: {:?}", error),
+            Ok(None) => println!("No error"),
+            Err(error) => eprintln!("UdpSocket.take_error failed: {:?}", error),
+        }
+    }
+
+    #[test]
+    fn udp_singlecast_receiver_works_ipv4_stdnet() {
+        let port = find_free_port();
+        let ip = Ipv4Addr::new(127, 0, 0, 1);
+        let socket_addr = SocketAddr::new(IpAddr::from(ip), port);
+        let socket_addr2 = SocketAddr::new(IpAddr::from(ip), port+1);
+
+        let socket = UdpSocket::bind(&socket_addr).expect("couldn't bind to address");
+        let socket2 = UdpSocket::bind(&socket_addr2).expect("couldn't bind to address");
+        assert_eq!(socket.local_addr().unwrap(), socket_addr.clone());
+        assert_eq!(socket2.local_addr().unwrap(), socket_addr2.clone());
+
+        handle_socket_error(&socket);
+        handle_socket_error(&socket2);
+
+        socket.connect(socket_addr).expect("connect function failed");
+        socket2.connect(socket_addr2).expect("connect function failed");
+        assert_eq!(socket.peer_addr().unwrap(), socket_addr.clone());
+        assert_eq!(socket2.peer_addr().unwrap(), socket_addr2.clone());
+
+        socket.send(&[0; 10]).expect("couldn't send data");
+        socket2.send(&[0; 10]).expect("couldn't send data");
+        handle_socket_receive(&socket);
+        handle_socket_receive(&socket2);
+    }
+
+    #[test]
+    fn udp_singlecast_receiver_works_ipv4_socket2() {
+        let address: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let address = address.into();
+        let address2: SocketAddr = "127.0.0.1:12346".parse().unwrap();
+        let address2 = address2.into();
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("couldn't create socket");
+        let socket2 = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("couldn't create socket");
+
+
+        socket.bind(&address).expect("couldn't bind");
+        socket2.bind(&address2).expect("couldn't bind");
+
+        socket.send_to(&[0; 10], &address2).expect("couldn't send data");
+        socket2.send_to(&[0; 10], &address).expect("couldn't send data");
+
+        let mut buf = [MaybeUninit::new(0); 10];
+        let (number_of_bytes, src_addr) = socket.recv_from_vectored(&mut [
+            MaybeUninitSlice::new(&mut buf)])
+            .expect("Didn't receive data");
+        let filled_buf = &mut buf[..number_of_bytes];
+        // match socket.recv_from(&mut []) {
+        //     Ok(received) => println!("received {:?} bytes {:?}", received, &buf[..received]),
+        //     Err(e) => panic!("recv function failed: {:?}", e),
+        // }
+
+    }
+
+    #[test]
+    fn udp_multicast_receiver_works_ipv4_socket2() {
+
     }
 }

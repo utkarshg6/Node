@@ -4,7 +4,6 @@ pub mod configurator;
 pub mod node_configurator_initialization;
 pub mod node_configurator_standard;
 
-use std::{io, net};
 use crate::bootstrapper::RealUser;
 use crate::database::db_initializer::{DbInitializer, DbInitializerReal, DATABASE_FILE};
 use crate::database::db_migrations::MigratorConfig;
@@ -21,13 +20,14 @@ use masq_lib::shared_schema::{
     chain_arg, config_file_arg, data_directory_arg, real_user_arg, ConfiguratorError,
 };
 use masq_lib::utils::{localhost, ExpectValue, WrapResult};
-use std::path::{Path, PathBuf};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use std::sync::{Arc, Barrier};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
 use std::time::Duration;
+use std::{io, net};
 
 pub trait NodeConfigurator<T> {
     fn configure(&self, multi_config: &MultiConfig) -> Result<T, ConfiguratorError>;
@@ -273,13 +273,12 @@ fn multicast_listener(
 
 fn new_sender(addr: &SocketAddr) -> io::Result<UdpSocket> {
     let socket = new_socket(addr)?;
-        socket.set_multicast_if_v4(&Ipv4Addr::new(0, 0, 0, 0))?;
+    socket.set_multicast_if_v4(&Ipv4Addr::new(0, 0, 0, 0))?;
 
-        socket.bind(&SockAddr::from(SocketAddr::new(
-            Ipv4Addr::new(0, 0, 0, 0).into(),
-            0,
-        )))?;
-
+    socket.bind(&SockAddr::from(SocketAddr::new(
+        Ipv4Addr::new(0, 0, 0, 0).into(),
+        0,
+    )))?;
 
     // convert to standard sockets...
     Ok(net::UdpSocket::from(socket))
@@ -372,7 +371,7 @@ mod tests {
             &determine_config_file_path_app(),
             args_vec.as_slice(),
         )
-            .unwrap();
+        .unwrap();
 
         assert_eq!(
             &format!("{}", config_file_path.parent().unwrap().display()),
@@ -395,7 +394,7 @@ mod tests {
             &determine_config_file_path_app(),
             args_vec.as_slice(),
         )
-            .unwrap();
+        .unwrap();
 
         assert_eq!(
             "data_dir",
@@ -419,7 +418,7 @@ mod tests {
             &determine_config_file_path_app(),
             args_vec.as_slice(),
         )
-            .unwrap();
+        .unwrap();
 
         assert_eq!(
             "/tmp/booga.toml",
@@ -442,7 +441,7 @@ mod tests {
             &determine_config_file_path_app(),
             args_vec.as_slice(),
         )
-            .unwrap();
+        .unwrap();
 
         assert_eq!(
             r"\tmp\booga.toml",
@@ -465,7 +464,7 @@ mod tests {
             &determine_config_file_path_app(),
             args_vec.as_slice(),
         )
-            .unwrap();
+        .unwrap();
 
         assert_eq!(
             r"c:\tmp\booga.toml",
@@ -488,7 +487,7 @@ mod tests {
             &determine_config_file_path_app(),
             args_vec.as_slice(),
         )
-            .unwrap();
+        .unwrap();
 
         assert_eq!(
             r"\\TMP\booga.toml",
@@ -499,7 +498,8 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn determine_config_file_path_ignores_data_dir_if_config_file_has_drive_letter_but_no_separator() {
+    fn determine_config_file_path_ignores_data_dir_if_config_file_has_drive_letter_but_no_separator(
+    ) {
         let _guard = EnvironmentGuard::new();
         let args = ArgsBuilder::new()
             .param("--data-directory", "data-dir")
@@ -511,7 +511,7 @@ mod tests {
             &determine_config_file_path_app(),
             args_vec.as_slice(),
         )
-            .unwrap();
+        .unwrap();
 
         assert_eq!(
             r"c:tmp\booga.toml",
@@ -548,7 +548,9 @@ mod tests {
 
         handle_socket_error(&socket);
         assert_eq!(socket.local_addr().unwrap(), socket_addr);
-        socket.connect(socket_addr).expect("connect function failed");
+        socket
+            .connect(socket_addr)
+            .expect("connect function failed");
 
         socket.send(&[0; 10]).expect("couldn't send message");
 
@@ -566,7 +568,9 @@ mod tests {
         handle_socket_error(&socket);
         assert_eq!(socket.local_addr().unwrap(), socket_addr);
 
-        socket.connect(socket_addr).expect("connect function failed");
+        socket
+            .connect(socket_addr)
+            .expect("connect function failed");
         socket.send(&[0; 50]).expect("couldn't send data");
 
         handle_socket_receive(&socket);
@@ -593,7 +597,7 @@ mod tests {
         let port = find_free_port();
         let ip = Ipv4Addr::new(127, 0, 0, 1);
         let socket_addr = SocketAddr::new(IpAddr::from(ip), port);
-        let socket_addr2 = SocketAddr::new(IpAddr::from(ip), port+1);
+        let socket_addr2 = SocketAddr::new(IpAddr::from(ip), port + 1);
 
         let socket = UdpSocket::bind(&socket_addr).expect("couldn't bind to address");
         let socket2 = UdpSocket::bind(&socket_addr2).expect("couldn't bind to address");
@@ -603,8 +607,12 @@ mod tests {
         handle_socket_error(&socket);
         handle_socket_error(&socket2);
 
-        socket.connect(socket_addr).expect("connect function failed");
-        socket2.connect(socket_addr2).expect("connect function failed");
+        socket
+            .connect(socket_addr)
+            .expect("connect function failed");
+        socket2
+            .connect(socket_addr2)
+            .expect("connect function failed");
         assert_eq!(socket.peer_addr().unwrap(), socket_addr.clone());
         assert_eq!(socket2.peer_addr().unwrap(), socket_addr2.clone());
 

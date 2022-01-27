@@ -4,6 +4,7 @@ pub mod configurator;
 pub mod node_configurator_initialization;
 pub mod node_configurator_standard;
 
+use std::{io, net};
 use crate::bootstrapper::RealUser;
 use crate::database::db_initializer::{DbInitializer, DbInitializerReal, DATABASE_FILE};
 use crate::database::db_migrations::MigratorConfig;
@@ -21,8 +22,12 @@ use masq_lib::shared_schema::{
 };
 use masq_lib::utils::{localhost, ExpectValue, WrapResult};
 use std::path::{Path, PathBuf};
-use std::net::{SocketAddr, TcpListener};
-use socket2::{Socket, Domain, Type};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 pub trait NodeConfigurator<T> {
     fn configure(&self, multi_config: &MultiConfig) -> Result<T, ConfiguratorError>;
@@ -143,6 +148,151 @@ pub fn port_is_busy(port: u16) -> bool {
     TcpListener::bind(SocketAddr::new(localhost(), port)).is_err()
 }
 
+// this will be common for all our sockets
+fn new_socket(addr: &SocketAddr) -> io::Result<Socket> {
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+
+    // we're going to use read timeouts so that we don't hang waiting for packets
+    socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+
+    Ok(socket)
+}
+
+/// On Windows, unlike all Unix variants, it is improper to bind to the multicast address
+///
+/// see https://msdn.microsoft.com/en-us/library/windows/desktop/ms737550(v=vs.85).aspx
+#[cfg(windows)]
+fn bind_multicast(socket: &Socket, addr: &SocketAddr) -> io::Result<()> {
+    let addr = match *addr {
+        SocketAddr::V4(addr) => SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), addr.port()),
+        SocketAddr::V6(addr) => {
+            SocketAddr::new(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0).into(), addr.port())
+        }
+    };
+    socket.bind(&socket2::SockAddr::from(addr))
+}
+
+/// On unixes we bind to the multicast address, which causes multicast packets to be filtered
+#[cfg(unix)]
+fn bind_multicast(socket: &Socket, addr: &SocketAddr) -> io::Result<()> {
+    socket.bind(&socket2::SockAddr::from(*addr))
+}
+
+fn join_multicast(addr: SocketAddr) -> io::Result<UdpSocket> {
+    let ip_addr = addr.ip();
+
+    let socket = new_socket(&addr)?;
+
+    // depending on the IP protocol we have slightly different work
+    match ip_addr {
+        IpAddr::V4(ref mdns_v4) => {
+            // join to the multicast address, with all interfaces
+            socket.join_multicast_v4(mdns_v4, &Ipv4Addr::new(0, 0, 0, 0))?;
+        }
+        IpAddr::V6(ref mdns_v6) => {
+            // join to the multicast address, with all interfaces (ipv6 uses indexes not addresses)
+            socket.join_multicast_v6(mdns_v6, 0)?;
+            socket.set_only_v6(true)?;
+        }
+    };
+
+    // bind us to the socket address.
+    bind_multicast(&socket, &addr)?;
+
+    // convert to standard sockets
+    Ok(net::UdpSocket::from(socket))
+}
+
+fn multicast_listener(
+    response: &'static str,
+    client_done: Arc<AtomicBool>,
+    addr: SocketAddr,
+) -> JoinHandle<()> {
+    // A barrier to not start the client test code until after the server is running
+    let server_barrier = Arc::new(Barrier::new(2));
+    let client_barrier = Arc::clone(&server_barrier);
+
+    let join_handle = std::thread::Builder::new()
+        .name(format!("{}:server", response))
+        .spawn(move || {
+            // socket creation will go here...
+            let listener = join_multicast(addr).expect("failed to create listener");
+            println!("{}:server: joined: {}", response, addr);
+
+            server_barrier.wait();
+            println!("{}:server: is ready", response);
+
+            // We'll be looping until the client indicates it is done.
+            while !client_done.load(std::sync::atomic::Ordering::Relaxed) {
+                // test receive and response code will go here...
+                let mut buf = [0u8; 64]; // receive buffer
+
+                // we're assuming failures were timeouts, the client_done loop will stop us
+                match listener.recv_from(&mut buf) {
+                    Ok((len, remote_addr)) => {
+                        let data = &buf[..len];
+
+                        println!(
+                            "{}:server: got data: {} from: {}",
+                            response,
+                            String::from_utf8_lossy(data),
+                            remote_addr
+                        );
+
+                        // create a socket to send the response
+                        let responder: UdpSocket = new_socket(&remote_addr)
+                            .expect("failed to create responder")
+                            .into();
+
+                        // we send the response that was set at the method beginning
+                        responder
+                            .send_to(response.as_bytes(), &remote_addr)
+                            .expect("failed to respond");
+
+                        println!("{}:server: sent response to: {}", response, remote_addr);
+                    }
+                    Err(err) => {
+                        println!("{}:server: got an error: {}", response, err);
+                    }
+                }
+            }
+
+            println!("{}:server: client is done", response);
+        })
+        .unwrap();
+
+    client_barrier.wait();
+    join_handle
+}
+
+fn new_sender(addr: &SocketAddr) -> io::Result<UdpSocket> {
+    let socket = new_socket(addr)?;
+        socket.set_multicast_if_v4(&Ipv4Addr::new(0, 0, 0, 0))?;
+
+        socket.bind(&SockAddr::from(SocketAddr::new(
+            Ipv4Addr::new(0, 0, 0, 0).into(),
+            0,
+        )))?;
+
+
+    // convert to standard sockets...
+    Ok(net::UdpSocket::from(socket))
+}
+
+/// This will guarantee we always tell the server to stop
+struct NotifyServer(Arc<AtomicBool>);
+impl Drop for NotifyServer {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 pub trait DirsWrapper: Send {
     fn data_dir(&self) -> Option<PathBuf>;
     fn home_dir(&self) -> Option<PathBuf>;
@@ -165,15 +315,12 @@ impl DirsWrapper for DirsWrapperReal {
 
 #[cfg(test)]
 mod tests {
-    use std::mem::MaybeUninit;
     use super::*;
     use crate::node_test_utils::DirsWrapperMock;
     use crate::test_utils::ArgsBuilder;
     use masq_lib::test_utils::environment_guard::EnvironmentGuard;
     use masq_lib::utils::find_free_port;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
-    use socket2::Protocol;
-    use socket2::MaybeUninitSlice;
 
     fn determine_config_file_path_app() -> App<'static, 'static> {
         App::new("test")
@@ -442,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn udp_singlecast_receiver_works_ipv4_stdnet() {
+    fn udp_single_receiver_works_ipv4_stdnet() {
         let port = find_free_port();
         let ip = Ipv4Addr::new(127, 0, 0, 1);
         let socket_addr = SocketAddr::new(IpAddr::from(ip), port);
@@ -468,35 +615,46 @@ mod tests {
     }
 
     #[test]
-    fn udp_singlecast_receiver_works_ipv4_socket2() {
-        let address: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        let address = address.into();
-        let address2: SocketAddr = "127.0.0.1:12346".parse().unwrap();
-        let address2 = address2.into();
-        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("couldn't create socket");
-        let socket2 = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).expect("couldn't create socket");
+    fn udp_multicast_works_ipv4_socket2() {
+        let ip: IpAddr = Ipv4Addr::new(224, 0, 0, 123).into();
+        let test = "ipv4";
+        assert!(ip.is_multicast());
+        let port = find_free_port();
+        let addr = SocketAddr::new(ip, port);
 
+        let client_done = Arc::new(AtomicBool::new(false));
+        let notify = NotifyServer(Arc::clone(&client_done));
 
-        socket.bind(&address).expect("couldn't bind");
-        socket2.bind(&address2).expect("couldn't bind");
+        multicast_listener(test, client_done, addr);
 
-        socket.send_to(&[0; 10], &address2).expect("couldn't send data");
-        socket2.send_to(&[0; 10], &address).expect("couldn't send data");
+        // client test code send and receive code after here
+        println!("{}:client: running", test);
 
-        let mut buf = [MaybeUninit::new(0); 10];
-        let (number_of_bytes, src_addr) = socket.recv_from_vectored(&mut [
-            MaybeUninitSlice::new(&mut buf)])
-            .expect("Didn't receive data");
-        let filled_buf = &mut buf[..number_of_bytes];
-        // match socket.recv_from(&mut []) {
-        //     Ok(received) => println!("received {:?} bytes {:?}", received, &buf[..received]),
-        //     Err(e) => panic!("recv function failed: {:?}", e),
-        // }
+        let message = b"Hello from client!";
 
-    }
+        // create the sending socket
+        let socket = new_sender(&addr).expect("could not create sender!");
+        socket.send_to(message, &addr).expect("could not send_to!");
 
-    #[test]
-    fn udp_multicast_receiver_works_ipv4_socket2() {
+        let mut buf = [0u8; 64]; // receive buffer
 
+        match socket.recv_from(&mut buf) {
+            Ok((len, remote_addr)) => {
+                let data = &buf[..len];
+                let response = String::from_utf8_lossy(data);
+
+                println!("{}:client: got data: {}", test, response);
+
+                // verify it's what we expected
+                assert_eq!(test, response);
+            }
+            Err(err) => {
+                println!("{}:client: had a problem: {}", test, err);
+                assert!(false);
+            }
+        }
+
+        // make sure we don't notify the server until the end of the client test
+        drop(notify);
     }
 }

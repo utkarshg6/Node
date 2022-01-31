@@ -148,6 +148,7 @@ pub fn port_is_busy(port: u16) -> bool {
     TcpListener::bind(SocketAddr::new(localhost(), port)).is_err()
 }
 
+#[allow(dead_code)]
 // this will be common for all our sockets
 fn new_socket(addr: &SocketAddr) -> io::Result<Socket> {
     let domain = if addr.is_ipv4() {
@@ -157,13 +158,12 @@ fn new_socket(addr: &SocketAddr) -> io::Result<Socket> {
     };
 
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-
     // we're going to use read timeouts so that we don't hang waiting for packets
     socket.set_read_timeout(Some(Duration::from_millis(100)))?;
-
     Ok(socket)
 }
 
+#[allow(dead_code)]
 /// On Windows, unlike all Unix variants, it is improper to bind to the multicast address
 ///
 /// see https://msdn.microsoft.com/en-us/library/windows/desktop/ms737550(v=vs.85).aspx
@@ -175,15 +175,20 @@ fn bind_multicast(socket: &Socket, addr: &SocketAddr) -> io::Result<()> {
             SocketAddr::new(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0).into(), addr.port())
         }
     };
+    socket.set_reuse_address(true)?;
     socket.bind(&socket2::SockAddr::from(addr))
 }
 
+#[allow(dead_code)]
 /// On unixes we bind to the multicast address, which causes multicast packets to be filtered
 #[cfg(unix)]
 fn bind_multicast(socket: &Socket, addr: &SocketAddr) -> io::Result<()> {
+    socket.set_reuse_address(true)?;
+    socket.set_reuse_port(true)?;
     socket.bind(&socket2::SockAddr::from(*addr))
 }
 
+#[allow(dead_code)]
 fn join_multicast(addr: SocketAddr) -> io::Result<UdpSocket> {
     let ip_addr = addr.ip();
 
@@ -209,6 +214,7 @@ fn join_multicast(addr: SocketAddr) -> io::Result<UdpSocket> {
     Ok(net::UdpSocket::from(socket))
 }
 
+#[allow(dead_code)]
 fn multicast_listener(
     response: &'static str,
     client_done: Arc<AtomicBool>,
@@ -271,10 +277,11 @@ fn multicast_listener(
     join_handle
 }
 
+#[allow(dead_code)]
 fn new_sender(addr: &SocketAddr) -> io::Result<UdpSocket> {
     let socket = new_socket(addr)?;
     socket.set_multicast_if_v4(&Ipv4Addr::new(0, 0, 0, 0))?;
-
+    socket.set_reuse_address(true)?;
     socket.bind(&SockAddr::from(SocketAddr::new(
         Ipv4Addr::new(0, 0, 0, 0).into(),
         0,
@@ -284,6 +291,7 @@ fn new_sender(addr: &SocketAddr) -> io::Result<UdpSocket> {
     Ok(net::UdpSocket::from(socket))
 }
 
+#[allow(dead_code)]
 /// This will guarantee we always tell the server to stop
 struct NotifyServer(Arc<AtomicBool>);
 impl Drop for NotifyServer {
@@ -625,7 +633,7 @@ mod tests {
     #[test]
     fn udp_multicast_works_ipv4_socket2() {
         let ip: IpAddr = Ipv4Addr::new(224, 0, 0, 123).into();
-        let test = "ipv4";
+        let test = "single_listener";
         assert!(ip.is_multicast());
         let port = find_free_port();
         let addr = SocketAddr::new(ip, port);
@@ -647,7 +655,54 @@ mod tests {
         let mut buf = [0u8; 64]; // receive buffer
 
         match socket.recv_from(&mut buf) {
-            Ok((len, remote_addr)) => {
+            Ok((len, _remote_addr)) => {
+                let data = &buf[..len];
+                let response = String::from_utf8_lossy(data);
+
+                println!("{}:client: got data: {}", test, response);
+
+                // verify it's what we expected
+                assert_eq!(test, response);
+            }
+            Err(err) => {
+                println!("{}:client: had a problem: {}", test, err);
+                assert!(false);
+            }
+        }
+
+        // make sure we don't notify the server until the end of the client test
+        drop(notify);
+    }
+
+    #[test]
+    fn udp_multicast_multiple_listeners_works() {
+        let ip: IpAddr = Ipv4Addr::new(224, 0, 0, 123).into();
+        let test = "multi_listener";
+        assert!(ip.is_multicast());
+        let port = find_free_port();
+        let addr = SocketAddr::new(ip, port);
+
+        let client_done = Arc::new(AtomicBool::new(false));
+        let client_done2 = Arc::new(AtomicBool::new(false));
+        let client_done3 = Arc::new(AtomicBool::new(false));
+        let notify = NotifyServer(Arc::clone(&client_done));
+
+        multicast_listener(test, client_done, addr);
+        multicast_listener(test, client_done2, addr);
+        multicast_listener(test, client_done3, addr);
+        // client test code send and receive code after here
+        println!("{}:client: running", test);
+
+        let message = b"Hello from client!";
+
+        // create the sending socket
+        let socket = new_sender(&addr).expect("could not create sender!");
+        socket.send_to(message, &addr).expect("could not send_to!");
+
+        let mut buf = [0u8; 64]; // receive buffer
+
+        match socket.recv_from(&mut buf) {
+            Ok((len, _remote_addr)) => {
                 let data = &buf[..len];
                 let response = String::from_utf8_lossy(data);
 

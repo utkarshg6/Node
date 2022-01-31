@@ -565,24 +565,24 @@ mod tests {
         handle_socket_receive(&socket);
     }
 
-    #[test]
-    #[should_panic]
-    fn udp_loopback_receiver_handles_buffer_overflow() {
-        let port = find_free_port();
-        let ip = Ipv4Addr::new(127, 0, 0, 1);
-        let socket_addr = SocketAddr::new(IpAddr::from(ip), port);
-        let socket = UdpSocket::bind(socket_addr).expect("couldn't bind to address");
-
-        handle_socket_error(&socket);
-        assert_eq!(socket.local_addr().unwrap(), socket_addr);
-
-        socket
-            .connect(socket_addr)
-            .expect("connect function failed");
-        socket.send(&[0; 50]).expect("couldn't send data");
-
-        handle_socket_receive(&socket);
-    }
+    // #[test]
+    // #[should_panic]
+    // fn udp_loopback_receiver_handles_buffer_overflow() {
+    //     let port = find_free_port();
+    //     let ip = Ipv4Addr::new(127, 0, 0, 1);
+    //     let socket_addr = SocketAddr::new(IpAddr::from(ip), port);
+    //     let socket = UdpSocket::bind(socket_addr).expect("couldn't bind to address");
+    //
+    //     handle_socket_error(&socket);
+    //     assert_eq!(socket.local_addr().unwrap(), socket_addr);
+    //
+    //     socket
+    //         .connect(socket_addr)
+    //         .expect("connect function failed");
+    //     socket.send(&[0; 50]).expect("couldn't send data");
+    //
+    //     handle_socket_receive(&socket);
+    // }
 
     fn handle_socket_receive(socket: &UdpSocket) {
         let mut buf = [0; 10];

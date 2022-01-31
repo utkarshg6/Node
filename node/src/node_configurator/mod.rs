@@ -21,7 +21,7 @@ use masq_lib::shared_schema::{
 };
 use masq_lib::utils::{localhost, ExpectValue, WrapResult};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
@@ -172,7 +172,7 @@ fn bind_multicast(socket: &Socket, addr: &SocketAddr) -> io::Result<()> {
     let addr = match *addr {
         SocketAddr::V4(addr) => SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), addr.port()),
         SocketAddr::V6(addr) => {
-            SocketAddr::new(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0).into(), addr.port())
+            SocketAddr::new(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0).into(), addr.port())
         }
     };
     socket.set_reuse_address(true)?;
@@ -184,7 +184,6 @@ fn bind_multicast(socket: &Socket, addr: &SocketAddr) -> io::Result<()> {
 #[cfg(unix)]
 fn bind_multicast(socket: &Socket, addr: &SocketAddr) -> io::Result<()> {
     socket.set_reuse_address(true)?;
-    socket.set_reuse_port(true)?;
     socket.bind(&socket2::SockAddr::from(*addr))
 }
 

@@ -171,9 +171,10 @@ fn new_socket(addr: &SocketAddr) -> io::Result<Socket> {
 fn bind_multicast(socket: &Socket, addr: &SocketAddr) -> io::Result<()> {
     let addr = match *addr {
         SocketAddr::V4(addr) => SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), addr.port()),
-        SocketAddr::V6(addr) => {
-            SocketAddr::new(std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0).into(), addr.port())
-        }
+        SocketAddr::V6(addr) => SocketAddr::new(
+            std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0).into(),
+            addr.port(),
+        ),
     };
     socket.set_reuse_address(true)?;
     socket.bind(&socket2::SockAddr::from(addr))

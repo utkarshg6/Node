@@ -167,7 +167,7 @@ fn new_socket(addr: &SocketAddr) -> io::Result<Socket> {
 /// On Windows, unlike all Unix variants, it is improper to bind to the multicast address
 ///
 /// see https://msdn.microsoft.com/en-us/library/windows/desktop/ms737550(v=vs.85).aspx
-#[cfg(windows)]
+#[cfg(target_os = "windows")]
 fn bind_multicast(socket: &Socket, addr: &SocketAddr) -> io::Result<()> {
     let addr = match *addr {
         SocketAddr::V4(addr) => SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), addr.port()),
@@ -182,9 +182,10 @@ fn bind_multicast(socket: &Socket, addr: &SocketAddr) -> io::Result<()> {
 
 #[allow(dead_code)]
 /// On unixes we bind to the multicast address, which causes multicast packets to be filtered
-#[cfg(unix)]
+#[cfg(not(target_os = "windows"))]
 fn bind_multicast(socket: &Socket, addr: &SocketAddr) -> io::Result<()> {
     socket.set_reuse_address(true)?;
+    socket.set_reuse_port(true)?;
     socket.bind(&socket2::SockAddr::from(*addr))
 }
 
@@ -554,7 +555,6 @@ mod tests {
         let socket_addr = SocketAddr::new(IpAddr::from(ip), port);
         let socket = UdpSocket::bind(socket_addr).expect("couldn't bind to address");
 
-        handle_socket_error(&socket);
         assert_eq!(socket.local_addr().unwrap(), socket_addr);
         socket
             .connect(socket_addr)
@@ -562,27 +562,28 @@ mod tests {
 
         socket.send(&[0; 10]).expect("couldn't send message");
 
+        handle_socket_error(&socket);
         handle_socket_receive(&socket);
     }
 
-    // #[test]
-    // #[should_panic]
-    // fn udp_loopback_receiver_handles_buffer_overflow() {
-    //     let port = find_free_port();
-    //     let ip = Ipv4Addr::new(127, 0, 0, 1);
-    //     let socket_addr = SocketAddr::new(IpAddr::from(ip), port);
-    //     let socket = UdpSocket::bind(socket_addr).expect("couldn't bind to address");
-    //
-    //     handle_socket_error(&socket);
-    //     assert_eq!(socket.local_addr().unwrap(), socket_addr);
-    //
-    //     socket
-    //         .connect(socket_addr)
-    //         .expect("connect function failed");
-    //     socket.send(&[0; 50]).expect("couldn't send data");
-    //
-    //     handle_socket_receive(&socket);
-    // }
+    #[test]
+    #[should_panic]
+    fn udp_loopback_receiver_handles_buffer_overflow() {
+        let port = find_free_port();
+        let ip = Ipv4Addr::new(127, 0, 0, 1);
+        let socket_addr = SocketAddr::new(IpAddr::from(ip), port);
+        let socket = UdpSocket::bind(socket_addr).expect("couldn't bind to address");
+
+        assert_eq!(socket.local_addr().unwrap(), socket_addr);
+        socket
+            .connect(socket_addr)
+            .expect("connect function failed");
+
+        socket.send(&[0; 50]).expect("couldn't send data");
+
+        handle_socket_error(&socket);
+        handle_socket_receive(&socket);
+    }
 
     fn handle_socket_receive(socket: &UdpSocket) {
         let mut buf = [0; 10];
@@ -612,9 +613,6 @@ mod tests {
         assert_eq!(socket.local_addr().unwrap(), socket_addr.clone());
         assert_eq!(socket2.local_addr().unwrap(), socket_addr2.clone());
 
-        handle_socket_error(&socket);
-        handle_socket_error(&socket2);
-
         socket
             .connect(socket_addr)
             .expect("connect function failed");
@@ -626,6 +624,9 @@ mod tests {
 
         socket.send(&[0; 10]).expect("couldn't send data");
         socket2.send(&[0; 10]).expect("couldn't send data");
+
+        handle_socket_error(&socket);
+        handle_socket_error(&socket2);
         handle_socket_receive(&socket);
         handle_socket_receive(&socket2);
     }
@@ -686,6 +687,8 @@ mod tests {
         let client_done2 = Arc::new(AtomicBool::new(false));
         let client_done3 = Arc::new(AtomicBool::new(false));
         let notify = NotifyServer(Arc::clone(&client_done));
+        let notify2 = NotifyServer(Arc::clone(&client_done2));
+        let notify3 = NotifyServer(Arc::clone(&client_done3));
 
         multicast_listener(test, client_done, addr);
         multicast_listener(test, client_done2, addr);
@@ -719,5 +722,7 @@ mod tests {
 
         // make sure we don't notify the server until the end of the client test
         drop(notify);
+        drop(notify2);
+        drop(notify3);
     }
 }

@@ -14,17 +14,25 @@ use std::sync::{Mutex, Once};
 
 pub static mut LOG_RECIPIENT: LogRecipient = LogRecipient {
     initiated: AtomicBool::new(false),
-    initiation_guard: AtomicBool::new(false),
     recipient_opt: None,
 };
+
+lazy_static! {
+    pub static ref LOG_RECIPIENT_MUTEX: LogRecipientMutex = LogRecipientMutex {
+        initiated: AtomicBool::new(false),
+        recipient_opt: Mutex::new(None),
+    };
+}
+
 const UI_MESSAGE_LOG_LEVEL: Level = Level::Info;
 
 #[cfg(test)]
-const TEST_LOG_RECIPIENT_GUARD: Mutex<()> = Mutex::new(());
+lazy_static! {
+    static ref TEST_LOG_RECIPIENT_GUARD: Mutex<()> = Mutex::new(());
+}
 
 pub struct LogRecipient {
     initiated: AtomicBool,
-    initiation_guard: AtomicBool,
     recipient_opt: Option<Recipient<NodeToUiMessage>>,
 }
 
@@ -45,19 +53,25 @@ impl LogRecipient {
     fn transmit_log(&self, msg: String, log_level: SerializableLogLevel) {
         if unsafe { LOG_RECIPIENT.initiated.load(Ordering::Relaxed) } {
             todo!("send the log")
-        } else {
-            if unsafe {
-                LOG_RECIPIENT
-                    .initiation_guard
-                    .swap(false, Ordering::Relaxed)
-            } {
-                if let Some(recipient) = unsafe { LOG_RECIPIENT.recipient_opt.as_ref() } {
-                    todo!()
-                }
-                //unsafe LOG_RECIPIENT.guard.swap(true)
-            }
         }
+        // else {
+        //     if unsafe {
+        //         LOG_RECIPIENT
+        //             .initiation_guard
+        //             .swap(false, Ordering::Relaxed)
+        //     } {
+        //         if let Some(recipient) = unsafe { LOG_RECIPIENT.recipient_opt.as_ref() } {
+        //             todo!()
+        //         }
+        //         //unsafe LOG_RECIPIENT.guard.swap(true)
+        //     }
+        // }
     }
+}
+
+pub struct LogRecipientMutex {
+    initiated: AtomicBool,
+    recipient_opt: Mutex<Option<Recipient<NodeToUiMessage>>>,
 }
 
 // Data structure:
@@ -93,20 +107,6 @@ impl LogRecipient {
 //             thread.sleep (Duration::from_millis (10)) // wait for the logger to finish
 //         }
 //     }
-// }
-
-// fn transmit(&self, msg: String, log_level: SerializableLogLevel) {
-//     todo!("Test Me!")
-//     // if let Some(recipient) = unsafe { LOG_RECIPIENT_OPT.as_ref() } {
-//     //     let actor_msg = NodeToUiMessage {
-//     //         target: MessageTarget::AllClients,
-//     //         body: UiLogBroadcast {
-//     //             msg,
-//     //             log_level
-//     //         }.tmb(0),
-//     //     }; //TODO we probably don't want to confront all connected clients?
-//     //     recipient.try_send(actor_msg).expect("UiGateway is dead")
-//     // }
 // }
 
 #[derive(Clone)]
@@ -307,6 +307,7 @@ mod tests {
     use crate::test_utils::logging::init_test_logging;
     use crate::test_utils::logging::TestLogHandler;
     use crate::ui_gateway::{MessageBody, MessagePath, NodeFromUiMessage};
+    use actix::{Actor, AsyncContext, Context, Handler, Message, System};
     use chrono::format::StrftimeItems;
     use chrono::{DateTime, Local};
     use std::sync::atomic::Ordering::Relaxed;
@@ -314,57 +315,57 @@ mod tests {
     use std::thread;
     use std::thread::ThreadId;
     use std::time::{Duration, SystemTime};
-    use actix::{Actor, Context, Handler, System, Message, AsyncContext};
 
     // 1) Send a message to Recorder
     // 2) Assert that testing actor received our message (proof that we called transmit method)
     // 3) Not going to print the logs to logfile
-    struct TestUiGateway{
-        received_messages: Vec<NodeToUiMessage>,
+    struct TestUiGateway {
+        msg_container: Arc<Mutex<Vec<NodeToUiMessage>>>,
         expected_msg_count: usize,
     }
 
-    impl TestUiGateway{
-        fn new(msg_count: usize,recording_arc: Arc<Mutex<>>)->Self{
-            Self{
-                received_messages: ,
-                expected_msg_count: msg_count
+    impl TestUiGateway {
+        fn new(msg_count: usize, received_msgs_arc: &Arc<Mutex<Vec<NodeToUiMessage>>>) -> Self {
+            Self {
+                msg_container: received_msgs_arc.clone(),
+                expected_msg_count: msg_count,
             }
         }
     }
 
-    impl Actor for TestUiGateway{
+    impl Actor for TestUiGateway {
         type Context = Context<Self>;
     }
 
-    impl Handler<NodeToUiMessage> for TestUiGateway{
+    impl Handler<NodeToUiMessage> for TestUiGateway {
         type Result = ();
 
         fn handle(&mut self, msg: NodeToUiMessage, ctx: &mut Self::Context) -> Self::Result {
-            self.received_messages.push(msg);
-            if self.received_messages.len() == self.expected_msg_count{
+            let mut inner = self.msg_container.lock().unwrap();
+            inner.push(msg);
+            if inner.len() == self.expected_msg_count {
                 System::current().stop();
             }
         }
     }
 
     #[derive(Message)]
-    struct ScheduleStop{
-        timeout: Duration
+    struct ScheduleStop {
+        timeout: Duration,
     }
 
     #[derive(Message)]
-    struct Stop{}
+    struct Stop {}
 
-    impl Handler<ScheduleStop> for TestUiGateway{
+    impl Handler<ScheduleStop> for TestUiGateway {
         type Result = ();
 
         fn handle(&mut self, msg: ScheduleStop, ctx: &mut Self::Context) -> Self::Result {
-            ctx.notify_later(Stop{},msg.timeout);
+            ctx.notify_later(Stop {}, msg.timeout);
         }
     }
 
-    impl Handler<Stop> for TestUiGateway{
+    impl Handler<Stop> for TestUiGateway {
         type Result = ();
 
         fn handle(&mut self, msg: Stop, ctx: &mut Self::Context) -> Self::Result {
@@ -373,82 +374,291 @@ mod tests {
     }
 
     #[test]
-    fn transmit_log_sends_msg_from_multiple_threads_when_log_recipient_initiated() {
-        fn create_msg() -> NodeToUiMessage {
-            NodeToUiMessage {
-                target: MessageTarget::AllClients,
-                body: MessageBody {
-                    opcode: "whatever".to_string(),
-                    path: MessagePath::FireAndForget,
-                    payload: Ok(String::from("our message")),
-                },
-            }
-        }
-        fn send_message_to_recipient() {
-            let recipient = unsafe { LOG_RECIPIENT.recipient_opt.as_ref().unwrap() };
-            recipient.try_send(create_msg()).unwrap()
-        }
-        let _test_guard = TEST_LOG_RECIPIENT_GUARD.lock().unwrap();
-        let ui_gateway = TestUiGateway::default();
+    fn transmit_log_sends_msg_from_multiple_threads_when_plain_log_recipient_initiated() {
+        let _test_guard = &TEST_LOG_RECIPIENT_GUARD.lock().unwrap();
+        let number_of_calls = 250;
+        let received_msg_arc = Arc::new(Mutex::new(vec![]));
+        let ui_gateway = TestUiGateway::new(number_of_calls, &received_msg_arc);
         let addr = ui_gateway.start();
         let recipient = addr.clone().recipient();
         unsafe {
             LOG_RECIPIENT.recipient_opt.replace(recipient);
-            LOG_RECIPIENT.initiated.store(true,Ordering::Relaxed)
+            LOG_RECIPIENT.initiated.store(true, Ordering::Relaxed)
         }
-
         let system = System::new("test_system");
-        addr.try_send(ScheduleStop{ timeout: Duration::from_secs(5) }).unwrap();
-        addr.try_send(SendAllAtOnce{}).unwrap();
+        addr.try_send(ScheduleStop {
+            timeout: Duration::from_secs(50),
+        })
+        .unwrap();
+
+        addr.try_send(SendAllAtOncePlain { number_of_calls })
+            .unwrap();
+
+        let before = SystemTime::now();
         system.run();
-        let recording = recording_arc.lock().unwrap();
-        assert_eq!(recording.len(), 3);
-        let msg1 = recording.get_record::<NodeToUiMessage>(0);
-        let msg2 = recording.get_record::<NodeToUiMessage>(1);
-        let msg3 = recording.get_record::<NodeToUiMessage>(2);
-        assert!(msg1 == msg2 && msg2 == &create_msg())
-    }
-
-    #[derive(Message)]
-    struct SendAllAtOnce{}
-
-    impl Handler<SendAllAtOnce> for TestUiGateway{
-        type Result = ();
-
-        fn handle(&mut self, msg: SendAllAtOnce, ctx: &mut Self::Context) -> Self::Result {
-            let barrier_arc = Arc::new(Barrier::new(3));
-            let mut join_handle_vector = Vec::new();
-            (0..3).for_each(|_| {
-                join_handle_vector.push(thread::spawn(move || {
-                    let barrier_arc_clone = Arc::clone(&barrier_arc);
-                    barrier_arc_clone.wait();
-                    send_message_to_recipient()
-                }))
-            });
-
-        }
+        let after = SystemTime::now();
+        let recording = received_msg_arc.lock().unwrap();
+        assert_eq!(recording.len(), number_of_calls);
+        let mut vec_of_results = vec![];
+        recording
+            .iter()
+            .for_each(|msg| vec_of_results.push(msg.body.payload.as_ref().unwrap_err().0));
+        vec_of_results.sort();
+        assert_eq!(
+            vec_of_results,
+            (0..number_of_calls as u64).collect::<Vec<u64>>()
+        );
+        eprintln!(
+            "Time elapsed in between: {}ms",
+            after.duration_since(before).unwrap().as_millis()
+        )
     }
 
     #[test]
-    fn prepare_log_recipient_waits_to_set_the_recipient() {
-        unsafe { assert_eq!(LOG_RECIPIENT.initiation_guard.load(Relaxed), false) };
-        // pub fn prepare_log_recipient (recipient: Recipient<NodeToUiMessage>) {
-        //     // loop {
-        //     //     if LOG_RECIPIENT.guard.swap(false) {
-        //     //         LOG_RECIPIENT.recipient_opt = Some (recipient);
-        //     //         LOG_RECIPIENT.guard.swap(true);
-        //     //         break;
-        //     //     }
-        //     //     else {
-        //     //         thread.sleep (Duration::from_millis (10)) // wait for the logger to finish
-        //     //     }
-        //     // }
+    fn transmit_log_sends_msg_from_multiple_threads_with_barrier_when_plain_log_recipient_initiated(
+    ) {
+        let _test_guard = &TEST_LOG_RECIPIENT_GUARD.lock().unwrap();
+        let number_of_calls = 250;
+        let received_msg_arc = Arc::new(Mutex::new(vec![]));
+        let ui_gateway = TestUiGateway::new(number_of_calls, &received_msg_arc);
+        let addr = ui_gateway.start();
+        let recipient = addr.clone().recipient();
+        unsafe {
+            LOG_RECIPIENT.recipient_opt.replace(recipient);
+            LOG_RECIPIENT.initiated.store(true, Ordering::Relaxed)
+        }
+        let system = System::new("test_system");
+        addr.try_send(ScheduleStop {
+            timeout: Duration::from_secs(50),
+        })
+        .unwrap();
+
+        addr.try_send(SendAllAtOncePlainBarrier { number_of_calls })
+            .unwrap();
 
         let before = SystemTime::now();
-        let join_handle = thread::spawn(move || {});
-        let _ = LogRecipient::prepare_log_recipient(recipient);
+        system.run();
         let after = SystemTime::now();
-        join_handle.join().unwrap();
+        let recording = received_msg_arc.lock().unwrap();
+        assert_eq!(recording.len(), number_of_calls);
+        let mut vec_of_results = vec![];
+        recording
+            .iter()
+            .for_each(|msg| vec_of_results.push(msg.body.payload.as_ref().unwrap_err().0));
+        vec_of_results.sort();
+        assert_eq!(
+            vec_of_results,
+            (0..number_of_calls as u64).collect::<Vec<u64>>()
+        );
+        eprintln!(
+            "Time elapsed in between: {}ms",
+            after.duration_since(before).unwrap().as_millis()
+        )
+    }
+
+    #[test]
+    fn transmit_log_sends_msg_from_multiple_threads_when_mutex_log_recipient_initiated() {
+        let _test_guard = &TEST_LOG_RECIPIENT_GUARD.lock().unwrap();
+        let number_of_calls = 250;
+        let received_msg_arc = Arc::new(Mutex::new(vec![]));
+        let ui_gateway = TestUiGateway::new(number_of_calls, &received_msg_arc);
+        let addr = ui_gateway.start();
+        let recipient = addr.clone().recipient();
+        unsafe {
+            LOG_RECIPIENT_MUTEX
+                .recipient_opt
+                .lock()
+                .unwrap()
+                .replace(recipient);
+            LOG_RECIPIENT_MUTEX.initiated.store(true, Ordering::Relaxed)
+        }
+        let system = System::new("test_system");
+        addr.try_send(ScheduleStop {
+            timeout: Duration::from_secs(50),
+        })
+        .unwrap();
+
+        addr.try_send(SendAllAtOnceMutex { number_of_calls })
+            .unwrap();
+
+        let before = SystemTime::now();
+        system.run();
+        let after = SystemTime::now();
+        let recording = received_msg_arc.lock().unwrap();
+        assert_eq!(recording.len(), number_of_calls);
+        let mut vec_of_results = vec![];
+        recording
+            .iter()
+            .for_each(|msg| vec_of_results.push(msg.body.payload.as_ref().unwrap_err().0));
+        vec_of_results.sort();
+        assert_eq!(
+            vec_of_results,
+            (0..number_of_calls as u64).collect::<Vec<u64>>()
+        );
+        eprintln!(
+            "Time elapsed in between: {}ms",
+            after.duration_since(before).unwrap().as_millis()
+        )
+    }
+
+    #[test]
+    fn transmit_log_sends_msg_from_multiple_threads_with_barrier_when_mutex_log_recipient_initiated(
+    ) {
+        let _test_guard = &TEST_LOG_RECIPIENT_GUARD.lock().unwrap();
+        let number_of_calls = 250;
+        let received_msg_arc = Arc::new(Mutex::new(vec![]));
+        let ui_gateway = TestUiGateway::new(number_of_calls, &received_msg_arc);
+        let addr = ui_gateway.start();
+        let recipient = addr.clone().recipient();
+        unsafe {
+            LOG_RECIPIENT_MUTEX
+                .recipient_opt
+                .lock()
+                .unwrap()
+                .replace(recipient);
+            LOG_RECIPIENT_MUTEX.initiated.store(true, Ordering::Relaxed)
+        }
+        let system = System::new("test_system");
+        addr.try_send(ScheduleStop {
+            timeout: Duration::from_secs(50),
+        })
+        .unwrap();
+
+        addr.try_send(SendAllAtOnceMutexBarrier { number_of_calls })
+            .unwrap();
+
+        let before = SystemTime::now();
+        system.run();
+        let after = SystemTime::now();
+        let recording = received_msg_arc.lock().unwrap();
+        assert_eq!(recording.len(), number_of_calls);
+        let mut vec_of_results = vec![];
+        recording
+            .iter()
+            .for_each(|msg| vec_of_results.push(msg.body.payload.as_ref().unwrap_err().0));
+        vec_of_results.sort();
+        assert_eq!(
+            vec_of_results,
+            (0..number_of_calls as u64).collect::<Vec<u64>>()
+        );
+        eprintln!(
+            "Time elapsed in between: {}ms",
+            after.duration_since(before).unwrap().as_millis()
+        )
+    }
+
+    fn send_message_to_mutex_recipient(num: usize) {
+        let mutex_guard = LOG_RECIPIENT_MUTEX.recipient_opt.lock().unwrap();
+        eprintln!("Acquired Mutex for '{}'.", num);
+        let recipient = unsafe { mutex_guard.as_ref().unwrap() };
+        eprintln!("Sending for '{}'.", num);
+        recipient.try_send(create_msg(num)).unwrap();
+        eprintln!("'{}' was sent.", num);
+    }
+
+    fn send_message_to_plain_recipient(num: usize) {
+        eprintln!("Acquired plain recipient for '{}'.", num);
+        let recipient = unsafe { LOG_RECIPIENT.recipient_opt.as_ref().unwrap() };
+        eprintln!("Sending for plain '{}'.", num);
+        recipient.try_send(create_msg(num)).unwrap();
+        eprintln!("Plain '{}' was sent.", num);
+    }
+
+    fn create_msg(num: usize) -> NodeToUiMessage {
+        NodeToUiMessage {
+            target: MessageTarget::AllClients,
+            body: MessageBody {
+                opcode: "whatever".to_string(),
+                path: MessagePath::FireAndForget,
+                payload: Err((num as u64, String::new())),
+            },
+        }
+    }
+
+    #[derive(Message)]
+    struct SendAllAtOncePlainBarrier {
+        number_of_calls: usize,
+    }
+
+    impl Handler<SendAllAtOncePlainBarrier> for TestUiGateway {
+        type Result = ();
+
+        fn handle(
+            &mut self,
+            msg: SendAllAtOncePlainBarrier,
+            ctx: &mut Self::Context,
+        ) -> Self::Result {
+            ctx.set_mailbox_capacity(0);
+            let barrier_arc = Arc::new(Barrier::new(msg.number_of_calls));
+            let mut join_handle_vector = Vec::new();
+            (0..msg.number_of_calls).for_each(|num| {
+                let barrier_arc_clone = Arc::clone(&barrier_arc);
+                join_handle_vector.push(thread::spawn(move || {
+                    barrier_arc_clone.wait();
+                    send_message_to_plain_recipient(num)
+                }))
+            });
+        }
+    }
+
+    #[derive(Message)]
+    struct SendAllAtOncePlain {
+        number_of_calls: usize,
+    }
+
+    impl Handler<SendAllAtOncePlain> for TestUiGateway {
+        type Result = ();
+
+        fn handle(&mut self, msg: SendAllAtOncePlain, ctx: &mut Self::Context) -> Self::Result {
+            ctx.set_mailbox_capacity(0);
+            let mut join_handle_vector = Vec::new();
+            (0..msg.number_of_calls).for_each(|num| {
+                join_handle_vector.push(thread::spawn(move || send_message_to_plain_recipient(num)))
+            });
+        }
+    }
+
+    #[derive(Message)]
+    struct SendAllAtOnceMutex {
+        number_of_calls: usize,
+    }
+
+    impl Handler<SendAllAtOnceMutex> for TestUiGateway {
+        type Result = ();
+
+        fn handle(&mut self, msg: SendAllAtOnceMutex, ctx: &mut Self::Context) -> Self::Result {
+            ctx.set_mailbox_capacity(0);
+            let mut join_handle_vector = Vec::new();
+            (0..msg.number_of_calls).for_each(|num| {
+                join_handle_vector.push(thread::spawn(move || send_message_to_mutex_recipient(num)))
+            });
+        }
+    }
+
+    #[derive(Message)]
+    struct SendAllAtOnceMutexBarrier {
+        number_of_calls: usize,
+    }
+
+    impl Handler<SendAllAtOnceMutexBarrier> for TestUiGateway {
+        type Result = ();
+
+        fn handle(
+            &mut self,
+            msg: SendAllAtOnceMutexBarrier,
+            ctx: &mut Self::Context,
+        ) -> Self::Result {
+            ctx.set_mailbox_capacity(0);
+            let barrier_arc = Arc::new(Barrier::new(msg.number_of_calls));
+            let mut join_handle_vector = Vec::new();
+            (0..msg.number_of_calls).for_each(|num| {
+                let barrier_arc_clone = Arc::clone(&barrier_arc);
+                join_handle_vector.push(thread::spawn(move || {
+                    barrier_arc_clone.wait();
+                    send_message_to_mutex_recipient(num)
+                }))
+            });
+        }
     }
 
     #[test]

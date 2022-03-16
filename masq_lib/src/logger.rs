@@ -175,10 +175,14 @@ mod tests {
     use crate::test_utils::logging::TestLogHandler;
     use chrono::format::StrftimeItems;
     use chrono::{DateTime, Local};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, MutexGuard};
     use std::thread;
     use std::thread::ThreadId;
-    use std::time::SystemTime;
+    use std::time::{Duration, SystemTime};
+    use actix::{Actor, Addr, Arbiter, Context, Handler, Recipient, System};
+    use crossbeam_channel::unbounded;
+    use actix::Message;
+    use lazy_static::lazy_static;
 
     #[test]
     fn logger_format_is_correct() {
@@ -416,5 +420,98 @@ mod tests {
             #[cfg(not(feature = "no_test_share"))]
             level_limit: level,
         }
+    }
+
+    struct SystemKillerActor {
+        lifetime: Duration
+    }
+
+    impl Actor for SystemKillerActor {
+        type Context = Context<Self>;
+
+        fn started(&mut self, ctx: &mut Self::Context) {
+            thread::sleep (self.lifetime);
+            eprintln! ("SystemKillerActor killing system");
+            System::current().stop();
+        }
+    }
+
+    #[derive (Message)]
+    struct SerializationMessage {
+
+    }
+
+    struct SerializationActor {
+        messages_received: u64
+    }
+
+    impl Actor for SerializationActor{ type Context = Context<Self>; }
+
+    impl Handler<SerializationMessage> for SerializationActor {
+        type Result = ();
+
+        fn handle(&mut self, msg: SerializationMessage, ctx: &mut Self::Context) -> Self::Result {
+            self.messages_received += 1;
+eprintln! ("Messages received: {}", self.messages_received);
+            if self.messages_received >= 100 {
+                System::current().stop();
+            }
+        }
+    }
+
+    impl SerializationActor {
+        pub fn new () -> Self {
+            Self {
+                messages_received: 0
+            }
+        }
+    }
+
+    lazy_static! {
+        static ref RECIPIENT: Arc<Mutex<Option<Recipient<SerializationMessage>>>> = Arc::new(Mutex::new(None));
+    }
+
+    // fn get_recipient() -> &'static Recipient<SerializationMessage> {
+    //     unsafe {
+    //         RECIPIENT.as_ref().unwrap()
+    //     }
+    // }
+
+    fn get_recipient_guard() -> MutexGuard<'static, Option<Recipient<SerializationMessage>>> {
+        RECIPIENT.lock().unwrap()
+    }
+
+    #[test]
+    fn temporary_serialization_test () {
+        let (tx, rx_orig) = unbounded();
+        let actor = SerializationActor::new ();
+        let _killer = SystemKillerActor {lifetime: Duration::from_secs (10)}.start();
+        let recipient = actor.start().recipient();
+        {
+            let mut recipient_guard = get_recipient_guard();
+            recipient_guard.replace (recipient);
+        }
+        (0..10).for_each(|i| {
+            let rx = rx_orig.clone();
+            thread::spawn (move || {
+                let _ = rx.recv().unwrap();
+                (0..10).for_each (|j| {
+                    let recipient_guard = get_recipient_guard();
+                    let recipient = recipient_guard.as_ref().unwrap();
+                    recipient.try_send(SerializationMessage{}).unwrap();
+                });
+            });
+        });
+        let handle = thread::spawn (move || {
+            let system = System::new ("test");
+            let begin = SystemTime::now();
+            system.run();
+            let end = SystemTime::now();
+            (begin, end)
+        });
+        tx.send (()).unwrap();
+        let (begin, end) = handle.join().unwrap();
+        let interval = end.duration_since (begin).unwrap();
+        eprintln! ("Actor ran for {}μs", interval.as_micros());
     }
 }

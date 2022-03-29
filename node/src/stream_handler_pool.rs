@@ -525,6 +525,7 @@ impl StreamHandlerPool {
                             port_configuration: PortConfiguration::new(clandestine_discriminator_factories, true),
                         }).expect("StreamHandlerPool is dead");
                         node_query_response_sub.try_send(msg).expect("StreamHandlerPool is dead");
+                        todo!("here we maybe should send a message to neighborhood saying that the TCP connection has been made right")
                     })
                     .map_err(move |err| { // connection was unsuccessful
                         error!(logger_me, "Stream to {} does not exist and could not be connected; discarding {} bytes: {}", peer_addr, msg_data_len, err);

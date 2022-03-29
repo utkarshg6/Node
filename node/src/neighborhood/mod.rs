@@ -11,13 +11,14 @@ use std::cmp::Ordering;
 use std::convert::TryFrom;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
-use actix::Addr;
 use actix::Context;
 use actix::Handler;
 use actix::MessageResult;
 use actix::Recipient;
 use actix::{Actor, System};
+use actix::{Addr, AsyncContext};
 use itertools::Itertools;
 use masq_lib::messages::FromMessageBody;
 use masq_lib::messages::UiShutdownRequest;
@@ -33,6 +34,8 @@ use crate::db_config::persistent_configuration::{
 use crate::neighborhood::gossip::{DotGossipEndpoint, GossipNodeRecord, Gossip_0v1};
 use crate::neighborhood::gossip_acceptor::GossipAcceptanceResult;
 use crate::neighborhood::node_record::NodeRecordInner_0v1;
+use crate::neighborhood::IndividualConnectionStage::{StageZero, TCPConnectionEstablished};
+use crate::neighborhood::OverallConnectednessStatus::{FullConnectedness, IndividualStages};
 use crate::stream_messages::RemovedStreamType;
 use crate::sub_lib::configurator::NewPasswordMessage;
 use crate::sub_lib::cryptde::PublicKey;
@@ -40,7 +43,6 @@ use crate::sub_lib::cryptde::{CryptDE, CryptData, PlainData};
 use crate::sub_lib::dispatcher::{Component, StreamShutdownMsg};
 use crate::sub_lib::hopper::{ExpiredCoresPackage, NoLookupIncipientCoresPackage};
 use crate::sub_lib::hopper::{IncipientCoresPackage, MessageType};
-use crate::sub_lib::neighborhood::ExpectedService;
 use crate::sub_lib::neighborhood::ExpectedServices;
 use crate::sub_lib::neighborhood::NeighborhoodSubs;
 use crate::sub_lib::neighborhood::NodeDescriptor;
@@ -51,6 +53,7 @@ use crate::sub_lib::neighborhood::RemoveNeighborMessage;
 use crate::sub_lib::neighborhood::RouteQueryMessage;
 use crate::sub_lib::neighborhood::RouteQueryResponse;
 use crate::sub_lib::neighborhood::{DispatcherNodeQueryMessage, GossipFailure_0v1};
+use crate::sub_lib::neighborhood::{ExpectedService, NeighborhoodMode};
 use crate::sub_lib::node_addr::NodeAddr;
 use crate::sub_lib::peer_actors::{BindMessage, NewPublicIp, StartMessage};
 use crate::sub_lib::proxy_server::DEFAULT_MINIMUM_HOP_COUNT;
@@ -77,7 +80,7 @@ pub struct Neighborhood {
     cryptde: &'static dyn CryptDE,
     hopper: Option<Recipient<IncipientCoresPackage>>,
     hopper_no_lookup: Option<Recipient<NoLookupIncipientCoresPackage>>,
-    is_connected_to_min_hop_count_radius: bool,
+    is_connected_to_min_hop_count_radius: bool, //TODO later replace this with connectedness_status.full_connectedness
     connected_signal: Option<Recipient<StartMessage>>,
     _to_ui_message_sub: Option<Recipient<NodeToUiMessage>>,
     gossip_acceptor: Box<dyn GossipAcceptor>,
@@ -86,12 +89,119 @@ pub struct Neighborhood {
     consuming_wallet_opt: Option<Wallet>,
     next_return_route_id: u32,
     initial_neighbors: Vec<NodeDescriptor>,
+    connectedness_status: OverallConnectednessStatus,
     chain: Chain,
     crashable: bool,
     data_directory: PathBuf,
     persistent_config_opt: Option<Box<dyn PersistentConfiguration>>,
     db_password_opt: Option<String>,
     logger: Logger,
+}
+
+struct IndividualConnectionProcedure {
+    node_identifier: PublicKey,
+    connection_stage: IndividualConnectionStage,
+}
+
+enum IndividualConnectionStage {
+    StageZero {
+        status: Result<usize, ConnectionStageError>,
+        previous_attempt_number: usize,
+    },
+    TCPConnectionEstablished {
+        attempt: Result<usize, ConnectionStageError>,
+        previous_attempt_number: usize,
+    },
+    NeighborGossipReceived,
+}
+
+enum ConnectionStageError {
+    UnsuccessfulTcpConnection,
+}
+
+#[derive(Default)]
+struct OverallConnectednessStatus {
+    individual_stages: Vec<IndividualConnectionProcedure>, //TODO I would recommend to delete these items when their procedure end
+    full_connectedness: bool,
+}
+
+impl OverallConnectednessStatus {
+    fn initiate_stage_zero(&self, node_identifier: PublicKey) {
+        todo!("untested");
+        if let IndividualStages(mut vec) = self {
+            vec.push(IndividualConnectionProcedure {
+                node_identifier,
+                connection_stage: IndividualConnectionStage::StageZero {
+                    status: Ok(0),
+                    previous_attempt_number: 0,
+                },
+            })
+        }
+    }
+    fn fetch_individual_connection_procedure(
+        &mut self,
+        public_key: &PublicKey,
+    ) -> Option<&mut IndividualConnectionProcedure> {
+        todo!("untested");
+        self.individual_stages
+            .iter_mut()
+            .find(|procedure| procedure.node_identifier == public_key)
+    }
+}
+
+#[derive(Clone, Debug, Message, PartialEq)]
+struct CheckConnectednessStatus {
+    node_identifier: PublicKey,
+}
+
+impl Handler<CheckConnectednessStatus> for Neighborhood {
+    type Result = ();
+
+    fn handle(&mut self, msg: CheckConnectednessStatus, ctx: &mut Self::Context) -> Self::Result {
+        let current_individual_stage_opt =
+            if let IndividualStages(mut vec) = self.connectedness_status.as_ref() {
+                vec.iter_mut()
+                    .find(|procedure| procedure.node_identifier == msg.node_identifier)
+            } else {
+                None
+            }; //TODO untested and needs to be corrected
+        if let Some(procedure) = current_individual_stage_opt {
+            match &procedure.connection_stage {
+                StageZero {
+                    status,
+                    previous_attempt_number,
+                } => match status {
+                    Ok(num) => {
+                        if num >= &50 {
+                            todo!("we got too much of pass Gossips, we will quit")
+                        } else if num > previous_attempt_number {
+                            return todo!("untested --- but we want to retry because this means we received the Pass Gossip in the meantime");
+                        } else {
+                            todo!("inform user that TCP connection to this Node failed, aborting")
+                        }
+                    }
+                    Err(e) => todo!(
+                        "discard this single procedure?? or retry once; also send a msg to the UI"
+                    ),
+                },
+                TCPConnectionEstablished {
+                    attempt,
+                    previous_attempt_number,
+                } => match status {
+                    //TODO I'm unsure about this result resolution, maybe we don't need it
+                    Ok(num) => {
+                        if num > previous_attempt_number {
+                            return todo!("untested --- but we want to retry because this means we received the Pass Gossip in the meantime");
+                        } else {
+                            todo!("inform user that TCP connection to this Node failed, aborting")
+                        }
+                    }
+                    Err(e) => todo!("I don't know if this is going to be needed"),
+                },
+                NeighborGossipReceived => todo!(),
+            }
+        }
+    }
 }
 
 impl Actor for Neighborhood {
@@ -112,8 +222,8 @@ impl Handler<BindMessage> for Neighborhood {
 impl Handler<StartMessage> for Neighborhood {
     type Result = ();
 
-    fn handle(&mut self, _msg: StartMessage, _ctx: &mut Self::Context) -> Self::Result {
-        self.handle_start_message();
+    fn handle(&mut self, _msg: StartMessage, ctx: &mut Self::Context) -> Self::Result {
+        self.handle_start_message(ctx);
     }
 }
 
@@ -232,6 +342,17 @@ impl Handler<RemoveNeighborMessage> for Neighborhood {
 
     fn handle(&mut self, msg: RemoveNeighborMessage, _ctx: &mut Self::Context) -> Self::Result {
         let public_key = &msg.public_key;
+        if let Some(connection_procedure) = self
+            .connectedness_status
+            .fetch_individual_connection_procedure(public_key)
+        {
+            connection_procedure.connection_stage = StageZero {
+                status: Err(ConnectionStageError::UnsuccessfulTcpConnection),
+                previous_attempt_number: 0,
+            } //TODO should be previous attempt optional?
+        } else {
+            todo!("maybe panic because it should be there in the collection")
+        }
         match self.neighborhood_database.remove_neighbor(public_key) {
             Err(s) => error!(self.logger, "{}", s),
             Ok(db_changed) => {
@@ -381,6 +502,7 @@ impl Neighborhood {
             consuming_wallet_opt: config.consuming_wallet_opt.clone(),
             next_return_route_id: 0,
             initial_neighbors,
+            connectedness_status: OverallConnectednessStatus::default(), //TODO untested
             chain: config.blockchain_bridge_config.chain,
             crashable: config.crash_point == CrashPoint::Message,
             data_directory: config.data_directory.clone(),
@@ -411,9 +533,9 @@ impl Neighborhood {
         }
     }
 
-    fn handle_start_message(&mut self) {
+    fn handle_start_message(&mut self, ctx: &mut Context<Self>) {
         self.connect_database();
-        self.send_debut_gossip();
+        self.send_debut_gossip(ctx);
     }
 
     fn handle_new_public_ip(&mut self, msg: NewPublicIp) {
@@ -469,7 +591,7 @@ impl Neighborhood {
         }
     }
 
-    fn send_debut_gossip(&mut self) {
+    fn send_debut_gossip(&mut self, ctx: &mut Context<Self>) {
         if self.initial_neighbors.is_empty() {
             info!(self.logger, "Empty. No Nodes to report to; continuing");
             return;
@@ -480,6 +602,14 @@ impl Neighborhood {
             .produce_debut(&self.neighborhood_database);
         self.initial_neighbors.iter().for_each(|node_descriptor| {
             if let Some(node_addr) = &node_descriptor.node_addr_opt {
+                self.connectedness_status
+                    .initiate_stage_zero(node_descriptor.encryption_public_key.clone()); //TODO untested
+                ctx.notify_later(
+                    CheckConnectednessStatus {
+                        node_identifier: node_descriptor.encryption_public_key.clone(),
+                    },
+                    Duration::from_millis(500),
+                ); //TODO untested
                 self.hopper_no_lookup
                     .as_ref()
                     .expect("unbound hopper")
@@ -711,6 +841,8 @@ impl Neighborhood {
         };
         if self.handle_route_query_message(msg).is_some() {
             self.is_connected_to_min_hop_count_radius = true;
+            self.connectedness_status.full_connectedness = true; //TODO: untested
+
             self.connected_signal
                 .as_ref()
                 .expect("Accountant was not bound")

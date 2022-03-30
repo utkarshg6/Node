@@ -290,6 +290,11 @@ impl ActorSystemFactoryToolsReal {
                     return; // never happens; handle_automap_error doesn't return.
                 }
             };
+            if let Some(mapping_protocol) = automap_control.get_mapping_protocol(){
+                if Some(mapping_protocol) != config.mapping_protocol_opt{
+                    todo!("write it into the database")
+                }
+            }
             Self::notify_of_public_ip_change(new_ip_recipients.as_slice(), public_ip);
             node_addr.ports().iter().for_each(|port| {
                 if let Err(e) = automap_control.add_mapping(*port) {

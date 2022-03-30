@@ -485,6 +485,7 @@ impl GossipHandler for PassHandler {
         }
     }
 
+    //TODO add some logging for forensic analysis
     fn handle(
         &self,
         _cryptde: &dyn CryptDE,
@@ -554,6 +555,7 @@ impl GossipHandler for IntroductionHandler {
         Qualification::Matched
     }
 
+    //TODO add some logging for forensic analysis
     fn handle(
         &self,
         cryptde: &dyn CryptDE,

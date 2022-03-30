@@ -34,7 +34,7 @@ use crate::db_config::persistent_configuration::{
 use crate::neighborhood::gossip::{DotGossipEndpoint, GossipNodeRecord, Gossip_0v1};
 use crate::neighborhood::gossip_acceptor::GossipAcceptanceResult;
 use crate::neighborhood::node_record::NodeRecordInner_0v1;
-use crate::neighborhood::IndividualConnectionStage::{StageZero, TCPConnectionEstablished};
+use crate::neighborhood::IndividualConnectionStage::{Done, StageZero, TCPConnectionEstablished};
 use crate::neighborhood::OverallConnectednessStatus::{FullConnectedness, IndividualStages};
 use crate::stream_messages::RemovedStreamType;
 use crate::sub_lib::configurator::NewPasswordMessage;
@@ -109,19 +109,25 @@ enum IndividualConnectionStage {
         previous_attempt_number: usize,
     },
     TCPConnectionEstablished {
-        attempt: Result<usize, ConnectionStageError>,
+        status: Result<usize, ConnectionStageError>,
         previous_attempt_number: usize,
     },
     NeighborGossipReceived,
+    Done,
 }
 
 enum ConnectionStageError {
     UnsuccessfulTcpConnection,
 }
 
+struct GossipAnnouncement {
+    node_identifier: PublicKey,
+}
+
 #[derive(Default)]
 struct OverallConnectednessStatus {
     individual_stages: Vec<IndividualConnectionProcedure>, //TODO I would recommend to delete these items when their procedure end
+    gossip_announcements: Vec<GossipAnnouncement>,
     full_connectedness: bool,
 }
 
@@ -150,6 +156,29 @@ impl OverallConnectednessStatus {
 }
 
 #[derive(Clone, Debug, Message, PartialEq)]
+struct AnnounceExpectedGossipArrival {
+    node_identifier: PublicKey,
+}
+
+impl Handler<AnnounceExpectedGossipArrival> for Neighborhood {
+    type Result = ();
+
+    fn handle(
+        &mut self,
+        msg: AnnounceExpectedGossipArrival,
+        _ctx: &mut Self::Context,
+    ) -> Self::Result {
+        todo!("test me wholly");
+        let gossip_arrival_announcement = GossipAnnouncement {
+            node_identifier: msg.node_identifier,
+        };
+        self.connectedness_status
+            .gossip_announcements
+            .push(gossip_arrival_announcement);
+    }
+}
+
+#[derive(Clone, Debug, Message, PartialEq)]
 struct CheckConnectednessStatus {
     node_identifier: PublicKey,
 }
@@ -158,27 +187,26 @@ impl Handler<CheckConnectednessStatus> for Neighborhood {
     type Result = ();
 
     fn handle(&mut self, msg: CheckConnectednessStatus, ctx: &mut Self::Context) -> Self::Result {
-        let current_individual_stage_opt =
-            if let IndividualStages(mut vec) = self.connectedness_status.as_ref() {
-                todo!("test drive me");
-                vec.iter_mut()
-                    .find(|procedure| procedure.node_identifier == msg.node_identifier)
-            } else {
-                todo!() // None
-            }; //TODO untested and needs to be corrected
+        let current_individual_stage_opt: Option<&mut IndividualConnectionProcedure> = {
+            let vec_of_individual_procedures = self.connectedness_status.individual_stages.as_ref();
+            todo!("test drive me");
+            vec_of_individual_procedures
+                .iter_mut()
+                .find(|procedure| procedure.node_identifier == msg.node_identifier)
+        };
         if let Some(procedure) = current_individual_stage_opt {
-            match &procedure.connection_stage {
+            match procedure.connection_stage.as_mut() {
                 StageZero {
                     status,
                     previous_attempt_number,
                 } => match status {
                     Ok(num) => {
-                        if num >= &50 {
+                        if num >= 50 {
                             todo!("we got too much of pass Gossips, we will quit")
                         } else if num > previous_attempt_number {
                             return todo!("untested --- but we want to retry because this means we received the Pass Gossip in the meantime");
                         } else {
-                            todo!("inform user that TCP connection to this Node failed, aborting")
+                            todo!("we are free to advance the status")
                         }
                     }
                     Err(e) => todo!(
@@ -186,7 +214,7 @@ impl Handler<CheckConnectednessStatus> for Neighborhood {
                     ),
                 },
                 TCPConnectionEstablished {
-                    attempt,
+                    status: attempt,
                     previous_attempt_number,
                 } => match status {
                     //TODO I'm unsure about this result resolution, maybe we don't need it
@@ -199,8 +227,31 @@ impl Handler<CheckConnectednessStatus> for Neighborhood {
                     }
                     Err(e) => todo!("I don't know if this is going to be needed"),
                 },
-                NeighborGossipReceived => todo!(),
+                NeighborGossipReceived => {
+                    if let Some(announcement) = self
+                        .connectedness_status
+                        .gossip_announcements
+                        .iter()
+                        .find(|announcement| announcement.node_identifier == msg.node_identifier)
+                    {
+                        todo!("notify UI that we successfully received a Gossip from our corespondent");
+                        procedure.connection_stage = Done;
+                    } else {
+                        todo!("problem, what we are gonna do?")
+                    }
+                }
+                _ => todo!("shouldn't happen, we end before Done is assigned"),
             }
+            let proper_next_interval_opt = match &procedure.connection_stage {
+                StageZero { .. } => todo!("some duration"), //Some(Duration::from_millis(500))
+                TCPConnectionEstablished { .. } => todo!("some other duration"),
+                NeighborGossipReceived => None,
+            };
+            if let Some(interval) = proper_next_interval_opt {
+                ctx.notify_later(msg, interval)
+            }
+        } else {
+            todo!("something is wrong, realize what")
         }
     }
 }
@@ -831,6 +882,7 @@ impl Neighborhood {
         }
     }
 
+    //TODO we probably want to tear this out from the present structure and use it in CheckConnectednessStatus
     fn check_connectedness(&mut self) {
         if self.is_connected_to_min_hop_count_radius {
             return;
@@ -843,8 +895,8 @@ impl Neighborhood {
         };
         if self.handle_route_query_message(msg).is_some() {
             self.is_connected_to_min_hop_count_radius = true;
-            self.connectedness_status.full_connectedness = true; //TODO: untested
-
+            todo!("send message to the UI that we are fully connected");
+            //self.connectedness_status.full_connectedness = true;
             self.connected_signal
                 .as_ref()
                 .expect("Accountant was not bound")

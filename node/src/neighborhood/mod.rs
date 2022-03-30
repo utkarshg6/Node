@@ -160,10 +160,11 @@ impl Handler<CheckConnectednessStatus> for Neighborhood {
     fn handle(&mut self, msg: CheckConnectednessStatus, ctx: &mut Self::Context) -> Self::Result {
         let current_individual_stage_opt =
             if let IndividualStages(mut vec) = self.connectedness_status.as_ref() {
+                todo!("test drive me");
                 vec.iter_mut()
                     .find(|procedure| procedure.node_identifier == msg.node_identifier)
             } else {
-                None
+                todo!() // None
             }; //TODO untested and needs to be corrected
         if let Some(procedure) = current_individual_stage_opt {
             match &procedure.connection_stage {
@@ -346,6 +347,7 @@ impl Handler<RemoveNeighborMessage> for Neighborhood {
             .connectedness_status
             .fetch_individual_connection_procedure(public_key)
         {
+            todo!("test drive me");
             connection_procedure.connection_stage = StageZero {
                 status: Err(ConnectionStageError::UnsuccessfulTcpConnection),
                 previous_attempt_number: 0,

@@ -4,12 +4,9 @@ on:
     branches: GH-589
 
 jobs:
-  build:
-    name: Build node on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [macOS-latest, ubuntu-latest, windows-latest]
+  build_on_win:
+    name: Build node on windows-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v3
       - name: Cache sccache results
@@ -19,7 +16,7 @@ jobs:
         with:
           path: ~/.cargo/cache
           key: ${{ runner.os }}-0001
-      - name: Build ${{ matrix.os }}
+      - name: Build windows-latest
         run: |
           rustup check
           case "$OSTYPE" in
@@ -39,13 +36,87 @@ jobs:
           ./ci/multinode_integration_test.sh
           ./ci/collect_results.sh
         shell: bash
-      - name: Publish ${{ matrix.os }}
+      - name: Publish windows-latest
         uses: actions/upload-artifact@v3
         with:
-          name: Build Results ${{ matrix.os }}
+          name: Build Results windows-latest
           path: results
+  build_on_linux:
+    name: Build node on ubuntu-latest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Cache sccache results
+        uses: actions/cache@v3
+        env:
+          cache-name: cache-node-modules
+        with:
+          path: ~/.cargo/cache
+          key: ${{ runner.os }}-0001
+      - name: Build ubuntu-latest
+        run: |
+          rustup check
+          case "$OSTYPE" in
+            msys)
+              echo "Windows doesn't like it when rustup updates itself"
+              rustup update --no-self-update stable
+              ;;
+            *)
+              echo "Linux and macOS don't need manual suppression of rustup self update"
+              rustup update stable
+              ;;
+          esac
+          rustup check
+          rustup component add rustfmt
+          rustup component add clippy
+          ./ci/all.sh
+          ./ci/multinode_integration_test.sh
+          ./ci/collect_results.sh
+        shell: bash
+      - name: Publish ubuntu-latest
+        uses: actions/upload-artifact@v3
+        with:
+          name: Build Results ubuntu-latest
+          path: results    
+  build_on_mac:
+    name: Build node on macOS-latest
+    runs-on: macOS-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Cache sccache results
+        uses: actions/cache@v3
+        env:
+          cache-name: cache-node-modules
+        with:
+          path: ~/.cargo/cache
+          key: ${{ runner.os }}-0001
+      - name: Build macOS-latest
+        run: |
+          rustup check
+          case "$OSTYPE" in
+            msys)
+              echo "Windows doesn't like it when rustup updates itself"
+              rustup update --no-self-update stable
+              ;;
+            *)
+              echo "Linux and macOS don't need manual suppression of rustup self update"
+              rustup update stable
+              ;;
+          esac
+          rustup check
+          rustup component add rustfmt
+          rustup component add clippy
+          ./ci/all.sh
+          ./ci/multinode_integration_test.sh
+          ./ci/collect_results.sh
+        shell: bash
+      - name: Publish macOS-latest
+        uses: actions/upload-artifact@v3
+        with:
+          name: Build Results macOS-latest
+          path: results        
   deploy_to_s3:
-       needs: build
+       needs: [build_on_win, build_on_linux, build_on_mac]
        runs-on: ubuntu-latest
        steps:
         - uses: actions/download-artifact@v3
@@ -63,6 +134,6 @@ jobs:
             AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
             AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
             AWS_REGION: 'us-west-2'
-            DEST_DIR: 'MASQ-app/staging'
+            DEST_DIR: 'Node/latest'
             SOURCE_DIR: ${{ steps.download.outputs.download-path }}
             

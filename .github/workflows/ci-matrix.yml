@@ -5,7 +5,7 @@ on:
 
 jobs:
   build_on_win:
-    name: Build node on windows-latest
+    name: MASQNode-windows
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v3
@@ -42,7 +42,7 @@ jobs:
           name: MASQNode-windows
           path: results
   build_on_linux:
-    name: Build node on ubuntu-latest
+    name: MASQNode-linux
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -79,7 +79,7 @@ jobs:
           name: MASQNode-linux
           path: results    
   build_on_mac:
-    name: Build node on macOS-latest
+    name: MASQNode-macOS
     runs-on: macOS-latest
     steps:
       - uses: actions/checkout@v3

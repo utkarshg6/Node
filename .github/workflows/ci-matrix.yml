@@ -4,9 +4,12 @@ on:
     branches: GH-589
 
 jobs:
-  build_on_win:
-    name: MASQNode-windows
-    runs-on: windows-latest
+  build:
+    name: MASQNode-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [macOS-latest, ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v3
       - name: Cache sccache results
@@ -16,7 +19,7 @@ jobs:
         with:
           path: ~/.cargo/cache
           key: ${{ runner.os }}-0001
-      - name: Build windows-latest
+      - name: Build ${{ matrix.os }}
         run: |
           rustup check
           case "$OSTYPE" in
@@ -36,95 +39,21 @@ jobs:
           ./ci/multinode_integration_test.sh
           ./ci/collect_results.sh
         shell: bash
-      - name: Publish windows-latest
+      - name: Publish ${{ matrix.os }}
         uses: actions/upload-artifact@v3
         with:
-          name: MASQNode-windows
-          path: results/generated/bin
-  build_on_linux:
-    name: MASQNode-linux
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-      - name: Cache sccache results
-        uses: actions/cache@v3
-        env:
-          cache-name: cache-node-modules
-        with:
-          path: ~/.cargo/cache
-          key: ${{ runner.os }}-0001
-      - name: Build ubuntu-latest
-        run: |
-          rustup check
-          case "$OSTYPE" in
-            msys)
-              echo "Windows doesn't like it when rustup updates itself"
-              rustup update --no-self-update stable
-              ;;
-            *)
-              echo "Linux and macOS don't need manual suppression of rustup self update"
-              rustup update stable
-              ;;
-          esac
-          rustup check
-          rustup component add rustfmt
-          rustup component add clippy
-          ./ci/all.sh
-          ./ci/multinode_integration_test.sh
-          ./ci/collect_results.sh
-        shell: bash
-      - name: Publish ubuntu-latest
-        uses: actions/upload-artifact@v3
-        with:
-          name: MASQNode-linux
-          path: results/generated/bin
-  build_on_mac:
-    name: MASQNode-macOS
-    runs-on: macOS-latest
-    steps:
-      - uses: actions/checkout@v3
-      - name: Cache sccache results
-        uses: actions/cache@v3
-        env:
-          cache-name: cache-node-modules
-        with:
-          path: ~/.cargo/cache
-          key: ${{ runner.os }}-0001
-      - name: Build macOS-latest
-        run: |
-          rustup check
-          case "$OSTYPE" in
-            msys)
-              echo "Windows doesn't like it when rustup updates itself"
-              rustup update --no-self-update stable
-              ;;
-            *)
-              echo "Linux and macOS don't need manual suppression of rustup self update"
-              rustup update stable
-              ;;
-          esac
-          rustup check
-          rustup component add rustfmt
-          rustup component add clippy
-          ./ci/all.sh
-          ./ci/multinode_integration_test.sh
-          ./ci/collect_results.sh
-        shell: bash
-      - name: Publish macOS-latest
-        uses: actions/upload-artifact@v3
-        with:
-          name: MASQNode-macOS
-          path: results/generated/bin
-  deploy_win_to_s3:
-       needs: build_on_win
+          name: MASQNode-${{ matrix.os }}
+          path: results/generated/bin          
+  deploy_to_s3:
+       needs: build
        runs-on: ubuntu-latest
        steps:
         - uses: actions/download-artifact@v3
-          id: download_win
+          id: download
         - name: Display structure of downloaded files
           run: ls -R
         - name: 'Echo download path'
-          run: echo ${{steps.download_win.outputs.download-path}}
+          run: echo ${{steps.download.outputs.download-path}}
         - name: S3 Sync
           uses: jakejarvis/s3-sync-action@v0.5.1
           with:
@@ -134,47 +63,5 @@ jobs:
             AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
             AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
             AWS_REGION: 'us-west-2'
-            DEST_DIR: 'Node/latest/win'
-            SOURCE_DIR: ${{ steps.download_win.outputs.download-path }}
-  deploy_linux_to_s3:
-       needs: build_on_linux
-       runs-on: ubuntu-latest
-       steps:
-        - uses: actions/download-artifact@v3
-          id: download_linux
-        - name: Display structure of downloaded files
-          run: ls -R
-        - name: 'Echo download path'
-          run: echo ${{steps.download_linux.outputs.download-path}}
-        - name: S3 Sync
-          uses: jakejarvis/s3-sync-action@v0.5.1
-          with:
-           args: --acl private --follow-symlinks --delete
-          env:
-            AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
-            AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-            AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-            AWS_REGION: 'us-west-2'
-            DEST_DIR: 'Node/latest/linux'
-            SOURCE_DIR: ${{ steps.download_linux.outputs.download-path }}       
-  deploy_mac_to_s3:
-       needs: build_on_mac
-       runs-on: ubuntu-latest
-       steps:
-        - uses: actions/download-artifact@v3
-          id: download_mac
-        - name: Display structure of downloaded files
-          run: ls -R
-        - name: 'Echo download path'
-          run: echo ${{steps.download_mac.outputs.download-path}}
-        - name: S3 Sync
-          uses: jakejarvis/s3-sync-action@v0.5.1
-          with:
-           args: --acl private --follow-symlinks --delete
-          env:
-            AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
-            AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-            AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-            AWS_REGION: 'us-west-2'
-            DEST_DIR: 'Node/latest/mac'
-            SOURCE_DIR: ${{ steps.download_mac.outputs.download-path }}        
+            DEST_DIR: 'Node/latest'
+            SOURCE_DIR: ${{ steps.download.outputs.download-path }}

@@ -39,7 +39,7 @@ jobs:
       - name: Publish windows-latest
         uses: actions/upload-artifact@v3
         with:
-          name: Build Results windows-latest
+          name: MASQNode-windows
           path: results
   build_on_linux:
     name: Build node on ubuntu-latest
@@ -76,7 +76,7 @@ jobs:
       - name: Publish ubuntu-latest
         uses: actions/upload-artifact@v3
         with:
-          name: Build Results ubuntu-latest
+          name: MASQNode-linux
           path: results    
   build_on_mac:
     name: Build node on macOS-latest
@@ -113,7 +113,7 @@ jobs:
       - name: Publish macOS-latest
         uses: actions/upload-artifact@v3
         with:
-          name: Build Results macOS-latest
+          name: MASQNode-macOS
           path: results        
   deploy_win_to_s3:
        needs: build_on_win

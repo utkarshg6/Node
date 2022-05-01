@@ -4,21 +4,29 @@ use crate::accountant::receivable_dao::ReceivableError;
 use crate::accountant::{AccountantError, PayableError, SignConversionError};
 use crate::database::connection_wrapper::ConnectionWrapper;
 use itertools::Either;
+use masq_lib::utils::ExpectValue;
 use rusqlite::types::Value;
-use rusqlite::{Statement, ToSql, Transaction};
+use rusqlite::ErrorCode::ConstraintViolation;
+use rusqlite::{Error, Statement, ToSql, Transaction};
+use std::any::Any;
 use std::fmt::{Display, Formatter};
 
-#[derive(Clone)]
 pub struct InsertUpdateConfig<'a> {
     pub insert_sql: &'a str,
     pub update_sql: &'a str,
+    pub params: VerboseParams<'a>,
+    pub table: Table,
+}
+
+pub struct InsertConfig<'a> {
+    pub insert_sql: &'a str,
     pub params: &'a [(&'static str, &'a dyn ToSql)],
     pub table: Table,
 }
 
 pub struct UpdateConfig<'a> {
     pub update_sql: &'a str,
-    pub params: &'a [(&'static str, &'a dyn ToSql)],
+    pub params: VerboseParams<'a>,
     pub table: Table,
 }
 
@@ -37,15 +45,58 @@ impl Display for Table {
     }
 }
 
+pub trait VerboseParamsMarker: ToSql + Display {
+    fn countable_as_any(&self) -> &dyn Any {
+        intentionally_blank!()
+    }
+}
+
+impl VerboseParamsMarker for i64 {
+    fn countable_as_any(&self) -> &dyn Any {
+        todo!()
+    }
+}
+impl VerboseParamsMarker for i128 {
+    fn countable_as_any(&self) -> &dyn Any {
+        self
+    }
+}
+impl VerboseParamsMarker for &str {}
+
+pub struct VerboseParams<'a> {
+    params: Vec<(&'a str, &'a dyn VerboseParamsMarker)>,
+}
+
+impl<'a> VerboseParams<'a> {
+    pub fn new(params: Vec<(&'a str, &'a (dyn VerboseParamsMarker + 'a))>) -> Self {
+        Self { params }
+    }
+
+    fn params(&self) -> &Vec<(&'a str, &'a (dyn VerboseParamsMarker + 'a))> {
+        &self.params
+    }
+
+    pub fn all_rusqlite_params(&'a self) -> Vec<(&'a str, &'a dyn ToSql)> {
+        self.params
+            .iter()
+            .map(|(first, second)| (*first, second as &dyn ToSql))
+            .collect()
+    }
+}
+
+//TODO wallet + amount among direct params are silly
 pub trait InsertUpdateCore {
-    fn update(
+    fn insert(
+        &self,
+        conn: &dyn ConnectionWrapper,
+        config: &dyn InsertConfiguration,
+    ) -> Result<(), Error>;
+    fn update<'a>(
         &self,
         conn: Either<&dyn ConnectionWrapper, &Transaction>,
-        wallet: &str,
-        amount: i128,
-        config: &dyn UpdateConfiguration,
+        config: &'a (dyn UpdateConfiguration<'a> + 'a),
     ) -> Result<(), String>;
-    fn insert_or_update<'a>(
+    fn upsert<'a>(
         &self,
         conn: &dyn ConnectionWrapper,
         wallet: &str,
@@ -57,27 +108,37 @@ pub trait InsertUpdateCore {
 pub struct InsertUpdateCoreReal;
 
 impl InsertUpdateCore for InsertUpdateCoreReal {
-    fn update(
+    fn insert(
         &self,
-        form_of_conn: Either<&dyn ConnectionWrapper, &Transaction>, //TODO should be either for conn_w or tx?
-        wallet: &str,
-        amount: i128,
-        config: &dyn UpdateConfiguration,
+        conn: &dyn ConnectionWrapper,
+        config: &dyn InsertConfiguration,
+    ) -> Result<(), Error> {
+        todo!()
+    }
+
+    fn update<'a>(
+        &self,
+        form_of_conn: Either<&dyn ConnectionWrapper, &Transaction>,
+        config: &'a (dyn UpdateConfiguration<'a> + 'a),
     ) -> Result<(), String> {
-        let query = config.select_sql();
-        let mut statement = Self::prepare_statement(form_of_conn, query.as_str());
-        match statement.query_row([wallet], |row| {
+        let present_state_query = config.select_sql();
+        let mut statement = Self::prepare_statement(form_of_conn, present_state_query.as_str());
+        let update_params = config.update_params().params();
+        let (wallet_rql, wallet_str) = update_params.fetch_wallet();
+        let change_num = update_params.fetch_balance_change();
+        match statement.query_row(&[(":wallet", wallet_rql)], |row| {
             let balance_result: rusqlite::Result<i128> = row.get(0);
             match balance_result {
                 Ok(balance) => {
-                    let updated_balance = balance + amount;
+                    let updated_balance = balance + change_num;
                     let blob = Self::blob_i128(updated_balance);
-                    let mut adjusted_params = config.update_params().to_vec();
-                    config.should_balance_param_be_removed(&mut adjusted_params);
-                    adjusted_params.insert(0, (":updated_balance", &blob));
+                    let update_params = config.finalize_update_params(
+                        &blob,
+                        config.update_params().all_rusqlite_params(),
+                    );
                     let query = config.update_sql();
                     let mut stm = Self::prepare_statement(form_of_conn, query);
-                    stm.execute(&*adjusted_params)
+                    stm.execute(&*update_params)
                 }
                 Err(e) => Err(e),
             }
@@ -86,37 +147,70 @@ impl InsertUpdateCore for InsertUpdateCoreReal {
             Err(e) => Err(format!(
                 "Updating balance for {} of {} Wei to {}; failing on: '{}'",
                 config.table(),
-                amount,
-                wallet,
+                change_num,
+                wallet_str,
                 e
             )),
         }
     }
 
-    fn insert_or_update(
+    fn upsert(
         &self,
         conn: &dyn ConnectionWrapper,
         wallet: &str,
         amount: i128,
         config: InsertUpdateConfig,
     ) -> Result<(), String> {
-        let params = config.params;
+        let params = config.params.all_rusqlite_params();
         let mut stm = conn
             .prepare(config.insert_sql)
             .expect("internal rusqlite error");
         match stm.execute(&*params) {
             Ok(_) => return Ok(()),
-            Err(e) => {
-                let cause = e.to_string();
-                let constraint_failed_msg = "UNIQUE constraint failed";
-                if cause.len() >= constraint_failed_msg.len()
-                    && &cause[..constraint_failed_msg.len()] == constraint_failed_msg
-                {
-                    self.update(Either::Left(conn), wallet, amount, &config)
-                } else {
-                    Err(format!("Updating balance after invalid insertion for {} of {} Wei to {}; failing on: '{}'", config.table, amount, wallet, cause))
-                }
+            Err(e)
+                if {
+                    match e {
+                        Error::SqliteFailure(e, _) => match e.code {
+                            ConstraintViolation => true,
+                            _ => false,
+                        },
+                        _ => false,
+                    }
+                } =>
+            {
+                self.update(Either::Left(conn), &config)
             }
+            Err(e) => Err(format!(
+                "Updating balance after invalid insertion for {} of {} Wei to {}; failing on: '{}'",
+                config.table, amount, wallet, e
+            )),
+        }
+    }
+}
+
+pub trait FetchValue<'a> {
+    fn fetch_balance_change(&'a self) -> i128;
+    fn fetch_wallet(&'a self) -> (&'a dyn ToSql, String);
+}
+
+impl<'a> FetchValue<'a> for &'a Vec<(&'a str, &'a dyn VerboseParamsMarker)> {
+    fn fetch_balance_change(&'a self) -> i128 {
+        match self
+            .iter()
+            .find(|(param_name, param_val)| *param_name == ":balance")
+        {
+            Some((_, val)) => *val.countable_as_any().downcast_ref().expect_v("i128"),
+            None => todo!(),
+        }
+    }
+
+    fn fetch_wallet(&'a self) -> (&'a dyn ToSql, String) {
+        match self
+            .iter()
+            .find(|(param_name, param_val)| *param_name == ":wallet")
+        {
+            Some((_, val)) => (val as &dyn ToSql, val.to_string()),
+            None => todo!(),
         }
     }
 }
@@ -125,6 +219,7 @@ impl InsertUpdateCoreReal {
     pub fn blob_i128(amount: i128) -> Value {
         amount.into()
     }
+
     fn prepare_statement<'a>(
         form_of_conn: Either<&'a dyn ConnectionWrapper, &'a Transaction>,
         query: &'a str,
@@ -137,12 +232,39 @@ impl InsertUpdateCoreReal {
     }
 }
 
+pub trait InsertConfiguration<'a> {
+    fn insert_sql(&self) -> &'a str;
+    fn insert_params(&self) -> &'a [(&'static str, &'a dyn ToSql)];
+}
+
+impl<'a> InsertConfiguration<'a> for InsertUpdateConfig<'a> {
+    fn insert_sql(&self) -> &'a str {
+        todo!()
+    }
+    fn insert_params(&self) -> &'a [(&'static str, &'a dyn ToSql)] {
+        todo!()
+    }
+}
+
 pub trait UpdateConfiguration<'a> {
     fn table(&self) -> String;
     fn select_sql(&self) -> String;
     fn update_sql(&self) -> &'a str;
-    fn update_params(&self) -> &'a [(&'static str, &'a dyn ToSql)];
-    fn should_balance_param_be_removed(&self, params_to_adjust: &mut Vec<(&str, &dyn ToSql)>);
+    fn update_params(&'a self) -> &VerboseParams;
+    fn finalize_update_params<'b>(
+        &'a self,
+        num_blob: &'b Value,
+        mut params_to_update: Vec<(&'b str, &'b dyn ToSql)>,
+    ) -> Vec<(&'b str, &'b dyn ToSql)> {
+        params_to_update.remove(
+            params_to_update
+                .iter()
+                .position(|(name, val)| *name == ":balance")
+                .expect_v(":balance"),
+        );
+        params_to_update.insert(0, (":updated_balance", num_blob));
+        params_to_update
+    }
 }
 
 impl<'a> UpdateConfiguration<'a> for InsertUpdateConfig<'a> {
@@ -151,22 +273,15 @@ impl<'a> UpdateConfiguration<'a> for InsertUpdateConfig<'a> {
     }
 
     fn select_sql(&self) -> String {
-        format!(
-            "select balance from {} where wallet_address = ?",
-            self.table
-        )
+        select_statement(&self.table)
     }
 
     fn update_sql(&self) -> &'a str {
         self.update_sql
     }
 
-    fn update_params(&self) -> &'a [(&'static str, &'a dyn ToSql)] {
-        self.params
-    }
-
-    fn should_balance_param_be_removed(&self, params_to_adjust: &mut Vec<(&str, &dyn ToSql)>) {
-        let _ = params_to_adjust.remove(1);
+    fn update_params(&self) -> &VerboseParams {
+        &self.params
     }
 }
 
@@ -176,23 +291,23 @@ impl<'a> UpdateConfiguration<'a> for UpdateConfig<'a> {
     }
 
     fn select_sql(&self) -> String {
-        format!(
-            "select balance from {} where wallet_address = :wallet",
-            self.table
-        )
+        select_statement(&self.table)
     }
 
     fn update_sql(&self) -> &'a str {
         self.update_sql
     }
 
-    fn update_params(&self) -> &'a [(&'static str, &'a dyn ToSql)] {
-        self.params
+    fn update_params(&self) -> &VerboseParams {
+        &self.params
     }
+}
 
-    fn should_balance_param_be_removed(&self, _params_to_adjust: &mut Vec<(&str, &dyn ToSql)>) {
-        ()
-    }
+fn select_statement(table: &Table) -> String {
+    format!(
+        "select balance from {} where wallet_address = :wallet",
+        table
+    )
 }
 
 //update
@@ -205,10 +320,10 @@ pub fn update_receivable(
 ) -> Result<(), AccountantError> {
     let config = UpdateConfig {
         update_sql: "update receivable set balance = :updated_balance, last_received_timestamp = :last_received where wallet_address = :wallet",
-        params: &[(":wallet",&wallet),(":last_received",&last_received_time_stamp)],
+        params: VerboseParams::new(vec![(":wallet",&wallet),(":balance", &amount),(":last_received",&last_received_time_stamp)]), //is later recomputed into :updated_balance
         table: Table::Receivable
     };
-    core.update(Either::Right(transaction), wallet, amount, &config)
+    core.update(Either::Right(transaction), &config)
         .map_err(receivable_rusqlite_error)
 }
 
@@ -222,10 +337,10 @@ pub fn insert_or_update_receivable(
     let config = InsertUpdateConfig{
         insert_sql: "insert into receivable (wallet_address, balance, last_received_timestamp) values (:wallet,:balance,strftime('%s','now'))",
         update_sql: "update receivable set balance = :updated_balance where wallet_address = :wallet",
-        params: &[(":wallet", &wallet), (":balance", &amount)],
+        params: VerboseParams::new(vec![(":wallet", &wallet), (":balance", &amount)]),
         table: Table::Receivable
     };
-    core.insert_or_update(conn, wallet, amount, config)
+    core.upsert(conn, wallet, amount, config)
         .map_err(receivable_rusqlite_error)
 }
 
@@ -238,13 +353,13 @@ pub fn insert_or_update_payable(
     let config = InsertUpdateConfig{
         insert_sql: "insert into payable (wallet_address, balance, last_paid_timestamp, pending_payment_transaction) values (:wallet,:balance,strftime('%s','now'),null)",
         update_sql: "update payable set balance = :updated_balance where wallet_address = :wallet",
-        params: &[(":wallet", &wallet), (":balance", &amount)],
+        params: VerboseParams::new(vec![(":wallet", &wallet), (":balance", &amount)]),
         table: Table::Payable
     };
-    core.insert_or_update(conn, wallet, amount, config)
+    core.upsert(conn, wallet, amount, config)
         .map_err(payable_rusqlite_error)
 }
-
+//TODO name change
 pub fn insert_or_update_payable_for_our_payment(
     conn: &dyn ConnectionWrapper,
     core: &dyn InsertUpdateCore,
@@ -256,10 +371,10 @@ pub fn insert_or_update_payable_for_our_payment(
     let config = InsertUpdateConfig{
         insert_sql: "insert into payable (balance, last_paid_timestamp, pending_payment_transaction, wallet_address) values (:balance, :last_paid, :transaction, :wallet)",
         update_sql: "update payable set balance = :updated_balance, last_paid_timestamp = :last_paid, pending_payment_transaction = :transaction where wallet_address = :wallet",
-        params: &[(":wallet", &wallet), (":balance", &amount), (":last_paid", &last_paid_timestamp), (":transaction", &transaction_hash)],
+        params: VerboseParams::new(vec![(":wallet", &wallet), (":balance", &amount), (":last_paid", &last_paid_timestamp), (":transaction", &transaction_hash)]),
         table: Table::Payable
     };
-    core.insert_or_update(conn, wallet, amount, config)
+    core.upsert(conn, wallet, amount, config)
         .map_err(payable_rusqlite_error)
 }
 
@@ -283,19 +398,81 @@ mod tests {
         insert_or_update_payable, insert_or_update_payable_for_our_payment,
         insert_or_update_receivable, reverse_sign, update_receivable, InsertUpdateConfig,
         InsertUpdateCore, InsertUpdateCoreReal, Table, UpdateConfig, UpdateConfiguration,
+        VerboseParams,
     };
     use crate::accountant::receivable_dao::ReceivableError;
     use crate::accountant::test_utils::InsertUpdateCoreMock;
     use crate::accountant::{AccountantError, PayableError, SignConversionError};
     use crate::database::connection_wrapper::{ConnectionWrapper, ConnectionWrapperReal};
     use crate::database::db_initializer::{DbInitializer, DbInitializerReal};
-    use itertools::Either;
+    use itertools::{Either, Itertools};
     use masq_lib::blockchains::chains::Chain;
     use masq_lib::test_utils::utils::ensure_node_home_directory_exists;
     use masq_lib::utils::SliceToVec;
-    use rusqlite::{named_params, params, Connection};
+    use rusqlite::types::ToSqlOutput;
+    use rusqlite::{named_params, params, Connection, ToSql};
     use std::sync::{Arc, Mutex};
     use std::time::SystemTime;
+
+    fn convert_params_to_debuggable_values<'a>(
+        standard_params: Vec<(&'a str, &'a dyn ToSql)>,
+    ) -> Vec<(&'a str, ToSqlOutput)> {
+        let mut vec = standard_params
+            .into_iter()
+            .map(|(name, value)| (name, value.to_sql().unwrap()))
+            .collect_vec();
+        vec.sort_by(|(name_a, _), (name_b, _)| name_a.cmp(name_b));
+        vec
+    }
+
+    #[test]
+    fn finalize_update_params_for_update_config_works() {
+        let subject = UpdateConfig {
+            update_sql: "blah",
+            params: VerboseParams::new(vec![
+                (":something", &152_i64),
+                (":balance", &5555_i128),
+                (":something_else", &"foooo"),
+            ]),
+            table: Table::Payable,
+        };
+
+        finalize_update_params_assertion(&subject)
+    }
+
+    #[test]
+    fn finalize_update_params_for_insert_update_config_works() {
+        let subject = InsertUpdateConfig {
+            insert_sql: "blah1",
+            update_sql: "blah2",
+            params: VerboseParams::new(vec![
+                (":something", &152_i64),
+                (":balance", &5555_i128),
+                (":something_else", &"foooo"),
+            ]),
+            table: Table::Payable,
+        };
+
+        finalize_update_params_assertion(&subject)
+    }
+
+    fn finalize_update_params_assertion<'a>(subject: &'a dyn UpdateConfiguration<'a>) {
+        let updated_balance = InsertUpdateCoreReal::blob_i128(456789);
+
+        let result = subject.finalize_update_params(
+            &updated_balance,
+            subject.update_params().all_rusqlite_params(),
+        );
+
+        let expected_params: Vec<(&str, &dyn ToSql)> = vec![
+            (":something", &152_i64),
+            (":updated_balance", &updated_balance),
+            (":something_else", &"foooo"),
+        ];
+        let expected_assertable = convert_params_to_debuggable_values(expected_params);
+        let result_assertable = convert_params_to_debuggable_values(result);
+        assert_eq!(result_assertable, expected_assertable)
+    }
 
     #[test]
     fn update_receivable_works_positive() {
@@ -798,11 +975,8 @@ mod tests {
             ))
         );
         let mut insert_or_update_params = insert_or_update_params_arc.lock().unwrap();
-        let (wallet, amount, (select_sql, update_sql, table, sql_param_names)) =
-            insert_or_update_params.remove(0);
+        let (select_sql, update_sql, table, sql_param_names) = insert_or_update_params.remove(0);
         assert!(insert_or_update_params.is_empty());
-        assert_eq!(wallet, wallet_address);
-        assert_eq!(amount, supplied_amount_wei);
         assert_eq!(
             select_sql,
             "select balance from receivable where wallet_address = :wallet"
@@ -811,7 +985,7 @@ mod tests {
         assert_eq!(table, Table::Receivable.to_string());
         assert_eq!(
             sql_param_names,
-            [":wallet", ":last_received"].array_of_borrows_to_vec()
+            [":wallet", ":balance", ":last_received"].array_of_borrows_to_vec() //TODO is this right?
         )
     }
 
@@ -955,16 +1129,11 @@ mod tests {
         let update_config = InsertUpdateConfig {
             insert_sql: "",
             update_sql: "",
-            params: &[],
+            params: VerboseParams::new(vec![]),
             table: Table::Payable,
         };
 
-        let result = InsertUpdateCoreReal.update(
-            Either::Left(&wrapped_conn),
-            wallet_address,
-            amount_wei,
-            &update_config,
-        );
+        let result = InsertUpdateCoreReal.update(Either::Left(&wrapped_conn), &update_config);
 
         assert_eq!(result, Err("Updating balance for payable of 100 Wei to a11122; failing on: 'Query returned no rows'".to_string()));
     }
@@ -985,19 +1154,14 @@ mod tests {
             wallet_address,
         );
         let amount_wei = 100;
-        let last_received_time_stamp_sec = 123;
+        let last_received_time_stamp_sec = 123_i64;
         let update_config = UpdateConfig {
             update_sql: "update receivable set balance = :updated_balance, last_received_timestamp = :last_received where wallet_address = :wallet",
-            params: &[(":wallet",&wallet_address),(":last_received",&last_received_time_stamp_sec)],
+            params: VerboseParams::new(vec![(":wallet",&wallet_address),(":last_received",&last_received_time_stamp_sec)]),
             table: Table::Payable
         };
 
-        let result = InsertUpdateCoreReal.update(
-            Either::Left(conn_ref),
-            wallet_address,
-            amount_wei,
-            &update_config,
-        );
+        let result = InsertUpdateCoreReal.update(Either::Left(conn_ref), &update_config);
 
         assert_eq!(result, Err("Updating balance for payable of 100 Wei to a11122; failing on: 'Invalid column type Text at index: 0, name: balance'".to_string()));
     }
@@ -1016,19 +1180,14 @@ mod tests {
         let mut stm = conn_ref.prepare("insert into payable (wallet_address, balance, last_paid_timestamp, pending_payment_transaction) values (?,?,strftime('%s','now'),null)").unwrap();
         stm.execute(params![wallet_address, 45245_i128]).unwrap();
         let amount_wei = 100;
-        let last_received_time_stamp_sec = 123;
+        let last_received_time_stamp_sec = 123_i64;
         let update_config = UpdateConfig {
             update_sql: "update receivable set balance = ?, last_received_timestamp = ? where wallet_address = ?",
-            params: &[(":woodstock",&wallet_address),(":hendrix",&last_received_time_stamp_sec)],
+            params: VerboseParams::new(vec![(":woodstock",&wallet_address),(":hendrix",&last_received_time_stamp_sec)]),
             table: Table::Payable
         };
 
-        let result = InsertUpdateCoreReal.update(
-            Either::Left(conn_ref),
-            wallet_address,
-            amount_wei,
-            &update_config,
-        );
+        let result = InsertUpdateCoreReal.update(Either::Left(conn_ref), &update_config);
 
         assert_eq!(result, Err("Updating balance for payable of 100 Wei to a11122; failing on: 'Invalid parameter name: :updated_balance'".to_string()));
     }

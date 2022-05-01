@@ -3,7 +3,7 @@
 #![cfg(test)]
 
 use crate::accountant::dao_shared_methods::{
-    InsertUpdateConfig, InsertUpdateCore, Table, UpdateConfiguration,
+    InsertConfiguration, InsertUpdateConfig, InsertUpdateCore, Table, UpdateConfiguration,
 };
 use crate::accountant::payable_dao::{
     PayableAccount, PayableDao, PayableDaoFactory, Payment, TotalInnerEncapsulationPayable,
@@ -22,7 +22,7 @@ use crate::test_utils::make_wallet;
 use crate::test_utils::persistent_configuration_mock::PersistentConfigurationMock;
 use ethereum_types::H256;
 use itertools::Either;
-use rusqlite::Transaction as RusqliteTransaction;
+use rusqlite::{Error, Transaction as RusqliteTransaction};
 use std::cell::RefCell;
 use std::ptr::addr_of;
 use std::rc::Rc;
@@ -186,7 +186,7 @@ impl PayableDaoMock {
 
 #[derive(Default)]
 pub struct InsertUpdateCoreMock {
-    update_params: Arc<Mutex<Vec<(String, i128, (String, String, String, Vec<String>))>>>, //trait-object-like params tested specially
+    update_params: Arc<Mutex<Vec<(String, String, String, Vec<String>)>>>, //trait-object-like params tested specially
     update_results: RefCell<Vec<Result<(), String>>>,
     insert_or_update_params: Arc<Mutex<Vec<(String, i128, (String, String, Table, Vec<String>))>>>, //I have to skip the sql params which cannot be handled in a test economically
     insert_or_update_results: RefCell<Vec<Result<(), String>>>,
@@ -194,27 +194,30 @@ pub struct InsertUpdateCoreMock {
 }
 
 impl InsertUpdateCore for InsertUpdateCoreMock {
-    fn update(
+    fn insert(
+        &self,
+        conn: &dyn ConnectionWrapper,
+        config: &dyn InsertConfiguration,
+    ) -> Result<(), Error> {
+        todo!()
+    }
+
+    fn update<'a>(
         &self,
         conn: Either<&dyn ConnectionWrapper, &RusqliteTransaction>,
-        wallet: &str,
-        amount: i128,
-        config: &dyn UpdateConfiguration,
+        config: &'a (dyn UpdateConfiguration<'a> + 'a),
     ) -> Result<(), String> {
         let owned_params: Vec<String> = config
             .update_params()
+            .all_rusqlite_params()
             .into_iter()
             .map(|(str, _to_sql)| str.to_string())
             .collect();
         self.update_params.lock().unwrap().push((
-            wallet.to_string(),
-            amount,
-            (
-                config.select_sql(),
-                config.update_sql().to_string(),
-                config.table(),
-                owned_params,
-            ),
+            config.select_sql(),
+            config.update_sql().to_string(),
+            config.table(),
+            owned_params,
         ));
         if let Some(conn_wrapp_pointer) = self.connection_wrapper_as_pointer_to_compare {
             assert_eq!(conn_wrapp_pointer, addr_of!(*conn.left().unwrap()))
@@ -222,7 +225,7 @@ impl InsertUpdateCore for InsertUpdateCoreMock {
         self.update_results.borrow_mut().remove(0)
     }
 
-    fn insert_or_update(
+    fn upsert(
         &self,
         conn: &dyn ConnectionWrapper,
         wallet: &str,
@@ -231,6 +234,7 @@ impl InsertUpdateCore for InsertUpdateCoreMock {
     ) -> Result<(), String> {
         let owned_params: Vec<String> = config
             .params
+            .all_rusqlite_params()
             .into_iter()
             .map(|(str, _to_sql)| str.to_string())
             .collect();
@@ -254,7 +258,7 @@ impl InsertUpdateCore for InsertUpdateCoreMock {
 impl InsertUpdateCoreMock {
     pub fn update_params(
         mut self,
-        params: &Arc<Mutex<Vec<(String, i128, (String, String, String, Vec<String>))>>>,
+        params: &Arc<Mutex<Vec<(String, String, String, Vec<String>)>>>,
     ) -> Self {
         self.update_params = params.clone();
         self

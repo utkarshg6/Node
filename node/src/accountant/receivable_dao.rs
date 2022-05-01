@@ -2,13 +2,12 @@
 use crate::accountant::dao_shared_methods::{
     insert_or_update_receivable, reverse_sign, update_receivable, InsertUpdateCore,
 };
-use crate::accountant::receivable_dao::ReceivableError::RusqliteError;
 use crate::accountant::u128_to_signed;
 use crate::accountant::{u64_to_signed, AccountantError, PaymentCurves, SignConversionError};
 use crate::blockchain::blockchain_interface::Transaction;
 use crate::database::connection_wrapper::ConnectionWrapper;
 use crate::database::dao_utils;
-use crate::database::dao_utils::{now_time_t, to_time_t, DaoFactoryReal};
+use crate::database::dao_utils::{to_time_t, DaoFactoryReal};
 use crate::db_config::config_dao::{ConfigDaoWrite, ConfigDaoWriteableReal};
 use crate::db_config::persistent_configuration::PersistentConfigError;
 use crate::sub_lib::logger::Logger;
@@ -18,7 +17,7 @@ use masq_lib::utils::WrapResult;
 use rusqlite::named_params;
 use rusqlite::types::{ToSql, Type};
 use rusqlite::{OptionalExtension, Row};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 #[derive(Debug, PartialEq)]
 pub enum ReceivableError {
@@ -459,7 +458,6 @@ mod tests {
     use crate::database::connection_wrapper::ConnectionWrapperReal;
     use crate::database::dao_utils::{from_time_t, now_time_t, to_time_t};
     use crate::database::db_initializer;
-    use crate::database::db_initializer::test_utils::ConnectionWrapperMock;
     use crate::database::db_initializer::DbInitializer;
     use crate::database::db_initializer::DbInitializerReal;
     use crate::db_config::config_dao::ConfigDaoReal;
@@ -467,11 +465,9 @@ mod tests {
         PersistentConfigError, PersistentConfiguration, PersistentConfigurationReal,
     };
     use crate::test_utils::assert_contains;
-    use crate::test_utils::logging;
-    use crate::test_utils::logging::TestLogHandler;
     use crate::test_utils::make_wallet;
     use masq_lib::test_utils::utils::{ensure_node_home_directory_exists, TEST_DEFAULT_CHAIN};
-    use rusqlite::{Connection, Error, OpenFlags};
+    use rusqlite::{Connection, OpenFlags};
 
     #[test]
     fn conversion_from_pce_works() {

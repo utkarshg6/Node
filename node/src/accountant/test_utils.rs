@@ -24,6 +24,7 @@ use ethereum_types::H256;
 use itertools::Either;
 use rusqlite::{Error, Transaction as RusqliteTransaction};
 use std::cell::RefCell;
+use std::fmt::Display;
 use std::ptr::addr_of;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -188,8 +189,8 @@ impl PayableDaoMock {
 pub struct InsertUpdateCoreMock {
     update_params: Arc<Mutex<Vec<(String, String, String, Vec<String>)>>>, //trait-object-like params tested specially
     update_results: RefCell<Vec<Result<(), String>>>,
-    insert_or_update_params: Arc<Mutex<Vec<(String, String, Table, Vec<String>)>>>, //I have to skip the sql params which cannot be handled in a test economically
-    insert_or_update_results: RefCell<Vec<Result<(), String>>>,
+    upsert_params: Arc<Mutex<Vec<(String, String, Table, Vec<(String, String)>)>>>,
+    upsert_results: RefCell<Vec<Result<(), String>>>,
     connection_wrapper_as_pointer_to_compare: Option<*const dyn ConnectionWrapper>,
 }
 
@@ -230,22 +231,22 @@ impl InsertUpdateCore for InsertUpdateCoreMock {
         conn: &dyn ConnectionWrapper,
         config: InsertUpdateConfig,
     ) -> Result<(), String> {
-        let owned_params: Vec<String> = config
+        let owned_params: Vec<(String, String)> = config
             .params
-            .all_rusqlite_params()
-            .into_iter()
-            .map(|(str, _to_sql)| str.to_string())
+            .params()
+            .iter()
+            .map(|(str, to_sql)| (str.to_string(), (to_sql as &dyn Display).to_string()))
             .collect();
-        self.insert_or_update_params.lock().unwrap().push((
+        self.upsert_params.lock().unwrap().push((
             config.update_sql.to_string(),
             config.insert_sql.to_string(),
-            config.table,
+            config.params.table(),
             owned_params,
         ));
         if let Some(conn_wrapp_pointer) = self.connection_wrapper_as_pointer_to_compare {
             assert_eq!(conn_wrapp_pointer, addr_of!(*conn))
         }
-        self.insert_or_update_results.borrow_mut().remove(0)
+        self.upsert_results.borrow_mut().remove(0)
     }
 }
 
@@ -263,16 +264,16 @@ impl InsertUpdateCoreMock {
         self
     }
 
-    pub fn insert_or_update_params(
+    pub fn upsert_params(
         mut self,
-        params: &Arc<Mutex<Vec<(String, String, Table, Vec<String>)>>>,
+        params: &Arc<Mutex<Vec<(String, String, Table, Vec<(String, String)>)>>>,
     ) -> Self {
-        self.insert_or_update_params = params.clone();
+        self.upsert_params = params.clone();
         self
     }
 
-    pub fn insert_or_update_results(self, result: Result<(), String>) -> Self {
-        self.insert_or_update_results.borrow_mut().push(result);
+    pub fn upsert_results(self, result: Result<(), String>) -> Self {
+        self.upsert_results.borrow_mut().push(result);
         self
     }
 }

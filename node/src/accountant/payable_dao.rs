@@ -1,8 +1,8 @@
 // Copyright (c) 2019, MASQ (https://masq.ai) and/or its affiliates. All rights reserved.
 
 use crate::accountant::dao_shared_methods::{
-    insert_or_update_payable, insert_or_update_payable_for_our_payment, reverse_sign,
-    InsertUpdateCore, InsertUpdateCoreReal,
+    reverse_sign, upsert_payable_on_confirmation, upsert_payable_on_new_accrual, InsertUpdateCore,
+    InsertUpdateCoreReal,
 };
 use crate::accountant::{
     u128_to_signed, u64_to_signed, AccountantError, PayableError, SignConversionError,
@@ -120,7 +120,7 @@ impl PayableDao for PayableDaoReal {
         }
         let amount_signed = u128_to_signed(amount)
             .map_err(|e| more_money_payable_err(e.into_payable(), wallet, amount))?;
-        match insert_or_update_payable(
+        match upsert_payable_on_new_accrual(
             self.conn.as_ref(),
             insert_update_core,
             &wallet.to_string(),
@@ -146,7 +146,7 @@ impl PayableDao for PayableDaoReal {
             .map_err(|e| payment_sent_err(e.into_payable(), payment))?;
         let reversed = reverse_sign(amount_signed)
             .expect("should be within the correct range after the previous operation");
-        match insert_or_update_payable_for_our_payment(
+        match upsert_payable_on_confirmation(
             self.conn.as_ref(),
             insert_update_core,
             &payment.to.to_string(),
@@ -460,8 +460,8 @@ mod tests {
         let wallet = make_wallet("booga");
         let conn = ConnectionWrapperMock::default();
         let subject = PayableDaoReal::new(Box::new(conn));
-        let insert_update_core = InsertUpdateCoreMock::default()
-            .insert_or_update_results(Err("SQL crashed".to_string()));
+        let insert_update_core =
+            InsertUpdateCoreMock::default().upsert_results(Err("SQL crashed".to_string()));
 
         let result = subject.more_money_payable(&wallet, 4565, &insert_update_core);
 
@@ -550,8 +550,8 @@ mod tests {
         let wallet = make_wallet("booga");
         let conn = ConnectionWrapperMock::default();
         let subject = PayableDaoReal::new(Box::new(conn));
-        let insert_update_core = InsertUpdateCoreMock::default()
-            .insert_or_update_results(Err("SQL crashed".to_string()));
+        let insert_update_core =
+            InsertUpdateCoreMock::default().upsert_results(Err("SQL crashed".to_string()));
         let payment = Payment::new(wallet, 12345, H256::from_uint(&U256::from(1)));
 
         let result = subject.payment_sent(&payment, &insert_update_core);

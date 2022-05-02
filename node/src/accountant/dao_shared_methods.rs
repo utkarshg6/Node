@@ -8,6 +8,7 @@ use masq_lib::utils::ExpectValue;
 use rusqlite::types::Value;
 use rusqlite::ErrorCode::ConstraintViolation;
 use rusqlite::{Error, Statement, ToSql, Transaction};
+use simple_server::Handler;
 use std::any::Any;
 use std::fmt::{Display, Formatter};
 use web3::types::Res;
@@ -16,8 +17,6 @@ pub struct InsertUpdateConfig<'a> {
     pub insert_sql: &'a str,
     pub update_sql: &'a str,
     pub params: ExtendedParams<'a>,
-    //TODO use phantom data for the table type?
-    pub table: Table,
 }
 
 pub struct InsertConfig<'a> {
@@ -29,10 +28,9 @@ pub struct InsertConfig<'a> {
 pub struct UpdateConfig<'a> {
     pub update_sql: &'a str,
     pub params: ExtendedParams<'a>,
-    pub table: Table,
 }
 
-#[derive(PartialEq, Debug, Clone)]
+#[derive(PartialEq, Debug, Clone, Copy)]
 pub enum Table {
     Payable,
     Receivable,
@@ -52,30 +50,29 @@ pub trait ExtendedParamsMarker: ToSql + Display {
         intentionally_blank!()
     }
 }
-
-impl ExtendedParamsMarker for i64 {
-    fn countable_as_any(&self) -> &dyn Any {
-        todo!()
-    }
-}
 impl ExtendedParamsMarker for i128 {
     fn countable_as_any(&self) -> &dyn Any {
         self
     }
 }
+impl ExtendedParamsMarker for i64 {}
 impl ExtendedParamsMarker for &str {}
 
 pub struct ExtendedParams<'a> {
     params: Vec<(&'a str, &'a dyn ExtendedParamsMarker)>,
+    table: Table,
 }
 
 impl<'a> ExtendedParams<'a> {
-    pub fn new(params: Vec<(&'a str, &'a (dyn ExtendedParamsMarker + 'a))>) -> Self {
-        Self { params }
+    pub fn new(table: Table, params: Vec<(&'a str, &'a (dyn ExtendedParamsMarker + 'a))>) -> Self {
+        Self { params, table }
+    }
+    pub fn params(&self) -> &Vec<(&'a str, &'a (dyn ExtendedParamsMarker + 'a))> {
+        &self.params
     }
 
-    fn params(&self) -> &Vec<(&'a str, &'a (dyn ExtendedParamsMarker + 'a))> {
-        &self.params
+    pub fn table(&self) -> Table {
+        self.table
     }
 
     pub fn all_rusqlite_params(&'a self) -> Vec<(&'a str, &'a dyn ToSql)> {
@@ -179,7 +176,7 @@ impl InsertUpdateCore for InsertUpdateCoreReal {
                 let (wallet, amount) = Self::fetch_fundamentals(params)?;
                 Err(format!(
                 "Updating balance after invalid insertion for {} of {} Wei to {}; failing on: '{}'",
-                config.table, amount, wallet, e
+                config.params.table, amount, wallet, e
             ))
             }
         }
@@ -197,20 +194,17 @@ impl<'a> FetchValue<'a> for ExtendedParamsVec<'a> {
     fn fetch_balance_change(&'a self) -> Result<i128, String> {
         match self
             .iter()
-            .find(|(param_name, param_val)| *param_name == ":balance")
+            .find(|(param_name, _)| *param_name == ":balance")
         {
-            Some((_, val)) => Ok(*val.countable_as_any().downcast_ref().expect_v("i128")),
-            None => todo!(),
+            Some((_, value)) => Ok(*value.countable_as_any().downcast_ref().expect_v("i128")),
+            None => Err("Missing parameter and value for the change in balance".to_string()),
         }
     }
 
     fn fetch_wallet(&'a self) -> Result<(String), String> {
-        match self
-            .iter()
-            .find(|(param_name, param_val)| *param_name == ":wallet")
-        {
-            Some((_, val)) => Ok((val.to_string())),
-            None => todo!(),
+        match self.iter().find(|(param_name, _)| *param_name == ":wallet") {
+            Some((_, value)) => Ok((value.to_string())),
+            None => Err("Missing parameter and value for the wallet address".to_string()),
         }
     }
 }
@@ -269,11 +263,11 @@ pub trait UpdateConfiguration<'a> {
 
 impl<'a> UpdateConfiguration<'a> for InsertUpdateConfig<'a> {
     fn table(&self) -> String {
-        self.table.to_string()
+        self.params.table.to_string()
     }
 
     fn select_sql(&self) -> String {
-        select_statement(&self.table)
+        select_statement(&self.params.table)
     }
 
     fn update_sql(&self) -> &'a str {
@@ -287,11 +281,11 @@ impl<'a> UpdateConfiguration<'a> for InsertUpdateConfig<'a> {
 
 impl<'a> UpdateConfiguration<'a> for UpdateConfig<'a> {
     fn table(&self) -> String {
-        self.table.to_string()
+        self.params.table.to_string()
     }
 
     fn select_sql(&self) -> String {
-        select_statement(&self.table)
+        select_statement(&self.params.table)
     }
 
     fn update_sql(&self) -> &'a str {
@@ -320,15 +314,20 @@ pub fn update_receivable(
 ) -> Result<(), AccountantError> {
     let config = UpdateConfig {
         update_sql: "update receivable set balance = :updated_balance, last_received_timestamp = :last_received where wallet_address = :wallet",
-        params: ExtendedParams::new(vec![(":wallet", &wallet), (":balance", &amount), (":last_received", &last_received_time_stamp)]), //is later recomputed into :updated_balance
-        table: Table::Receivable
+        params: ExtendedParams::new(
+            Table::Receivable,
+            vec![
+                (":wallet", &wallet),
+                (":balance", &amount), //:balance is later recomputed into :updated_balance
+                (":last_received", &last_received_time_stamp),
+            ])
     };
     core.update(Either::Right(transaction), &config)
         .map_err(receivable_rusqlite_error)
 }
 
 //insert_update
-pub fn insert_or_update_receivable(
+pub fn upsert_receivable(
     conn: &dyn ConnectionWrapper,
     core: &dyn InsertUpdateCore,
     wallet: &str,
@@ -337,13 +336,17 @@ pub fn insert_or_update_receivable(
     let config = InsertUpdateConfig{
         insert_sql: "insert into receivable (wallet_address, balance, last_received_timestamp) values (:wallet,:balance,strftime('%s','now'))",
         update_sql: "update receivable set balance = :updated_balance where wallet_address = :wallet",
-        params: ExtendedParams::new(vec![(":wallet", &wallet), (":balance", &amount)]),
-        table: Table::Receivable
+        params: ExtendedParams::new(
+        Table::Receivable,
+        vec![
+            (":wallet", &wallet),
+            (":balance", &amount)
+        ])
     };
     core.upsert(conn, config).map_err(receivable_rusqlite_error)
 }
 
-pub fn insert_or_update_payable(
+pub fn upsert_payable_on_new_accrual(
     conn: &dyn ConnectionWrapper,
     core: &dyn InsertUpdateCore,
     wallet: &str,
@@ -352,13 +355,19 @@ pub fn insert_or_update_payable(
     let config = InsertUpdateConfig{
         insert_sql: "insert into payable (wallet_address, balance, last_paid_timestamp, pending_payment_transaction) values (:wallet,:balance,strftime('%s','now'),null)",
         update_sql: "update payable set balance = :updated_balance where wallet_address = :wallet",
-        params: ExtendedParams::new(vec![(":wallet", &wallet), (":balance", &amount)]),
-        table: Table::Payable
+        params: ExtendedParams::new(
+            Table::Payable,
+            vec![
+                (":wallet", &wallet),
+                (":balance", &amount)
+            ])
     };
     core.upsert(conn, config).map_err(payable_rusqlite_error)
 }
+
+//TODO this function may not need to be insert update but simply update
 //TODO name change
-pub fn insert_or_update_payable_for_our_payment(
+pub fn upsert_payable_on_confirmation(
     conn: &dyn ConnectionWrapper,
     core: &dyn InsertUpdateCore,
     wallet: &str,
@@ -369,8 +378,14 @@ pub fn insert_or_update_payable_for_our_payment(
     let config = InsertUpdateConfig{
         insert_sql: "insert into payable (balance, last_paid_timestamp, pending_payment_transaction, wallet_address) values (:balance, :last_paid, :transaction, :wallet)",
         update_sql: "update payable set balance = :updated_balance, last_paid_timestamp = :last_paid, pending_payment_transaction = :transaction where wallet_address = :wallet",
-        params: ExtendedParams::new(vec![(":wallet", &wallet), (":balance", &amount), (":last_paid", &last_paid_timestamp), (":transaction", &transaction_hash)]),
-        table: Table::Payable
+        params: ExtendedParams::new(
+            Table::Payable,
+            vec![
+                (":wallet", &wallet),
+                (":balance", &amount),
+                (":last_paid", &last_paid_timestamp),
+                (":transaction", &transaction_hash),
+            ])
     };
     core.upsert(conn, config).map_err(payable_rusqlite_error)
 }
@@ -392,10 +407,10 @@ pub fn reverse_sign(amount: i128) -> Result<i128, SignConversionError> {
 #[cfg(test)]
 mod tests {
     use crate::accountant::dao_shared_methods::{
-        insert_or_update_payable, insert_or_update_payable_for_our_payment,
-        insert_or_update_receivable, reverse_sign, update_receivable, ExtendedParams,
-        ExtendedParamsMarker, ExtendedParamsVec, FetchValue, InsertUpdateConfig, InsertUpdateCore,
-        InsertUpdateCoreReal, Table, UpdateConfig, UpdateConfiguration,
+        reverse_sign, update_receivable, upsert_payable_on_confirmation,
+        upsert_payable_on_new_accrual, upsert_receivable, ExtendedParams, ExtendedParamsMarker,
+        ExtendedParamsVec, FetchValue, InsertUpdateConfig, InsertUpdateCore, InsertUpdateCoreReal,
+        Table, UpdateConfig, UpdateConfiguration,
     };
     use crate::accountant::receivable_dao::ReceivableError;
     use crate::accountant::test_utils::InsertUpdateCoreMock;
@@ -422,16 +437,25 @@ mod tests {
         vec
     }
 
+    fn convert_to_all_string_values(str_args: Vec<(&str, &str)>) -> Vec<(String, String)> {
+        str_args
+            .into_iter()
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect()
+    }
+
     #[test]
     fn finalize_update_params_for_update_config_works() {
         let subject = UpdateConfig {
             update_sql: "blah",
-            params: ExtendedParams::new(vec![
-                (":something", &152_i64),
-                (":balance", &5555_i128),
-                (":something_else", &"foooo"),
-            ]),
-            table: Table::Payable,
+            params: ExtendedParams::new(
+                Table::Payable,
+                vec![
+                    (":something", &152_i64),
+                    (":balance", &5555_i128),
+                    (":something_else", &"foooo"),
+                ],
+            ),
         };
 
         finalize_update_params_assertion(&subject)
@@ -442,12 +466,14 @@ mod tests {
         let subject = InsertUpdateConfig {
             insert_sql: "blah1",
             update_sql: "blah2",
-            params: ExtendedParams::new(vec![
-                (":something", &152_i64),
-                (":balance", &5555_i128),
-                (":something_else", &"foooo"),
-            ]),
-            table: Table::Payable,
+            params: ExtendedParams::new(
+                Table::Payable,
+                vec![
+                    (":something", &152_i64),
+                    (":balance", &5555_i128),
+                    (":something_else", &"foooo"),
+                ],
+            ),
         };
 
         finalize_update_params_assertion(&subject)
@@ -475,13 +501,16 @@ mod tests {
     fn fetch_balance_change_works_for_err() {
         fetch_param_assertion(
             &|subject| subject.fetch_balance_change(),
-            String::from("baakaaj"),
+            String::from("Missing parameter and value for the change in balance"),
         );
     }
 
     #[test]
     fn fetch_wallet_works_for_err() {
-        fetch_param_assertion(&|subject| subject.fetch_wallet(), String::from("baakaaj"));
+        fetch_param_assertion(
+            &|subject| subject.fetch_wallet(),
+            String::from("Missing parameter and value for the wallet address"),
+        );
     }
 
     fn fetch_param_assertion<T>(
@@ -490,7 +519,7 @@ mod tests {
     ) {
         let subject = &some_meaningless_params();
 
-        let result = subject.fetch_wallet();
+        let result = act(subject);
 
         let result = match result {
             Ok(_) => panic!("we expected Err but got Ok"),
@@ -591,12 +620,7 @@ mod tests {
         }
         let amount_wei = i128::MAX;
 
-        let result = insert_or_update_receivable(
-            conn_ref,
-            &InsertUpdateCoreReal,
-            wallet_address,
-            amount_wei,
-        );
+        let result = upsert_receivable(conn_ref, &InsertUpdateCoreReal, wallet_address, amount_wei);
 
         assert_eq!(result, Ok(()));
         let (balance, last_timestamp) = read_row_receivable(conn_ref, wallet_address).unwrap();
@@ -622,12 +646,7 @@ mod tests {
         }
         let amount_wei = -125_125;
 
-        let result = insert_or_update_receivable(
-            conn_ref,
-            &InsertUpdateCoreReal,
-            wallet_address,
-            amount_wei,
-        );
+        let result = upsert_receivable(conn_ref, &InsertUpdateCoreReal, wallet_address, amount_wei);
 
         assert_eq!(result, Ok(()));
         let (balance, last_timestamp) = read_row_receivable(conn_ref, wallet_address).unwrap();
@@ -652,12 +671,7 @@ mod tests {
         assert_eq!(last_time_stamp, 100);
         let amount_wei = i128::MAX - 100;
 
-        let result = insert_or_update_receivable(
-            conn_ref,
-            &InsertUpdateCoreReal,
-            wallet_address,
-            amount_wei,
-        );
+        let result = upsert_receivable(conn_ref, &InsertUpdateCoreReal, wallet_address, amount_wei);
 
         assert_eq!(result, Ok(()));
         let (balance, last_timestamp) = read_row_receivable(conn_ref, wallet_address).unwrap();
@@ -682,12 +696,7 @@ mod tests {
         assert_eq!(last_time_stamp, 100);
         let amount_wei = -123_100;
 
-        let result = insert_or_update_receivable(
-            conn_ref,
-            &InsertUpdateCoreReal,
-            wallet_address,
-            amount_wei,
-        );
+        let result = upsert_receivable(conn_ref, &InsertUpdateCoreReal, wallet_address, amount_wei);
 
         assert_eq!(result, Ok(()));
         let (balance, last_timestamp) = read_row_receivable(conn_ref, wallet_address).unwrap();
@@ -713,8 +722,12 @@ mod tests {
         }
         let amount_wei = i128::MAX;
 
-        let result =
-            insert_or_update_payable(conn_ref, &InsertUpdateCoreReal, wallet_address, amount_wei);
+        let result = upsert_payable_on_new_accrual(
+            conn_ref,
+            &InsertUpdateCoreReal,
+            wallet_address,
+            amount_wei,
+        );
 
         assert_eq!(result, Ok(()));
         let (balance, last_timestamp, pending_transaction_hash) =
@@ -742,8 +755,12 @@ mod tests {
         }
         let amount_wei = -1_245_999;
 
-        let result =
-            insert_or_update_payable(conn_ref, &InsertUpdateCoreReal, wallet_address, amount_wei);
+        let result = upsert_payable_on_new_accrual(
+            conn_ref,
+            &InsertUpdateCoreReal,
+            wallet_address,
+            amount_wei,
+        );
 
         assert_eq!(result, Ok(()));
         let (balance, last_timestamp, pending_transaction_hash) =
@@ -775,8 +792,12 @@ mod tests {
         assert_eq!(pending_transaction_hash, Some("abc".to_string()));
         let amount_wei = i128::MAX - 100;
 
-        let result =
-            insert_or_update_payable(conn_ref, &InsertUpdateCoreReal, wallet_address, amount_wei);
+        let result = upsert_payable_on_new_accrual(
+            conn_ref,
+            &InsertUpdateCoreReal,
+            wallet_address,
+            amount_wei,
+        );
 
         assert_eq!(result, Ok(()));
         let (balance, last_timestamp, pending_transaction_hash) =
@@ -808,8 +829,12 @@ mod tests {
         assert_eq!(pending_transaction_hash, Some("abc".to_string()));
         let amount_wei = -90_333;
 
-        let result =
-            insert_or_update_payable(conn_ref, &InsertUpdateCoreReal, wallet_address, amount_wei);
+        let result = upsert_payable_on_new_accrual(
+            conn_ref,
+            &InsertUpdateCoreReal,
+            wallet_address,
+            amount_wei,
+        );
 
         assert_eq!(result, Ok(()));
         let (balance, last_timestamp, pending_transaction_hash) =
@@ -839,7 +864,7 @@ mod tests {
         let last_paid_timestamp = 10_000_000;
         let transaction_hash = "ce5456ed";
 
-        let result = insert_or_update_payable_for_our_payment(
+        let result = upsert_payable_on_confirmation(
             conn_ref,
             &InsertUpdateCoreReal,
             wallet_address,
@@ -876,7 +901,7 @@ mod tests {
         let last_paid_timestamp = 890_000_000;
         let transaction_hash = "ce5456ed";
 
-        let result = insert_or_update_payable_for_our_payment(
+        let result = upsert_payable_on_confirmation(
             conn_ref,
             &InsertUpdateCoreReal,
             wallet_address,
@@ -917,7 +942,7 @@ mod tests {
         let last_paid_timestamp = 5_000;
         let transaction_hash = "ed78acc54";
 
-        let result = insert_or_update_payable_for_our_payment(
+        let result = upsert_payable_on_confirmation(
             conn_ref,
             &InsertUpdateCoreReal,
             wallet_address,
@@ -958,7 +983,7 @@ mod tests {
         let last_paid_timestamp = 5_000;
         let transaction_hash = "ed78acc54";
 
-        let result = insert_or_update_payable_for_our_payment(
+        let result = upsert_payable_on_confirmation(
             conn_ref,
             &InsertUpdateCoreReal,
             wallet_address,
@@ -1027,10 +1052,10 @@ mod tests {
         create_broken_receivable(&wrapped_conn);
         let supplied_amount_wei = 100;
         let insert_update_core = InsertUpdateCoreMock::default()
-            .insert_or_update_params(&insert_or_update_params_arc)
-            .insert_or_update_results(Err("SomethingWrong".to_string()));
+            .upsert_params(&insert_or_update_params_arc)
+            .upsert_results(Err("SomethingWrong".to_string()));
 
-        let result = insert_or_update_receivable(
+        let result = upsert_receivable(
             &wrapped_conn,
             &insert_update_core,
             wallet_address,
@@ -1046,8 +1071,6 @@ mod tests {
         let mut insert_or_update_params = insert_or_update_params_arc.lock().unwrap();
         let (update_sql, insert_sql, table, sql_param_names) = insert_or_update_params.remove(0);
         assert!(insert_or_update_params.is_empty());
-        assert_eq!(wallet, wallet_address);
-        assert_eq!(amount, supplied_amount_wei);
         assert_eq!(
             update_sql,
             "update receivable set balance = :updated_balance where wallet_address = :wallet"
@@ -1056,7 +1079,10 @@ mod tests {
         assert_eq!(table, Table::Receivable);
         assert_eq!(
             sql_param_names,
-            [":wallet", ":balance"].array_of_borrows_to_vec()
+            convert_to_all_string_values(vec![
+                (":wallet", wallet_address),
+                (":balance", &supplied_amount_wei.to_string())
+            ])
         )
     }
 
@@ -1069,10 +1095,10 @@ mod tests {
         create_broken_payable(&wrapped_conn);
         let supplied_amount_wei = 100;
         let insert_update_core = InsertUpdateCoreMock::default()
-            .insert_or_update_params(&insert_or_update_params_arc)
-            .insert_or_update_results(Err("SomethingWrong".to_string()));
+            .upsert_params(&insert_or_update_params_arc)
+            .upsert_results(Err("SomethingWrong".to_string()));
 
-        let result = insert_or_update_payable(
+        let result = upsert_payable_on_new_accrual(
             &wrapped_conn,
             &insert_update_core,
             wallet_address,
@@ -1088,8 +1114,6 @@ mod tests {
         let mut insert_or_update_params = insert_or_update_params_arc.lock().unwrap();
         let (update_sql, insert_sql, table, sql_param_names) = insert_or_update_params.remove(0);
         assert!(insert_or_update_params.is_empty());
-        assert_eq!(wallet, wallet_address);
-        assert_eq!(amount, supplied_amount_wei);
         assert_eq!(
             update_sql,
             "update payable set balance = :updated_balance where wallet_address = :wallet"
@@ -1098,7 +1122,10 @@ mod tests {
         assert_eq!(table, Table::Payable);
         assert_eq!(
             sql_param_names,
-            [":wallet", ":balance"].array_of_borrows_to_vec()
+            convert_to_all_string_values(vec![
+                (":wallet", wallet_address),
+                (":balance", &supplied_amount_wei.to_string())
+            ])
         )
     }
 
@@ -1113,10 +1140,10 @@ mod tests {
         let last_received_time_stamp_sec = 123;
         let tx_hash = "ab45cab45";
         let insert_update_core = InsertUpdateCoreMock::default()
-            .insert_or_update_params(&insert_or_update_params_arc)
-            .insert_or_update_results(Err("SomethingWrong".to_string()));
+            .upsert_params(&insert_or_update_params_arc)
+            .upsert_results(Err("SomethingWrong".to_string()));
 
-        let result = insert_or_update_payable_for_our_payment(
+        let result = upsert_payable_on_confirmation(
             &wrapped_conn,
             &insert_update_core,
             wallet_address,
@@ -1134,14 +1161,17 @@ mod tests {
         let mut insert_or_update_params = insert_or_update_params_arc.lock().unwrap();
         let (update_sql, insert_sql, table, sql_param_names) = insert_or_update_params.remove(0);
         assert!(insert_or_update_params.is_empty());
-        assert_eq!(wallet, wallet_address);
-        assert_eq!(amount, supplied_amount_wei);
         assert_eq!(update_sql,"update payable set balance = :updated_balance, last_paid_timestamp = :last_paid, pending_payment_transaction = :transaction where wallet_address = :wallet");
         assert_eq!(insert_sql,"insert into payable (balance, last_paid_timestamp, pending_payment_transaction, wallet_address) values (:balance, :last_paid, :transaction, :wallet)");
         assert_eq!(table, Table::Payable);
         assert_eq!(
             sql_param_names,
-            [":wallet", ":balance", ":last_paid", ":transaction"].array_of_borrows_to_vec()
+            convert_to_all_string_values(vec![
+                (":wallet", wallet_address),
+                (":balance", &supplied_amount_wei.to_string()),
+                (":last_paid", &last_received_time_stamp_sec.to_string()),
+                (":transaction", tx_hash)
+            ])
         )
     }
 
@@ -1151,12 +1181,14 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let wrapped_conn = ConnectionWrapperReal::new(conn);
         create_broken_payable(&wrapped_conn);
-        let amount_wei = 100;
+        let amount_wei = 100_i128;
         let update_config = InsertUpdateConfig {
             insert_sql: "",
             update_sql: "",
-            params: ExtendedParams::new(vec![]),
-            table: Table::Payable,
+            params: ExtendedParams::new(
+                Table::Payable,
+                vec![(":wallet", &wallet_address), (":balance", &amount_wei)],
+            ),
         };
 
         let result = InsertUpdateCoreReal.update(Either::Left(&wrapped_conn), &update_config);
@@ -1179,12 +1211,11 @@ mod tests {
             conn_ref,
             wallet_address,
         );
-        let amount_wei = 100;
+        let amount_wei = 100_i128;
         let last_received_time_stamp_sec = 123_i64;
         let update_config = UpdateConfig {
             update_sql: "update receivable set balance = :updated_balance, last_received_timestamp = :last_received where wallet_address = :wallet",
-            params: ExtendedParams::new(vec![(":wallet", &wallet_address), (":last_received", &last_received_time_stamp_sec)]),
-            table: Table::Payable
+            params: ExtendedParams::new(Table::Payable,vec![(":wallet", &wallet_address), (":balance",&amount_wei), (":last_received", &last_received_time_stamp_sec)]),
         };
 
         let result = InsertUpdateCoreReal.update(Either::Left(conn_ref), &update_config);
@@ -1205,12 +1236,11 @@ mod tests {
         let conn_ref = conn.as_ref();
         let mut stm = conn_ref.prepare("insert into payable (wallet_address, balance, last_paid_timestamp, pending_payment_transaction) values (?,?,strftime('%s','now'),null)").unwrap();
         stm.execute(params![wallet_address, 45245_i128]).unwrap();
-        let amount_wei = 100;
+        let amount_wei = 100_i128;
         let last_received_time_stamp_sec = 123_i64;
         let update_config = UpdateConfig {
             update_sql: "update receivable set balance = ?, last_received_timestamp = ? where wallet_address = ?",
-            params: ExtendedParams::new(vec![(":woodstock", &wallet_address), (":hendrix", &last_received_time_stamp_sec)]),
-            table: Table::Payable
+            params: ExtendedParams::new(Table::Payable,vec![(":woodstock", &wallet_address), (":hendrix", &last_received_time_stamp_sec),(":wallet",&wallet_address),(":balance",&amount_wei)]),
         };
 
         let result = InsertUpdateCoreReal.update(Either::Left(conn_ref), &update_config);

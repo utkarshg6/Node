@@ -1,6 +1,6 @@
 // Copyright (c) 2019, MASQ (https://masq.ai) and/or its affiliates. All rights reserved.
 use crate::accountant::dao_shared_methods::{
-    insert_or_update_receivable, reverse_sign, update_receivable, InsertUpdateCore,
+    reverse_sign, update_receivable, upsert_receivable, InsertUpdateCore,
 };
 use crate::accountant::u128_to_signed;
 use crate::accountant::{u64_to_signed, AccountantError, PaymentCurves, SignConversionError};
@@ -98,7 +98,7 @@ impl ReceivableDao for ReceivableDaoReal {
         &self,
         wallet: &Wallet,
         amount: u128,
-        insert_update_core: &dyn InsertUpdateCore,
+        tool_core: &dyn InsertUpdateCore,
     ) -> Result<(), AccountantError> {
         let signed_amount = u128_to_signed(amount).map_err(|e| {
             e.into_receivable().extend(&format!(
@@ -106,9 +106,9 @@ impl ReceivableDao for ReceivableDaoReal {
                 wallet, amount
             ))
         })?;
-        match insert_or_update_receivable(
+        match upsert_receivable(
             self.conn.as_ref(),
-            insert_update_core,
+            tool_core,
             &wallet.to_string(),
             signed_amount,
         ) {
@@ -120,9 +120,9 @@ impl ReceivableDao for ReceivableDaoReal {
     fn more_money_received(
         &mut self,
         payments: &[Transaction],
-        insert_update_core: &dyn InsertUpdateCore,
+        tool_core: &dyn InsertUpdateCore,
     ) -> Result<(), AccountantError> {
-        self.try_multi_insert_payment(payments, insert_update_core)
+        self.try_multi_insert_payment(payments, tool_core)
     }
 
     fn single_account_status(&self, wallet: &Wallet) -> Option<ReceivableAccount> {
@@ -510,10 +510,6 @@ mod tests {
 
     #[test]
     fn try_multi_insert_payment_handles_error_setting_start_block() {
-        let home_dir = ensure_node_home_directory_exists(
-            "receivable_dao",
-            "try_multi_insert_payment_handles_error_setting_start_block",
-        );
         let conn = Connection::open_in_memory().unwrap();
         let conn_wrapped = ConnectionWrapperReal::new(conn);
         let mut subject = ReceivableDaoReal::new(Box::new(conn_wrapped));
@@ -879,7 +875,7 @@ rows'; couldn't update an account calling try_multi_insert_payment()".to_string(
         subject.create_temporary_table_with_metadata_for_yet_unbanned(&pcs, SystemTime::now());
 
         let now = now_time_t();
-        let mut captured = capture_rows(subject.conn.as_ref(), "delinquency_metadata");
+        let captured = capture_rows(subject.conn.as_ref(), "delinquency_metadata");
         let expected_point_height_for_unbanned_1 =
             ReceivableDaoReal::delinquency_curve_height_detection(
                 &pcs,

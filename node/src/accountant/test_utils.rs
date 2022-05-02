@@ -188,7 +188,7 @@ impl PayableDaoMock {
 pub struct InsertUpdateCoreMock {
     update_params: Arc<Mutex<Vec<(String, String, String, Vec<String>)>>>, //trait-object-like params tested specially
     update_results: RefCell<Vec<Result<(), String>>>,
-    insert_or_update_params: Arc<Mutex<Vec<(String, i128, (String, String, Table, Vec<String>))>>>, //I have to skip the sql params which cannot be handled in a test economically
+    insert_or_update_params: Arc<Mutex<Vec<(String, String, Table, Vec<String>)>>>, //I have to skip the sql params which cannot be handled in a test economically
     insert_or_update_results: RefCell<Vec<Result<(), String>>>,
     connection_wrapper_as_pointer_to_compare: Option<*const dyn ConnectionWrapper>,
 }
@@ -228,8 +228,6 @@ impl InsertUpdateCore for InsertUpdateCoreMock {
     fn upsert(
         &self,
         conn: &dyn ConnectionWrapper,
-        wallet: &str,
-        amount: i128,
         config: InsertUpdateConfig,
     ) -> Result<(), String> {
         let owned_params: Vec<String> = config
@@ -239,14 +237,10 @@ impl InsertUpdateCore for InsertUpdateCoreMock {
             .map(|(str, _to_sql)| str.to_string())
             .collect();
         self.insert_or_update_params.lock().unwrap().push((
-            wallet.to_string(),
-            amount,
-            (
-                config.update_sql.to_string(),
-                config.insert_sql.to_string(),
-                config.table,
-                owned_params,
-            ),
+            config.update_sql.to_string(),
+            config.insert_sql.to_string(),
+            config.table,
+            owned_params,
         ));
         if let Some(conn_wrapp_pointer) = self.connection_wrapper_as_pointer_to_compare {
             assert_eq!(conn_wrapp_pointer, addr_of!(*conn))
@@ -271,7 +265,7 @@ impl InsertUpdateCoreMock {
 
     pub fn insert_or_update_params(
         mut self,
-        params: &Arc<Mutex<Vec<(String, i128, (String, String, Table, Vec<String>))>>>,
+        params: &Arc<Mutex<Vec<(String, String, Table, Vec<String>)>>>,
     ) -> Self {
         self.insert_or_update_params = params.clone();
         self

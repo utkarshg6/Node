@@ -1,3 +1,4 @@
+use std::any::TypeId;
 // Copyright (c) 2019, MASQ (https://masq.ai) and/or its affiliates. All rights reserved.
 use crate::bootstrapper::BootstrapperConfig;
 use crate::neighborhood::gossip::GossipNodeRecord;
@@ -292,21 +293,26 @@ pub fn make_node_descriptor(ip_addr: IpAddr) -> NodeDescriptor {
     }
 }
 
-pub fn make_node_and_recipient() -> (IpAddr, NodeDescriptor, Recipient<NodeToUiMessage>) {
-    let ip_addr = make_ip(u8::MAX);
+pub fn make_node(nonce: u8) -> (IpAddr, NodeDescriptor) {
+    let ip_addr = make_ip(nonce);
     let node_descriptor = make_node_descriptor(ip_addr);
-    let (node_to_ui_recipient, _) = make_node_to_ui_recipient();
 
-    (ip_addr, node_descriptor, node_to_ui_recipient)
+    (ip_addr, node_descriptor)
 }
 
-pub fn make_recipient_and_recording_arc<M: 'static>() -> (Recipient<M>, Arc<Mutex<Recording>>)
+pub fn make_recipient_and_recording_arc<M: 'static>(
+    stopping_message: Option<TypeId>,
+) -> (Recipient<M>, Arc<Mutex<Recording>>)
 where
     M: Message + Send,
     <M as Message>::Result: Send,
     Recorder: Handler<M>,
 {
     let (recorder, _, recording_arc) = make_recorder();
+    let recorder = match stopping_message {
+        Some(type_id) => recorder.stop_condition(type_id), // No need to write stop message after this
+        None => recorder,
+    };
     let addr = recorder.start();
     let recipient = addr.recipient::<M>();
 
@@ -314,9 +320,9 @@ where
 }
 
 pub fn make_cpm_recipient() -> (Recipient<ConnectionProgressMessage>, Arc<Mutex<Recording>>) {
-    make_recipient_and_recording_arc()
+    make_recipient_and_recording_arc(None)
 }
 
 pub fn make_node_to_ui_recipient() -> (Recipient<NodeToUiMessage>, Arc<Mutex<Recording>>) {
-    make_recipient_and_recording_arc()
+    make_recipient_and_recording_arc(None)
 }

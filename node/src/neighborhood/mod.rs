@@ -259,16 +259,29 @@ impl Handler<ConnectionProgressMessage> for Neighborhood {
     type Result = ();
 
     fn handle(&mut self, msg: ConnectionProgressMessage, ctx: &mut Self::Context) -> Self::Result {
-        self.overall_connection_status.update_connection_stage(
-            msg.peer_addr,
-            msg.event.clone(),
-            self.node_to_ui_recipient_opt
-                .as_ref()
-                .expect("UI Gateway is unbound"),
-        );
-
-        if msg.event == ConnectionProgressEvent::TcpConnectionSuccessful {
-            self.send_ask_about_debut_gossip_message(ctx, msg.peer_addr);
+        if let Ok(connection_progress) = self
+            .overall_connection_status
+            .get_connection_progress_by_ip(msg.peer_addr)
+        {
+            OverallConnectionStatus::update_connection_stage(
+                connection_progress,
+                msg.event.clone(),
+            );
+            match msg.event {
+                ConnectionProgressEvent::TcpConnectionSuccessful => {
+                    self.send_ask_about_debut_gossip_message(ctx, msg.peer_addr);
+                }
+                ConnectionProgressEvent::IntroductionGossipReceived(_)
+                | ConnectionProgressEvent::StandardGossipReceived => {
+                    self.overall_connection_status
+                        .update_ocs_stage_and_send_message_to_ui(
+                            self.node_to_ui_recipient_opt
+                                .as_ref()
+                                .expect("UI Gateway is unbound"),
+                        );
+                }
+                _ => (),
+            }
         }
     }
 }
@@ -281,19 +294,17 @@ impl Handler<AskAboutDebutGossipMessage> for Neighborhood {
         msg: AskAboutDebutGossipMessage,
         _ctx: &mut Self::Context,
     ) -> Self::Result {
-        let new_connection_progress = self
+        if let Ok(current_connection_progress) = self
             .overall_connection_status
-            .get_connection_progress_by_desc(&msg.prev_connection_progress.initial_node_descriptor);
-
-        if msg.prev_connection_progress == *new_connection_progress {
-            // No change, hence no response was received
-            self.overall_connection_status.update_connection_stage(
-                msg.prev_connection_progress.current_peer_addr,
-                ConnectionProgressEvent::NoGossipResponseReceived,
-                self.node_to_ui_recipient_opt
-                    .as_ref()
-                    .expect("UI Gateway is unbound"),
-            );
+            .get_connection_progress_by_desc(&msg.prev_connection_progress.initial_node_descriptor)
+        {
+            if msg.prev_connection_progress == *current_connection_progress {
+                // No change, hence no response was received
+                OverallConnectionStatus::update_connection_stage(
+                    current_connection_progress,
+                    ConnectionProgressEvent::NoGossipResponseReceived,
+                );
+            }
         }
     }
 }
@@ -1171,7 +1182,9 @@ impl Neighborhood {
             prev_connection_progress: self
                 .overall_connection_status
                 .get_connection_progress_by_ip(current_peer_addr)
+                .unwrap()
                 .clone(),
+            // TODO: Do Something with the error - "Cannot send AskAboutDebutGossipMessage for peer with IP Address: {}"
         };
         self.tools.notify_later_ask_about_gossip.notify_later(
             message,
@@ -1331,6 +1344,7 @@ pub fn regenerate_signed_gossip(
 
 #[cfg(test)]
 mod tests {
+    use std::any::TypeId;
     use std::cell::RefCell;
     use std::convert::TryInto;
     use std::net::{IpAddr, SocketAddr};
@@ -1343,14 +1357,16 @@ mod tests {
     use actix::Recipient;
     use actix::System;
     use itertools::Itertools;
+
     use serde_cbor;
     use std::time::Duration;
     use tokio::prelude::Future;
 
     use masq_lib::constants::{DEFAULT_CHAIN, TLS_PORT};
+    use masq_lib::messages::{ToMessageBody, UiConnectionChangeBroadcast, UiConnectionChangeStage};
     use masq_lib::test_utils::utils::{ensure_node_home_directory_exists, TEST_DEFAULT_CHAIN};
-    use masq_lib::ui_gateway::MessageBody;
     use masq_lib::ui_gateway::MessagePath::Conversation;
+    use masq_lib::ui_gateway::{MessageBody, MessageTarget};
     use masq_lib::utils::running_test;
 
     use crate::db_config::persistent_configuration::PersistentConfigError;
@@ -1374,8 +1390,9 @@ mod tests {
     use crate::test_utils::make_meaningless_route;
     use crate::test_utils::make_wallet;
     use crate::test_utils::neighborhood_test_utils::{
-        db_from_node, make_global_cryptde_node_record, make_node_descriptor, make_node_record,
-        make_node_record_f, make_node_to_ui_recipient, neighborhood_from_nodes,
+        db_from_node, make_global_cryptde_node_record, make_ip, make_node, make_node_descriptor,
+        make_node_record, make_node_record_f, make_node_to_ui_recipient,
+        make_recipient_and_recording_arc, neighborhood_from_nodes,
     };
     use crate::test_utils::persistent_configuration_mock::PersistentConfigurationMock;
     use crate::test_utils::rate_pack;
@@ -1393,7 +1410,9 @@ mod tests {
     use crate::neighborhood::overall_connection_status::ConnectionStageErrors::{
         NoGossipResponseReceived, PassLoopFound, TcpConnectionFailed,
     };
-    use crate::neighborhood::overall_connection_status::{ConnectionProgress, ConnectionStage};
+    use crate::neighborhood::overall_connection_status::{
+        ConnectionProgress, ConnectionStage, OverallConnectionStage,
+    };
     use masq_lib::test_utils::logging::{init_test_logging, TestLogHandler};
 
     impl Handler<AssertionsMessage<Neighborhood>> for Neighborhood {
@@ -1635,10 +1654,37 @@ mod tests {
     }
 
     #[test]
+    pub fn neighborhood_doesn_t_do_anything_if_it_receives_a_cpm_with_an_unknown_peer_addr() {
+        let known_peer = make_ip(1);
+        let unknown_peer = make_ip(2);
+        let node_descriptor = make_node_descriptor(known_peer);
+        let subject = make_subject_from_node_descriptor(
+            &node_descriptor,
+            "neighborhood_doesn_t_do_anything_if_it_receives_a_cpm_with_an_unknown_peer_addr",
+        );
+        let initial_ocs = subject.overall_connection_status.clone();
+        let addr = subject.start();
+        let cpm_recipient = addr.clone().recipient::<ConnectionProgressMessage>();
+        let system = System::new("testing");
+        let cpm = ConnectionProgressMessage {
+            peer_addr: unknown_peer,
+            event: ConnectionProgressEvent::TcpConnectionSuccessful,
+        };
+
+        cpm_recipient.try_send(cpm).unwrap();
+
+        let assertions = Box::new(move |actor: &mut Neighborhood| {
+            assert_eq!(actor.overall_connection_status, initial_ocs);
+        });
+        addr.try_send(AssertionsMessage { assertions }).unwrap();
+        System::current().stop();
+        assert_eq!(system.run(), 0);
+    }
+
+    #[test]
     pub fn neighborhood_handles_connection_progress_message_with_tcp_connection_established() {
         init_test_logging();
-        let node_ip_addr = IpAddr::from_str("5.4.3.2").unwrap();
-        let node_descriptor = make_node_descriptor(node_ip_addr);
+        let (node_ip_addr, node_descriptor) = make_node(1);
         let mut subject = make_subject_from_node_descriptor(
             &node_descriptor,
             "neighborhood_handles_connection_progress_message_with_tcp_connection_established",
@@ -1667,8 +1713,12 @@ mod tests {
 
         let assertions = Box::new(move |actor: &mut Neighborhood| {
             assert_eq!(
-                actor.overall_connection_status.progress,
-                vec![beginning_connection_progress_clone]
+                actor.overall_connection_status,
+                OverallConnectionStatus {
+                    can_make_routes: false,
+                    stage: OverallConnectionStage::NotConnected,
+                    progress: vec![beginning_connection_progress_clone]
+                }
             );
         });
         addr.try_send(AssertionsMessage { assertions }).unwrap();
@@ -1690,16 +1740,21 @@ mod tests {
     #[test]
     fn ask_about_debut_gossip_message_handles_timeout_in_case_no_response_is_received() {
         init_test_logging();
-        let node_ip_addr = IpAddr::from_str("5.4.3.2").unwrap();
-        let node_descriptor = make_node_descriptor(node_ip_addr);
+        let (node_ip_addr, node_descriptor) = make_node(1);
         let mut subject = make_subject_from_node_descriptor(
             &node_descriptor,
             "ask_about_debut_gossip_message_handles_timeout_in_case_no_response_is_received",
         );
-        subject.overall_connection_status.update_connection_stage(
-            node_ip_addr,
+        let (node_to_ui_recipient, node_to_ui_recording_arc) =
+            make_recipient_and_recording_arc(Some(TypeId::of::<NodeToUiMessage>()));
+        subject.node_to_ui_recipient_opt = Some(node_to_ui_recipient);
+        let connection_progress_to_modify = subject
+            .overall_connection_status
+            .get_connection_progress_by_ip(node_ip_addr)
+            .unwrap();
+        OverallConnectionStatus::update_connection_stage(
+            connection_progress_to_modify,
             ConnectionProgressEvent::TcpConnectionSuccessful,
-            subject.node_to_ui_recipient_opt.as_ref().unwrap(),
         );
         let beginning_connection_progress = ConnectionProgress {
             initial_node_descriptor: node_descriptor.clone(),
@@ -1717,13 +1772,48 @@ mod tests {
 
         let assertions = Box::new(move |actor: &mut Neighborhood| {
             assert_eq!(
-                actor.overall_connection_status.progress,
-                vec![ConnectionProgress {
-                    initial_node_descriptor: node_descriptor,
-                    current_peer_addr: node_ip_addr,
-                    connection_stage: ConnectionStage::Failed(NoGossipResponseReceived),
-                }]
+                actor.overall_connection_status,
+                OverallConnectionStatus {
+                    can_make_routes: false,
+                    stage: OverallConnectionStage::NotConnected,
+                    progress: vec![ConnectionProgress {
+                        initial_node_descriptor: node_descriptor,
+                        current_peer_addr: node_ip_addr,
+                        connection_stage: ConnectionStage::Failed(NoGossipResponseReceived),
+                    }]
+                }
             );
+        });
+        addr.try_send(AssertionsMessage { assertions }).unwrap();
+        System::current().stop();
+        let node_to_ui_mutex = node_to_ui_recording_arc.lock().unwrap();
+        let node_to_ui_message_opt = node_to_ui_mutex.get_record_opt::<NodeToUiMessage>(0);
+        assert_eq!(system.run(), 0);
+        assert_eq!(node_to_ui_message_opt, None);
+    }
+
+    #[test]
+    pub fn it_doesn_t_cause_a_panic_if_neighborhood_receives_ask_about_debut_message_from_unknown_descriptor(
+    ) {
+        let (_known_ip, known_desc) = make_node(1);
+        let (unknown_ip, unknown_desc) = make_node(2);
+        let subject = make_subject_from_node_descriptor(&known_desc, "it_doesn_t_cause_a_panic_if_neighborhood_receives_ask_about_debut_message_from_unknown_descriptor");
+        let initial_ocs = subject.overall_connection_status.clone();
+        let addr = subject.start();
+        let recipient: Recipient<AskAboutDebutGossipMessage> = addr.clone().recipient();
+        let aadgrm = AskAboutDebutGossipMessage {
+            prev_connection_progress: ConnectionProgress {
+                initial_node_descriptor: unknown_desc.clone(),
+                current_peer_addr: unknown_ip,
+                connection_stage: ConnectionStage::TcpConnectionEstablished,
+            },
+        };
+        let system = System::new("testing");
+
+        recipient.try_send(aadgrm).unwrap();
+
+        let assertions = Box::new(move |actor: &mut Neighborhood| {
+            assert_eq!(actor.overall_connection_status, initial_ocs);
         });
         addr.try_send(AssertionsMessage { assertions }).unwrap();
         System::current().stop();
@@ -1733,12 +1823,13 @@ mod tests {
     #[test]
     pub fn neighborhood_handles_connection_progress_message_with_tcp_connection_failed() {
         init_test_logging();
-        let node_ip_addr = IpAddr::from_str("5.4.3.2").unwrap();
-        let node_descriptor = make_node_descriptor(node_ip_addr);
-        let subject = make_subject_from_node_descriptor(
+        let (node_ip_addr, node_descriptor) = make_node(1);
+        let mut subject = make_subject_from_node_descriptor(
             &node_descriptor,
             "neighborhood_handles_connection_progress_message_with_tcp_connection_failed",
         );
+        let (node_to_ui_recipient, node_to_ui_recording_arc) = make_node_to_ui_recipient();
+        subject.node_to_ui_recipient_opt = Some(node_to_ui_recipient);
         let addr = subject.start();
         let cpm_recipient = addr.clone().recipient();
         let system = System::new("testing");
@@ -1751,37 +1842,46 @@ mod tests {
 
         let assertions = Box::new(move |actor: &mut Neighborhood| {
             assert_eq!(
-                actor.overall_connection_status.progress,
-                vec![ConnectionProgress {
-                    initial_node_descriptor: node_descriptor.clone(),
-                    current_peer_addr: node_ip_addr,
-                    connection_stage: ConnectionStage::Failed(TcpConnectionFailed)
-                }]
+                actor.overall_connection_status,
+                OverallConnectionStatus {
+                    can_make_routes: false,
+                    stage: OverallConnectionStage::NotConnected,
+                    progress: vec![ConnectionProgress {
+                        initial_node_descriptor: node_descriptor.clone(),
+                        current_peer_addr: node_ip_addr,
+                        connection_stage: ConnectionStage::Failed(TcpConnectionFailed)
+                    }]
+                }
             );
         });
         addr.try_send(AssertionsMessage { assertions }).unwrap();
         System::current().stop();
+        let node_to_ui_mutex = node_to_ui_recording_arc.lock().unwrap();
+        let node_to_ui_message_opt = node_to_ui_mutex.get_record_opt::<NodeToUiMessage>(0);
         assert_eq!(system.run(), 0);
+        assert_eq!(node_to_ui_message_opt, None);
     }
 
     #[test]
     fn neighborhood_handles_a_connection_progress_message_with_pass_gossip_received() {
         init_test_logging();
-        let node_ip_addr = IpAddr::from_str("5.4.3.2").unwrap();
-        let node_descriptor = make_node_descriptor(node_ip_addr);
+        let (node_ip_addr, node_descriptor) = make_node(1);
         let mut subject = make_subject_from_node_descriptor(
             &node_descriptor,
             "neighborhood_handles_a_connection_progress_message_with_pass_gossip_received",
         );
-        subject.overall_connection_status.update_connection_stage(
-            node_ip_addr,
+        let connection_progress_to_modify = subject
+            .overall_connection_status
+            .get_connection_progress_by_ip(node_ip_addr)
+            .unwrap();
+        OverallConnectionStatus::update_connection_stage(
+            connection_progress_to_modify,
             ConnectionProgressEvent::TcpConnectionSuccessful,
-            subject.node_to_ui_recipient_opt.as_ref().unwrap(),
         );
         let addr = subject.start();
         let cpm_recipient = addr.clone().recipient();
         let system = System::new("testing");
-        let new_pass_target = IpAddr::from_str("10.20.30.40").unwrap();
+        let new_pass_target = make_ip(2);
         let connection_progress_message = ConnectionProgressMessage {
             peer_addr: node_ip_addr,
             event: ConnectionProgressEvent::PassGossipReceived(new_pass_target),
@@ -1791,12 +1891,16 @@ mod tests {
 
         let assertions = Box::new(move |actor: &mut Neighborhood| {
             assert_eq!(
-                actor.overall_connection_status.progress,
-                vec![ConnectionProgress {
-                    initial_node_descriptor: node_descriptor.clone(),
-                    current_peer_addr: new_pass_target,
-                    connection_stage: ConnectionStage::StageZero
-                }]
+                actor.overall_connection_status,
+                OverallConnectionStatus {
+                    can_make_routes: false,
+                    stage: OverallConnectionStage::NotConnected,
+                    progress: vec![ConnectionProgress {
+                        initial_node_descriptor: node_descriptor.clone(),
+                        current_peer_addr: new_pass_target,
+                        connection_stage: ConnectionStage::StageZero
+                    }]
+                }
             );
         });
         addr.try_send(AssertionsMessage { assertions }).unwrap();
@@ -1807,16 +1911,18 @@ mod tests {
     #[test]
     fn neighborhood_handles_a_connection_progress_message_with_pass_loop_found() {
         init_test_logging();
-        let node_ip_addr = IpAddr::from_str("5.4.3.2").unwrap();
-        let node_descriptor = make_node_descriptor(node_ip_addr);
+        let (node_ip_addr, node_descriptor) = make_node(1);
         let mut subject = make_subject_from_node_descriptor(
             &node_descriptor,
             "neighborhood_handles_a_connection_progress_message_with_pass_loop_found",
         );
-        subject.overall_connection_status.update_connection_stage(
-            node_ip_addr,
+        let connection_progress_to_modify = subject
+            .overall_connection_status
+            .get_connection_progress_by_ip(node_ip_addr)
+            .unwrap();
+        OverallConnectionStatus::update_connection_stage(
+            connection_progress_to_modify,
             ConnectionProgressEvent::TcpConnectionSuccessful,
-            subject.node_to_ui_recipient_opt.as_ref().unwrap(),
         );
         let addr = subject.start();
         let cpm_recipient = addr.clone().recipient();
@@ -1830,12 +1936,16 @@ mod tests {
 
         let assertions = Box::new(move |actor: &mut Neighborhood| {
             assert_eq!(
-                actor.overall_connection_status.progress,
-                vec![ConnectionProgress {
-                    initial_node_descriptor: node_descriptor.clone(),
-                    current_peer_addr: node_ip_addr,
-                    connection_stage: ConnectionStage::Failed(PassLoopFound)
-                }]
+                actor.overall_connection_status,
+                OverallConnectionStatus {
+                    can_make_routes: false,
+                    stage: OverallConnectionStage::NotConnected,
+                    progress: vec![ConnectionProgress {
+                        initial_node_descriptor: node_descriptor.clone(),
+                        current_peer_addr: node_ip_addr,
+                        connection_stage: ConnectionStage::Failed(PassLoopFound)
+                    }]
+                }
             );
         });
         addr.try_send(AssertionsMessage { assertions }).unwrap();
@@ -1846,56 +1956,81 @@ mod tests {
     #[test]
     fn neighborhood_handles_a_connection_progress_message_with_introduction_gossip_received() {
         init_test_logging();
-        let node_ip_addr = IpAddr::from_str("5.4.3.2").unwrap();
-        let node_descriptor = make_node_descriptor(node_ip_addr);
+        let (node_ip_addr, node_descriptor) = make_node(1);
         let mut subject = make_subject_from_node_descriptor(
             &node_descriptor,
             "neighborhood_handles_a_connection_progress_message_with_introduction_gossip_received",
         );
-        subject.overall_connection_status.update_connection_stage(
-            node_ip_addr,
+        let (node_to_ui_recipient, node_to_ui_recording_arc) =
+            make_recipient_and_recording_arc(Some(TypeId::of::<NodeToUiMessage>()));
+        subject.node_to_ui_recipient_opt = Some(node_to_ui_recipient);
+        let connection_progress_to_modify = subject
+            .overall_connection_status
+            .get_connection_progress_by_ip(node_ip_addr)
+            .unwrap();
+        OverallConnectionStatus::update_connection_stage(
+            connection_progress_to_modify,
             ConnectionProgressEvent::TcpConnectionSuccessful,
-            subject.node_to_ui_recipient_opt.as_ref().unwrap(),
         );
         let addr = subject.start();
         let cpm_recipient = addr.clone().recipient();
         let system = System::new("testing");
-        let new_node = IpAddr::from_str("10.20.30.40").unwrap();
         let connection_progress_message = ConnectionProgressMessage {
             peer_addr: node_ip_addr,
-            event: ConnectionProgressEvent::IntroductionGossipReceived(new_node),
+            event: ConnectionProgressEvent::IntroductionGossipReceived(make_ip(2)),
         };
 
         cpm_recipient.try_send(connection_progress_message).unwrap();
 
         let assertions = Box::new(move |actor: &mut Neighborhood| {
             assert_eq!(
-                actor.overall_connection_status.progress,
-                vec![ConnectionProgress {
-                    initial_node_descriptor: node_descriptor.clone(),
-                    current_peer_addr: node_ip_addr,
-                    connection_stage: ConnectionStage::NeighborshipEstablished
-                }]
+                actor.overall_connection_status,
+                OverallConnectionStatus {
+                    can_make_routes: false,
+                    stage: OverallConnectionStage::ConnectedToNeighbor,
+                    progress: vec![ConnectionProgress {
+                        initial_node_descriptor: node_descriptor.clone(),
+                        current_peer_addr: node_ip_addr,
+                        connection_stage: ConnectionStage::NeighborshipEstablished
+                    }]
+                }
             );
         });
         addr.try_send(AssertionsMessage { assertions }).unwrap();
-        System::current().stop();
         assert_eq!(system.run(), 0);
+        let node_to_ui_mutex = node_to_ui_recording_arc.lock().unwrap();
+        let node_to_ui_message_opt = node_to_ui_mutex.get_record_opt::<NodeToUiMessage>(0);
+        assert_eq!(node_to_ui_mutex.len(), 1);
+        assert_eq!(
+            node_to_ui_message_opt,
+            Some(&NodeToUiMessage {
+                target: MessageTarget::AllClients,
+                body: UiConnectionChangeBroadcast {
+                    stage: UiConnectionChangeStage::ConnectedToNeighbor
+                }
+                .tmb(0)
+            })
+        );
     }
 
     #[test]
     fn neighborhood_handles_a_connection_progress_message_with_standard_gossip_received() {
         init_test_logging();
-        let node_ip_addr = IpAddr::from_str("5.4.3.2").unwrap();
-        let node_descriptor = make_node_descriptor(node_ip_addr);
+        let (node_ip_addr, node_descriptor) = make_node(1);
         let mut subject = make_subject_from_node_descriptor(
             &node_descriptor,
             "neighborhood_handles_a_connection_progress_message_with_standard_gossip_received",
         );
-        subject.overall_connection_status.update_connection_stage(
-            node_ip_addr,
+        let (node_to_ui_recipient, node_to_ui_recording_arc) =
+            make_recipient_and_recording_arc(Some(TypeId::of::<NodeToUiMessage>()));
+        subject.node_to_ui_recipient_opt = Some(node_to_ui_recipient);
+        let connection_progress_to_modify = subject
+            .overall_connection_status
+            .get_connection_progress_by_ip(node_ip_addr)
+            .unwrap();
+        OverallConnectionStatus::update_connection_stage(
+            connection_progress_to_modify,
             ConnectionProgressEvent::TcpConnectionSuccessful,
-            subject.node_to_ui_recipient_opt.as_ref().unwrap(),
         );
         let addr = subject.start();
         let cpm_recipient = addr.clone().recipient();
@@ -1909,32 +2044,50 @@ mod tests {
 
         let assertions = Box::new(move |actor: &mut Neighborhood| {
             assert_eq!(
-                actor.overall_connection_status.progress,
-                vec![ConnectionProgress {
-                    initial_node_descriptor: node_descriptor.clone(),
-                    current_peer_addr: node_ip_addr,
-                    connection_stage: ConnectionStage::NeighborshipEstablished
-                }]
+                actor.overall_connection_status,
+                OverallConnectionStatus {
+                    can_make_routes: false,
+                    stage: OverallConnectionStage::ConnectedToNeighbor,
+                    progress: vec![ConnectionProgress {
+                        initial_node_descriptor: node_descriptor.clone(),
+                        current_peer_addr: node_ip_addr,
+                        connection_stage: ConnectionStage::NeighborshipEstablished
+                    }]
+                }
             );
         });
         addr.try_send(AssertionsMessage { assertions }).unwrap();
-        System::current().stop();
         assert_eq!(system.run(), 0);
+        let node_to_ui_mutex = node_to_ui_recording_arc.lock().unwrap();
+        let node_to_ui_message_opt = node_to_ui_mutex.get_record_opt::<NodeToUiMessage>(0);
+        assert_eq!(node_to_ui_mutex.len(), 1);
+        assert_eq!(
+            node_to_ui_message_opt,
+            Some(&NodeToUiMessage {
+                target: MessageTarget::AllClients,
+                body: UiConnectionChangeBroadcast {
+                    stage: UiConnectionChangeStage::ConnectedToNeighbor
+                }
+                .tmb(0)
+            })
+        );
     }
 
     #[test]
     fn neighborhood_handles_a_connection_progress_message_with_no_gossip_response_received() {
         init_test_logging();
-        let node_ip_addr = IpAddr::from_str("5.4.3.2").unwrap();
-        let node_descriptor = make_node_descriptor(node_ip_addr);
+        let (node_ip_addr, node_descriptor) = make_node(1);
         let mut subject = make_subject_from_node_descriptor(
             &node_descriptor,
             "neighborhood_handles_a_connection_progress_message_with_no_gossip_response_received",
         );
-        subject.overall_connection_status.update_connection_stage(
-            node_ip_addr,
+        let connection_progress_to_modify = subject
+            .overall_connection_status
+            .get_connection_progress_by_ip(node_ip_addr)
+            .unwrap();
+        OverallConnectionStatus::update_connection_stage(
+            connection_progress_to_modify,
             ConnectionProgressEvent::TcpConnectionSuccessful,
-            subject.node_to_ui_recipient_opt.as_ref().unwrap(),
         );
         let addr = subject.start();
         let cpm_recipient = addr.clone().recipient();
@@ -1948,12 +2101,81 @@ mod tests {
 
         let assertions = Box::new(move |actor: &mut Neighborhood| {
             assert_eq!(
-                actor.overall_connection_status.progress,
-                vec![ConnectionProgress {
-                    initial_node_descriptor: node_descriptor.clone(),
-                    current_peer_addr: node_ip_addr,
-                    connection_stage: ConnectionStage::Failed(NoGossipResponseReceived)
-                }]
+                actor.overall_connection_status,
+                OverallConnectionStatus {
+                    can_make_routes: false,
+                    stage: OverallConnectionStage::NotConnected,
+                    progress: vec![ConnectionProgress {
+                        initial_node_descriptor: node_descriptor.clone(),
+                        current_peer_addr: node_ip_addr,
+                        connection_stage: ConnectionStage::Failed(NoGossipResponseReceived)
+                    }]
+                }
+            );
+        });
+        addr.try_send(AssertionsMessage { assertions }).unwrap();
+        System::current().stop();
+        assert_eq!(system.run(), 0);
+    }
+
+    #[test]
+    pub fn progress_in_the_stage_of_overall_connection_status_made_by_one_cpm_is_not_overriden_by_the_other(
+    ) {
+        init_test_logging();
+        let peer_1 = make_ip(1);
+        let peer_2 = make_ip(2);
+        let initial_node_descriptors =
+            vec![make_node_descriptor(peer_1), make_node_descriptor(peer_2)];
+        let neighborhood_config = NeighborhoodConfig {
+            mode: NeighborhoodMode::Standard(
+                NodeAddr::new(&make_ip(3), &[1234]),
+                initial_node_descriptors,
+                rate_pack(100),
+            ),
+        };
+        let mut subject = Neighborhood::new(
+            main_cryptde(),
+            &bc_from_nc_plus(
+                neighborhood_config,
+                make_wallet("earning"),
+                None,
+                "progress_in_the_stage_of_overall_connection_status_made_by_one_cpm_is_not_overriden_by_the_other"),
+        );
+        let (node_to_ui_recipient, _) = make_node_to_ui_recipient();
+        subject.node_to_ui_recipient_opt = Some(node_to_ui_recipient);
+        let addr = subject.start();
+        let cpm_recipient = addr.clone().recipient();
+        let system = System::new("testing");
+        cpm_recipient
+            .try_send(ConnectionProgressMessage {
+                peer_addr: peer_1,
+                event: ConnectionProgressEvent::TcpConnectionSuccessful,
+            })
+            .unwrap();
+        cpm_recipient
+            .try_send(ConnectionProgressMessage {
+                peer_addr: peer_1,
+                event: ConnectionProgressEvent::IntroductionGossipReceived(make_ip(4)),
+            })
+            .unwrap();
+        cpm_recipient
+            .try_send(ConnectionProgressMessage {
+                peer_addr: peer_2,
+                event: ConnectionProgressEvent::TcpConnectionSuccessful,
+            })
+            .unwrap();
+
+        cpm_recipient
+            .try_send(ConnectionProgressMessage {
+                peer_addr: peer_2,
+                event: ConnectionProgressEvent::PassGossipReceived(make_ip(5)),
+            })
+            .unwrap();
+
+        let assertions = Box::new(move |actor: &mut Neighborhood| {
+            assert_eq!(
+                actor.overall_connection_status.stage(),
+                OverallConnectionStage::ConnectedToNeighbor
             );
         });
         addr.try_send(AssertionsMessage { assertions }).unwrap();

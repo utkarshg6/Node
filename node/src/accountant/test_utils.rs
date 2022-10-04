@@ -11,7 +11,10 @@ use crate::accountant::pending_payable_dao::{
 use crate::accountant::receivable_dao::{
     ReceivableAccount, ReceivableDao, ReceivableDaoError, ReceivableDaoFactory,
 };
-use crate::accountant::{Accountant, PendingPayableId};
+use crate::accountant::scanners::scanners::{
+    PayableScanner, PendingPayableScanner, ReceivableScanner,
+};
+use crate::accountant::{Accountant, PendingPayableId, DEFAULT_PENDING_TOO_LONG_SEC};
 use crate::banned_dao::{BannedDao, BannedDaoFactory};
 use crate::blockchain::blockchain_bridge::PendingPayableFingerprint;
 use crate::blockchain::blockchain_interface::BlockchainTransaction;
@@ -20,10 +23,11 @@ use crate::database::dao_utils;
 use crate::database::dao_utils::{from_time_t, to_time_t};
 use crate::db_config::config_dao::{ConfigDao, ConfigDaoFactory};
 use crate::db_config::mocks::ConfigDaoMock;
-use crate::sub_lib::accountant::{AccountantConfig, MessageIdGenerator, PaymentThresholds};
+use crate::sub_lib::accountant::FinancialStatistics;
+use crate::sub_lib::accountant::{MessageIdGenerator, PaymentThresholds};
 use crate::sub_lib::wallet::Wallet;
 use crate::test_utils::make_wallet;
-use crate::test_utils::unshared_test_utils::make_populated_accountant_config_with_defaults;
+use crate::test_utils::unshared_test_utils::make_bc_with_defaults;
 use actix::System;
 use ethereum_types::{BigEndianHash, H256, U256};
 use rusqlite::{Connection, Error, OptionalExtension};
@@ -70,10 +74,10 @@ pub fn make_payable_account_with_recipient_and_balance_and_timestamp_opt(
 
 pub struct AccountantBuilder {
     config: Option<BootstrapperConfig>,
-    payable_dao_factory: Option<Box<dyn PayableDaoFactory>>,
-    receivable_dao_factory: Option<Box<dyn ReceivableDaoFactory>>,
-    pending_payable_dao_factory: Option<Box<dyn PendingPayableDaoFactory>>,
-    banned_dao_factory: Option<Box<dyn BannedDaoFactory>>,
+    payable_dao_factory: Option<PayableDaoFactoryMock>,
+    receivable_dao_factory: Option<ReceivableDaoFactoryMock>,
+    pending_payable_dao_factory: Option<PendingPayableDaoFactoryMock>,
+    banned_dao_factory: Option<BannedDaoFactoryMock>,
     config_dao_factory: Option<Box<dyn ConfigDaoFactory>>,
 }
 
@@ -97,24 +101,55 @@ impl AccountantBuilder {
     }
 
     pub fn payable_dao(mut self, payable_dao: PayableDaoMock) -> Self {
-        self.payable_dao_factory = Some(Box::new(PayableDaoFactoryMock::new(payable_dao)));
+        match self.payable_dao_factory {
+            None => {
+                self.payable_dao_factory =
+                    Some(PayableDaoFactoryMock::new().make_result(payable_dao))
+            }
+            Some(payable_dao_factory) => {
+                self.payable_dao_factory = Some(payable_dao_factory.make_result(payable_dao))
+            }
+        }
         self
     }
 
     pub fn receivable_dao(mut self, receivable_dao: ReceivableDaoMock) -> Self {
-        self.receivable_dao_factory = Some(Box::new(ReceivableDaoFactoryMock::new(receivable_dao)));
+        match self.receivable_dao_factory {
+            None => {
+                self.receivable_dao_factory =
+                    Some(ReceivableDaoFactoryMock::new().make_result(receivable_dao))
+            }
+            Some(receivable_dao_factory) => {
+                self.receivable_dao_factory =
+                    Some(receivable_dao_factory.make_result(receivable_dao))
+            }
+        }
         self
     }
 
     pub fn pending_payable_dao(mut self, pending_payable_dao: PendingPayableDaoMock) -> Self {
-        self.pending_payable_dao_factory = Some(Box::new(PendingPayableDaoFactoryMock::new(
-            pending_payable_dao,
-        )));
+        match self.pending_payable_dao_factory {
+            None => {
+                self.pending_payable_dao_factory =
+                    Some(PendingPayableDaoFactoryMock::new().make_result(pending_payable_dao))
+            }
+            Some(pending_payable_dao_factory) => {
+                self.pending_payable_dao_factory =
+                    Some(pending_payable_dao_factory.make_result(pending_payable_dao))
+            }
+        }
         self
     }
 
     pub fn banned_dao(mut self, banned_dao: BannedDaoMock) -> Self {
-        self.banned_dao_factory = Some(Box::new(BannedDaoFactoryMock::new(banned_dao)));
+        match self.banned_dao_factory {
+            None => {
+                self.banned_dao_factory = Some(BannedDaoFactoryMock::new().make_result(banned_dao))
+            }
+            Some(banned_dao_factory) => {
+                self.banned_dao_factory = Some(banned_dao_factory.make_result(banned_dao))
+            }
+        }
         self
     }
 
@@ -124,110 +159,140 @@ impl AccountantBuilder {
     }
 
     pub fn build(self) -> Accountant {
-        let config = self.config.unwrap_or({
-            let mut config = BootstrapperConfig::default();
-            config.accountant_config_opt = Some(make_populated_accountant_config_with_defaults());
-            config
-        });
-        let payable_dao_factory = self
-            .payable_dao_factory
-            .unwrap_or(Box::new(PayableDaoFactoryMock::new(PayableDaoMock::new())));
-        let receivable_dao_factory =
-            self.receivable_dao_factory
-                .unwrap_or(Box::new(ReceivableDaoFactoryMock::new(
-                    ReceivableDaoMock::new(),
-                )));
-        let pending_payable_dao_factory = self.pending_payable_dao_factory.unwrap_or(Box::new(
-            PendingPayableDaoFactoryMock::new(PendingPayableDaoMock::default()),
-        ));
+        let mut config = self.config.unwrap_or(make_bc_with_defaults());
+        let payable_dao_factory = self.payable_dao_factory.unwrap_or(
+            PayableDaoFactoryMock::new()
+                .make_result(PayableDaoMock::new())
+                .make_result(PayableDaoMock::new())
+                .make_result(PayableDaoMock::new()),
+        );
+        let receivable_dao_factory = self.receivable_dao_factory.unwrap_or(
+            ReceivableDaoFactoryMock::new()
+                .make_result(ReceivableDaoMock::new())
+                .make_result(ReceivableDaoMock::new()),
+        );
+        let pending_payable_dao_factory = self.pending_payable_dao_factory.unwrap_or(
+            PendingPayableDaoFactoryMock::new()
+                .make_result(PendingPayableDaoMock::new())
+                .make_result(PendingPayableDaoMock::new())
+                .make_result(PendingPayableDaoMock::new()),
+        );
         let banned_dao_factory = self
             .banned_dao_factory
-            .unwrap_or(Box::new(BannedDaoFactoryMock::new(BannedDaoMock::new())));
+            .unwrap_or(BannedDaoFactoryMock::new().make_result(BannedDaoMock::new()));
         let accountant = Accountant::new(
-            &config,
-            payable_dao_factory,
-            receivable_dao_factory,
-            pending_payable_dao_factory,
-            banned_dao_factory,
+            &mut config,
+            Box::new(payable_dao_factory),
+            Box::new(receivable_dao_factory),
+            Box::new(pending_payable_dao_factory),
+            Box::new(banned_dao_factory),
         );
         accountant
     }
 }
 
 pub struct PayableDaoFactoryMock {
-    called: Rc<RefCell<bool>>,
-    mock: RefCell<Vec<PayableDaoMock>>,
+    make_params: Arc<Mutex<Vec<()>>>,
+    make_results: RefCell<Vec<Box<dyn PayableDao>>>,
 }
 
 impl PayableDaoFactory for PayableDaoFactoryMock {
     fn make(&self) -> Box<dyn PayableDao> {
-        *self.called.borrow_mut() = true;
-        Box::new(self.mock.borrow_mut().remove(0))
+        if self.make_results.borrow().len() == 0 {
+            panic!(
+                "PayableDao Missing. This problem mostly occurs when PayableDao is only supplied for Accountant and not for the Scanner while building Accountant."
+            )
+        };
+        self.make_params.lock().unwrap().push(());
+        self.make_results.borrow_mut().remove(0)
     }
 }
 
 impl PayableDaoFactoryMock {
-    pub fn new(mock: PayableDaoMock) -> Self {
+    pub fn new() -> Self {
         Self {
-            called: Rc::new(RefCell::new(false)),
-            mock: RefCell::new(vec![mock]),
+            make_params: Arc::new(Mutex::new(vec![])),
+            make_results: RefCell::new(vec![]),
         }
     }
 
-    pub fn called(mut self, called: &Rc<RefCell<bool>>) -> Self {
-        self.called = called.clone();
+    pub fn make_params(mut self, params: &Arc<Mutex<Vec<()>>>) -> Self {
+        self.make_params = params.clone();
+        self
+    }
+
+    pub fn make_result(self, result: PayableDaoMock) -> Self {
+        self.make_results.borrow_mut().push(Box::new(result));
         self
     }
 }
 
 pub struct ReceivableDaoFactoryMock {
-    called: Rc<RefCell<bool>>,
-    mock: RefCell<Vec<ReceivableDaoMock>>,
+    make_params: Arc<Mutex<Vec<()>>>,
+    make_results: RefCell<Vec<Box<dyn ReceivableDao>>>,
 }
 
 impl ReceivableDaoFactory for ReceivableDaoFactoryMock {
     fn make(&self) -> Box<dyn ReceivableDao> {
-        *self.called.borrow_mut() = true;
-        Box::new(self.mock.borrow_mut().remove(0))
+        if self.make_results.borrow().len() == 0 {
+            panic!(
+                "ReceivableDao Missing. This problem mostly occurs when ReceivableDao is only supplied for Accountant and not for the Scanner while building Accountant."
+            )
+        };
+        self.make_params.lock().unwrap().push(());
+        self.make_results.borrow_mut().remove(0)
     }
 }
 
 impl ReceivableDaoFactoryMock {
-    pub fn new(mock: ReceivableDaoMock) -> Self {
+    pub fn new() -> Self {
         Self {
-            called: Rc::new(RefCell::new(false)),
-            mock: RefCell::new(vec![mock]),
+            make_params: Arc::new(Mutex::new(vec![])),
+            make_results: RefCell::new(vec![]),
         }
     }
 
-    pub fn called(mut self, called: &Rc<RefCell<bool>>) -> Self {
-        self.called = called.clone();
+    pub fn make_params(mut self, params: &Arc<Mutex<Vec<()>>>) -> Self {
+        self.make_params = params.clone();
+        self
+    }
+
+    pub fn make_result(self, result: ReceivableDaoMock) -> Self {
+        self.make_results.borrow_mut().push(Box::new(result));
         self
     }
 }
 
 pub struct BannedDaoFactoryMock {
-    called: Rc<RefCell<bool>>,
-    mock: RefCell<Option<BannedDaoMock>>,
+    make_params: Arc<Mutex<Vec<()>>>,
+    make_results: RefCell<Vec<Box<dyn BannedDao>>>,
 }
 
 impl BannedDaoFactory for BannedDaoFactoryMock {
     fn make(&self) -> Box<dyn BannedDao> {
-        *self.called.borrow_mut() = true;
-        Box::new(self.mock.borrow_mut().take().unwrap())
+        if self.make_results.borrow().len() == 0 {
+            panic!("BannedDao Missing.")
+        };
+        self.make_params.lock().unwrap().push(());
+        self.make_results.borrow_mut().remove(0)
     }
 }
 
 impl BannedDaoFactoryMock {
-    pub fn new(mock: BannedDaoMock) -> Self {
+    pub fn new() -> Self {
         Self {
-            called: Rc::new(RefCell::new(false)),
-            mock: RefCell::new(Some(mock)),
+            make_params: Arc::new(Mutex::new(vec![])),
+            make_results: RefCell::new(vec![]),
         }
     }
 
-    pub fn called(mut self, called: &Rc<RefCell<bool>>) -> Self {
-        self.called = called.clone();
+    pub fn make_params(mut self, params: &Arc<Mutex<Vec<()>>>) -> Self {
+        self.make_params = params.clone();
+        self
+    }
+
+    pub fn make_result(self, result: BannedDaoMock) -> Self {
+        self.make_results.borrow_mut().push(Box::new(result));
         self
     }
 }
@@ -638,23 +703,14 @@ impl BannedDaoMock {
     }
 }
 
-pub fn bc_from_ac_plus_earning_wallet(
-    ac: AccountantConfig,
-    earning_wallet: Wallet,
-) -> BootstrapperConfig {
-    let mut bc = BootstrapperConfig::new();
-    bc.accountant_config_opt = Some(ac);
+pub fn bc_from_earning_wallet(earning_wallet: Wallet) -> BootstrapperConfig {
+    let mut bc = make_bc_with_defaults();
     bc.earning_wallet = earning_wallet;
     bc
 }
 
-pub fn bc_from_ac_plus_wallets(
-    ac: AccountantConfig,
-    consuming_wallet: Wallet,
-    earning_wallet: Wallet,
-) -> BootstrapperConfig {
-    let mut bc = BootstrapperConfig::new();
-    bc.accountant_config_opt = Some(ac);
+pub fn bc_from_wallets(consuming_wallet: Wallet, earning_wallet: Wallet) -> BootstrapperConfig {
+    let mut bc = make_bc_with_defaults();
     bc.consuming_wallet_opt = Some(consuming_wallet);
     bc.earning_wallet = earning_wallet;
     bc
@@ -727,6 +783,10 @@ impl PendingPayableDao for PendingPayableDaoMock {
 }
 
 impl PendingPayableDaoMock {
+    pub fn new() -> Self {
+        PendingPayableDaoMock::default()
+    }
+
     pub fn fingerprint_rowid_params(mut self, params: &Arc<Mutex<Vec<H256>>>) -> Self {
         self.fingerprint_rowid_params = params.clone();
         self
@@ -794,28 +854,129 @@ impl PendingPayableDaoMock {
 }
 
 pub struct PendingPayableDaoFactoryMock {
-    called: Rc<RefCell<bool>>,
-    mock: RefCell<Vec<PendingPayableDaoMock>>,
+    make_params: Arc<Mutex<Vec<()>>>,
+    make_results: RefCell<Vec<Box<dyn PendingPayableDao>>>,
 }
 
 impl PendingPayableDaoFactory for PendingPayableDaoFactoryMock {
     fn make(&self) -> Box<dyn PendingPayableDao> {
-        *self.called.borrow_mut() = true;
-        Box::new(self.mock.borrow_mut().remove(0))
+        if self.make_results.borrow().len() == 0 {
+            panic!(
+                "PendingPayableDao Missing. This problem mostly occurs when PendingPayableDao is only supplied for Accountant and not for the Scanner while building Accountant."
+            )
+        };
+        self.make_params.lock().unwrap().push(());
+        self.make_results.borrow_mut().remove(0)
     }
 }
 
 impl PendingPayableDaoFactoryMock {
-    pub fn new(mock: PendingPayableDaoMock) -> Self {
+    pub fn new() -> Self {
         Self {
-            called: Rc::new(RefCell::new(false)),
-            mock: RefCell::new(vec![mock]),
+            make_params: Arc::new(Mutex::new(vec![])),
+            make_results: RefCell::new(vec![]),
         }
     }
 
-    pub fn called(mut self, called: &Rc<RefCell<bool>>) -> Self {
-        self.called = called.clone();
+    pub fn make_params(mut self, params: &Arc<Mutex<Vec<()>>>) -> Self {
+        self.make_params = params.clone();
         self
+    }
+
+    pub fn make_result(self, result: PendingPayableDaoMock) -> Self {
+        self.make_results.borrow_mut().push(Box::new(result));
+        self
+    }
+}
+
+impl Default for PayableScanner {
+    fn default() -> Self {
+        PayableScanner::new(
+            Box::new(PayableDaoMock::new()),
+            Box::new(PendingPayableDaoMock::new()),
+            Rc::new(PaymentThresholds::default()),
+        )
+    }
+}
+
+impl PayableScanner {
+    pub fn payable_dao(mut self, payable_dao: PayableDaoMock) -> Self {
+        self.payable_dao = Box::new(payable_dao);
+        self
+    }
+
+    pub fn pending_payable_dao(mut self, pending_payable_dao: PendingPayableDaoMock) -> Self {
+        self.pending_payable_dao = Box::new(pending_payable_dao);
+        self
+    }
+}
+
+impl Default for PendingPayableScanner {
+    fn default() -> Self {
+        PendingPayableScanner::new(
+            Box::new(PayableDaoMock::new()),
+            Box::new(PendingPayableDaoMock::new()),
+            Rc::new(PaymentThresholds::default()),
+            DEFAULT_PENDING_TOO_LONG_SEC,
+            Rc::new(RefCell::new(FinancialStatistics::default())),
+        )
+    }
+}
+
+impl PendingPayableScanner {
+    pub fn payable_dao(mut self, payable_dao: PayableDaoMock) -> Self {
+        self.payable_dao = Box::new(payable_dao);
+        self
+    }
+
+    pub fn pending_payable_dao(mut self, pending_payable_dao: PendingPayableDaoMock) -> Self {
+        self.pending_payable_dao = Box::new(pending_payable_dao);
+        self
+    }
+}
+
+impl Default for ReceivableScanner {
+    fn default() -> Self {
+        ReceivableScanner::new(
+            Box::new(ReceivableDaoMock::new()),
+            Box::new(BannedDaoMock::new()),
+            Rc::new(PaymentThresholds::default()),
+            Rc::new(make_wallet("earning")),
+            Rc::new(RefCell::new(FinancialStatistics::default())),
+        )
+    }
+}
+
+impl ReceivableScanner {
+    pub fn receivable_dao(mut self, receivable_dao: ReceivableDaoMock) -> Self {
+        self.receivable_dao = Box::new(receivable_dao);
+        self
+    }
+
+    pub fn banned_dao(mut self, banned_dao: BannedDaoMock) -> Self {
+        self.banned_dao = Box::new(banned_dao);
+        self
+    }
+
+    pub fn payment_thresholds(mut self, payment_thresholds: PaymentThresholds) -> Self {
+        self.common.payment_thresholds = Rc::new(payment_thresholds);
+        self
+    }
+
+    pub fn earning_wallet(mut self, earning_wallet: Wallet) -> Self {
+        self.earning_wallet = Rc::new(earning_wallet);
+        self
+    }
+}
+
+pub fn make_custom_payment_thresholds() -> PaymentThresholds {
+    PaymentThresholds {
+        threshold_interval_sec: 2_592_000,
+        debt_threshold_gwei: 1_000_000_000,
+        payment_grace_period_sec: 86_400,
+        maturity_threshold_sec: 86_400,
+        permanent_debt_allowed_gwei: 10_000_000,
+        unban_below_gwei: 10_000_000,
     }
 }
 
@@ -828,6 +989,52 @@ pub fn make_pending_payable_fingerprint() -> PendingPayableFingerprint {
         amount: 12345,
         process_error: None,
     }
+}
+
+pub fn make_payables(
+    now: SystemTime,
+    payment_thresholds: &PaymentThresholds,
+) -> (
+    Vec<PayableAccount>,
+    Vec<PayableAccount>,
+    Vec<PayableAccount>,
+) {
+    let unqualified_payable_accounts = vec![PayableAccount {
+        wallet: make_wallet("wallet1"),
+        balance: payment_thresholds.permanent_debt_allowed_gwei + 1,
+        last_paid_timestamp: from_time_t(
+            to_time_t(now) - payment_thresholds.maturity_threshold_sec + 1,
+        ),
+        pending_payable_opt: None,
+    }];
+    let qualified_payable_accounts = vec![
+        PayableAccount {
+            wallet: make_wallet("wallet2"),
+            balance: payment_thresholds.permanent_debt_allowed_gwei + 1_000_000_000,
+            last_paid_timestamp: from_time_t(
+                to_time_t(now) - payment_thresholds.maturity_threshold_sec - 1,
+            ),
+            pending_payable_opt: None,
+        },
+        PayableAccount {
+            wallet: make_wallet("wallet3"),
+            balance: payment_thresholds.permanent_debt_allowed_gwei + 1_200_000_000,
+            last_paid_timestamp: from_time_t(
+                to_time_t(now) - payment_thresholds.maturity_threshold_sec - 100,
+            ),
+            pending_payable_opt: None,
+        },
+    ];
+
+    let mut all_non_pending_payables = Vec::new();
+    all_non_pending_payables.extend(qualified_payable_accounts.clone());
+    all_non_pending_payables.extend(unqualified_payable_accounts.clone());
+
+    (
+        qualified_payable_accounts,
+        unqualified_payable_accounts,
+        all_non_pending_payables,
+    )
 }
 
 #[derive(Default)]

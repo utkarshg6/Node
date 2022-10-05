@@ -19,7 +19,8 @@ use crate::node_configurator::unprivileged_parse_args_configuration::{
 use crate::node_configurator::{
     data_directory_from_context, determine_config_file_path, DirsWrapper, DirsWrapperReal,
 };
-use crate::sub_lib::accountant::{DEFAULT_PAYMENT_THRESHOLDS, DEFAULT_SCAN_INTERVALS};
+use crate::sub_lib::accountant::PaymentThresholds as PaymentThresholdsFromAccountant;
+use crate::sub_lib::accountant::DEFAULT_SCAN_INTERVALS;
 use crate::sub_lib::neighborhood::NodeDescriptor;
 use crate::sub_lib::neighborhood::{NeighborhoodMode as NeighborhoodModeEnum, DEFAULT_RATE_PACK};
 use crate::sub_lib::utils::make_new_multi_config;
@@ -864,7 +865,10 @@ impl ValueRetriever for PaymentThresholds {
         _db_password_opt: &Option<String>,
     ) -> Option<(String, UiSetupResponseValueStatus)> {
         let pc_value = pc.payment_thresholds().expectv("payment-thresholds");
-        payment_thresholds_rate_pack_and_scan_intervals(pc_value, *DEFAULT_PAYMENT_THRESHOLDS)
+        payment_thresholds_rate_pack_and_scan_intervals(
+            pc_value,
+            PaymentThresholdsFromAccountant::default(),
+        )
     }
 
     fn is_required(&self, _params: &SetupCluster) -> bool {
@@ -928,7 +932,7 @@ fn payment_thresholds_rate_pack_and_scan_intervals<T>(
     default: T,
 ) -> Option<(String, UiSetupResponseValueStatus)>
 where
-    T: PartialEq + Display + Copy,
+    T: PartialEq + Display + Clone,
 {
     if persistent_config_value == default {
         Some((default.to_string(), Default))
@@ -1042,6 +1046,9 @@ mod tests {
     };
     use crate::node_configurator::{DirsWrapper, DirsWrapperReal};
     use crate::node_test_utils::DirsWrapperMock;
+    use crate::sub_lib::accountant::{
+        PaymentThresholds as PaymentThresholdsFromAccountant, DEFAULT_PAYMENT_THRESHOLDS,
+    };
     use crate::sub_lib::cryptde::PublicKey;
     use crate::sub_lib::node_addr::NodeAddr;
     use crate::sub_lib::wallet::Wallet;
@@ -3113,7 +3120,7 @@ mod tests {
 
     #[test]
     fn payment_thresholds_computed_default_persistent_config_unequal_to_default() {
-        let mut payment_thresholds = *DEFAULT_PAYMENT_THRESHOLDS;
+        let mut payment_thresholds = PaymentThresholdsFromAccountant::default();
         payment_thresholds.maturity_threshold_sec += 12;
         payment_thresholds.unban_below_gwei -= 11;
         payment_thresholds.debt_threshold_gwei += 1111;
@@ -3151,14 +3158,16 @@ mod tests {
         pc_method_result_setter: &C,
     ) where
         C: Fn(PersistentConfigurationMock, T) -> PersistentConfigurationMock,
-        T: Display + PartialEq + Copy,
+        T: Display + PartialEq + Clone,
     {
         let mut bootstrapper_config = BootstrapperConfig::new();
         //the rate_pack within the mode setting does not determine the result, so I just set a nonsense
         bootstrapper_config.neighborhood_config.mode =
             NeighborhoodModeEnum::OriginateOnly(vec![], rate_pack(0));
-        let persistent_config =
-            pc_method_result_setter(PersistentConfigurationMock::new(), persistent_config_value);
+        let persistent_config = pc_method_result_setter(
+            PersistentConfigurationMock::new(),
+            persistent_config_value.clone(),
+        );
 
         let result = subject.computed_default(&bootstrapper_config, &persistent_config, &None);
 

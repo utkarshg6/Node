@@ -252,7 +252,7 @@ fn configure_database(
             return Err(pce.into_configurator_error("clandestine-port"));
         }
     }
-    let neighborhood_mode_light = config.neighborhood_config.mode.make_light();
+    let neighborhood_mode_light: NeighborhoodModeLight = (&config.neighborhood_config.mode).into();
     if let Err(pce) = persistent_config.set_neighborhood_mode(neighborhood_mode_light) {
         return Err(pce.into_configurator_error("neighborhood-mode"));
     }
@@ -304,6 +304,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::vec;
+    use crate::test_utils::neighborhood_test_utils::MIN_HOPS_COUNT_FOR_TEST;
 
     #[test]
     fn node_configurator_standard_unprivileged_uses_parse_args_configurator_dao_real() {
@@ -574,7 +575,8 @@ mod tests {
         assert_eq!(
             config.neighborhood_config,
             NeighborhoodConfig {
-                mode: NeighborhoodMode::ZeroHop // not populated on the privileged side
+                mode: NeighborhoodMode::ZeroHop, // not populated on the privileged side
+                min_hops_count: MIN_HOPS_COUNT_FOR_TEST,
             }
         );
         assert_eq!(

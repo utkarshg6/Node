@@ -15,6 +15,7 @@ use crate::json_discriminator_factory::JsonDiscriminatorFactory;
 use crate::listener_handler::ListenerHandler;
 use crate::listener_handler::ListenerHandlerFactory;
 use crate::listener_handler::ListenerHandlerFactoryReal;
+use crate::neighborhood::DEFAULT_MIN_HOPS_COUNT;
 use crate::node_configurator::node_configurator_standard::{
     NodeConfiguratorStandardPrivileged, NodeConfiguratorStandardUnprivileged,
 };
@@ -395,6 +396,7 @@ impl BootstrapperConfig {
             consuming_wallet_opt: None,
             neighborhood_config: NeighborhoodConfig {
                 mode: NeighborhoodMode::ZeroHop,
+                min_hops_count: DEFAULT_MIN_HOPS_COUNT,
             },
             when_pending_too_long_sec: DEFAULT_PENDING_TOO_LONG_SEC,
         }
@@ -647,13 +649,11 @@ impl Bootstrapper {
                     )
                     .expect("Failed to bind ListenerHandler to clandestine port");
                 self.listener_handlers.push(listener_handler);
-                self.config.neighborhood_config = NeighborhoodConfig {
-                    mode: NeighborhoodMode::Standard(
-                        NodeAddr::new(&node_addr.ip_addr(), &[clandestine_port]),
-                        neighbor_configs.clone(),
-                        *rate_pack,
-                    ),
-                };
+                self.config.neighborhood_config.mode = NeighborhoodMode::Standard(
+                    NodeAddr::new(&node_addr.ip_addr(), &[clandestine_port]),
+                    neighbor_configs.clone(),
+                    *rate_pack,
+                );
                 Some(clandestine_port)
             } else {
                 None
@@ -770,6 +770,7 @@ mod tests {
     use tokio::executor::current_thread::CurrentThread;
     use tokio::prelude::stream::FuturesUnordered;
     use tokio::prelude::Async;
+    use crate::test_utils::neighborhood_test_utils::MIN_HOPS_COUNT_FOR_TEST;
 
     lazy_static! {
         pub static ref INITIALIZATION: Mutex<bool> = Mutex::new(false);
@@ -1222,6 +1223,7 @@ mod tests {
         let clandestine_port_opt = Some(44444);
         let neighborhood_config = NeighborhoodConfig {
             mode: NeighborhoodMode::OriginateOnly(vec![], rate_pack(9)),
+            min_hops_count: MIN_HOPS_COUNT_FOR_TEST,
         };
         let earning_wallet = make_wallet("earning wallet");
         let consuming_wallet_opt = Some(make_wallet("consuming wallet"));
@@ -1822,6 +1824,7 @@ mod tests {
                 ))],
                 rate_pack(100),
             ),
+            min_hops_count: MIN_HOPS_COUNT_FOR_TEST,
         };
         config.data_directory = data_dir.clone();
         config.clandestine_port_opt = Some(port);
@@ -1891,6 +1894,7 @@ mod tests {
                 ))],
                 rate_pack(100),
             ),
+            min_hops_count: MIN_HOPS_COUNT_FOR_TEST,
         };
         config.data_directory = data_dir.clone();
         config.clandestine_port_opt = None;
@@ -1939,6 +1943,7 @@ mod tests {
                 ))],
                 rate_pack(100),
             ),
+            min_hops_count: MIN_HOPS_COUNT_FOR_TEST,
         };
         let listener_handler = ListenerHandlerNull::new(vec![]);
         let mut subject = BootstrapperBuilder::new()
@@ -1975,6 +1980,7 @@ mod tests {
                 Chain::EthRopsten,
                 cryptde,
             ))]),
+            min_hops_count: MIN_HOPS_COUNT_FOR_TEST,
         };
         let listener_handler = ListenerHandlerNull::new(vec![]);
         let mut subject = BootstrapperBuilder::new()
@@ -2004,6 +2010,7 @@ mod tests {
         config.clandestine_port_opt = None;
         config.neighborhood_config = NeighborhoodConfig {
             mode: NeighborhoodMode::ZeroHop,
+            min_hops_count: MIN_HOPS_COUNT_FOR_TEST,
         };
         let listener_handler = ListenerHandlerNull::new(vec![]);
         let mut subject = BootstrapperBuilder::new()

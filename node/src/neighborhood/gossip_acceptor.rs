@@ -6,11 +6,9 @@ use crate::neighborhood::node_record::NodeRecord;
 use crate::neighborhood::AccessibleGossipRecord;
 use crate::sub_lib::cryptde::{CryptDE, PublicKey};
 use crate::sub_lib::neighborhood::{
-    ConnectionProgressEvent, ConnectionProgressMessage, GossipFailure_0v1,
+    ConnectionProgressEvent, ConnectionProgressMessage, GossipFailure_0v1, NeighborhoodMetadata,
 };
 use crate::sub_lib::node_addr::NodeAddr;
-use crate::sub_lib::proxy_server::DEFAULT_MINIMUM_HOP_COUNT;
-use actix::Recipient;
 use masq_lib::logger::Logger;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -63,8 +61,7 @@ trait GossipHandler: NamedType + Send /* Send because lazily-written tests requi
         database: &mut NeighborhoodDatabase,
         agrs: Vec<AccessibleGossipRecord>,
         gossip_source: SocketAddr,
-        connection_progress_peers: &[IpAddr],
-        cpm_recipient: &Recipient<ConnectionProgressMessage>,
+        neighborhood_metadata: NeighborhoodMetadata,
     ) -> GossipAcceptanceResult;
 }
 
@@ -133,8 +130,7 @@ impl GossipHandler for DebutHandler {
         database: &mut NeighborhoodDatabase,
         mut agrs: Vec<AccessibleGossipRecord>,
         gossip_source: SocketAddr,
-        _connection_progress_peers: &[IpAddr],
-        _cpm_recipient: &Recipient<ConnectionProgressMessage>,
+        _neighborhood_metadata: NeighborhoodMetadata,
     ) -> GossipAcceptanceResult {
         let source_agr = {
             let mut agr = agrs.remove(0); // empty Gossip shouldn't get here
@@ -510,8 +506,7 @@ impl GossipHandler for PassHandler {
         database: &mut NeighborhoodDatabase,
         agrs: Vec<AccessibleGossipRecord>,
         _gossip_source: SocketAddr,
-        connection_progress_peers: &[IpAddr],
-        cpm_recipient: &Recipient<ConnectionProgressMessage>,
+        neighborhood_metadata: NeighborhoodMetadata,
     ) -> GossipAcceptanceResult {
         let pass_agr = &agrs[0]; // empty Gossip shouldn't get here
         let pass_target_node_addr: NodeAddr = pass_agr
@@ -524,7 +519,8 @@ impl GossipHandler for PassHandler {
                 peer_addr: _gossip_source.ip(),
                 event,
             };
-            cpm_recipient
+            neighborhood_metadata
+                .cpm_recipient
                 .try_send(connection_progress_message)
                 .expect("System is dead.");
         };
@@ -541,7 +537,10 @@ impl GossipHandler for PassHandler {
 
         let mut hash_map = self.previous_pass_targets.borrow_mut();
         let gossip_acceptance_result = match hash_map.get_mut(&pass_target_ip_addr) {
-            None => match connection_progress_peers.contains(&pass_target_ip_addr) {
+            None => match neighborhood_metadata
+                .connection_progress_peers
+                .contains(&pass_target_ip_addr)
+            {
                 true => {
                     send_cpm(ConnectionProgressEvent::PassLoopFound);
                     GossipAcceptanceResult::Ignored
@@ -628,8 +627,7 @@ impl GossipHandler for IntroductionHandler {
         database: &mut NeighborhoodDatabase,
         agrs: Vec<AccessibleGossipRecord>,
         gossip_source: SocketAddr,
-        _connection_progress_peers: &[IpAddr],
-        cpm_recipient: &Recipient<ConnectionProgressMessage>,
+        neighborhood_metadata: NeighborhoodMetadata,
     ) -> GossipAcceptanceResult {
         if database.root().full_neighbor_keys(database).len() >= MAX_DEGREE {
             GossipAcceptanceResult::Ignored
@@ -660,7 +658,8 @@ impl GossipHandler for IntroductionHandler {
                 peer_addr: introducer_ip_addr,
                 event: ConnectionProgressEvent::IntroductionGossipReceived(introducee_ip_addr),
             };
-            cpm_recipient
+            neighborhood_metadata
+                .cpm_recipient
                 .try_send(connection_progess_message)
                 .expect("Neighborhood is dead");
             let (debut, target_key, target_node_addr) =
@@ -933,13 +932,16 @@ impl GossipHandler for StandardGossipHandler {
         database: &mut NeighborhoodDatabase,
         agrs: Vec<AccessibleGossipRecord>,
         gossip_source: SocketAddr,
-        _connection_progress_peers: &[IpAddr],
-        cpm_recipient: &Recipient<ConnectionProgressMessage>,
+        neighborhood_metadata: NeighborhoodMetadata,
     ) -> GossipAcceptanceResult {
         let initial_neighborship_status =
             StandardGossipHandler::check_full_neighbor(database, gossip_source.ip());
 
-        let patch = self.compute_patch(&agrs, database.root());
+        let patch = self.compute_patch(
+            &agrs,
+            database.root(),
+            neighborhood_metadata.min_hops_count as u8,
+        );
         let filtered_agrs = self.filter_agrs_by_patch(agrs, patch);
 
         let mut db_changed = self.identify_and_add_non_introductory_new_nodes(
@@ -962,7 +964,8 @@ impl GossipHandler for StandardGossipHandler {
                     peer_addr: gossip_source.ip(),
                     event: ConnectionProgressEvent::StandardGossipReceived,
                 };
-                cpm_recipient
+                neighborhood_metadata
+                    .cpm_recipient
                     .try_send(cpm)
                     .unwrap_or_else(|e| panic!("Neighborhood is dead: {}", e));
             }
@@ -986,6 +989,7 @@ impl StandardGossipHandler {
         &self,
         agrs: &[AccessibleGossipRecord],
         root_node: &NodeRecord,
+        min_hops_count: u8,
     ) -> HashSet<PublicKey> {
         let agrs_by_key = agrs
             .iter()
@@ -997,7 +1001,7 @@ impl StandardGossipHandler {
             &mut patch,
             root_node.public_key(),
             &agrs_by_key,
-            DEFAULT_MINIMUM_HOP_COUNT,
+            min_hops_count,
             root_node,
         );
 
@@ -1009,7 +1013,7 @@ impl StandardGossipHandler {
         patch: &mut HashSet<PublicKey>,
         current_node_key: &PublicKey,
         agrs: &HashMap<&PublicKey, &AccessibleGossipRecord>,
-        hops_remaining: usize,
+        hops_remaining: u8,
         root_node: &NodeRecord,
     ) {
         patch.insert(current_node_key.clone());
@@ -1209,8 +1213,7 @@ impl GossipHandler for RejectHandler {
         _database: &mut NeighborhoodDatabase,
         _agrs: Vec<AccessibleGossipRecord>,
         _gossip_source: SocketAddr,
-        _connection_progress_peers: &[IpAddr],
-        _cpm_recipient: &Recipient<ConnectionProgressMessage>,
+        _neighborhood_metadata: NeighborhoodMetadata,
     ) -> GossipAcceptanceResult {
         panic!("Should never be called")
     }
@@ -1228,7 +1231,7 @@ pub trait GossipAcceptor: Send /* Send because lazily-written tests require it *
         database: &mut NeighborhoodDatabase,
         agrs: Vec<AccessibleGossipRecord>,
         gossip_source: SocketAddr,
-        connection_progress_peers: &[IpAddr],
+        neighborhood_metadata: NeighborhoodMetadata,
     ) -> GossipAcceptanceResult;
 }
 
@@ -1236,7 +1239,6 @@ pub struct GossipAcceptorReal<'a> {
     cryptde: &'a dyn CryptDE,
     gossip_handlers: Vec<Box<dyn GossipHandler>>,
     logger: Logger,
-    cpm_recipient: Recipient<ConnectionProgressMessage>,
 }
 
 impl<'a> GossipAcceptor for GossipAcceptorReal<'a> {
@@ -1245,7 +1247,7 @@ impl<'a> GossipAcceptor for GossipAcceptorReal<'a> {
         database: &mut NeighborhoodDatabase,
         agrs: Vec<AccessibleGossipRecord>,
         gossip_source: SocketAddr,
-        connection_progress_peers: &[IpAddr],
+        neighborhood_metadata: NeighborhoodMetadata,
     ) -> GossipAcceptanceResult {
         let (qualification, handler_ref) = self
             .gossip_handlers
@@ -1265,8 +1267,7 @@ impl<'a> GossipAcceptor for GossipAcceptorReal<'a> {
                     database,
                     agrs,
                     gossip_source,
-                    connection_progress_peers,
-                    &self.cpm_recipient,
+                    neighborhood_metadata,
                 )
             }
             Qualification::Unmatched => {
@@ -1278,10 +1279,7 @@ impl<'a> GossipAcceptor for GossipAcceptorReal<'a> {
 }
 
 impl<'a> GossipAcceptorReal<'a> {
-    pub fn new(
-        cryptde: &'a dyn CryptDE,
-        cpm_recipient: Recipient<ConnectionProgressMessage>,
-    ) -> GossipAcceptorReal {
+    pub fn new(cryptde: &'a dyn CryptDE) -> GossipAcceptorReal {
         let logger = Logger::new("GossipAcceptor");
         GossipAcceptorReal {
             gossip_handlers: vec![
@@ -1293,7 +1291,6 @@ impl<'a> GossipAcceptorReal<'a> {
             ],
             cryptde,
             logger,
-            cpm_recipient,
         }
     }
 
@@ -1337,15 +1334,12 @@ mod tests {
     use crate::neighborhood::gossip_producer::GossipProducerReal;
     use crate::neighborhood::node_record::NodeRecord;
     use crate::sub_lib::cryptde_null::CryptDENull;
-    use crate::sub_lib::neighborhood::{ConnectionProgressEvent, ConnectionProgressMessage};
+    use crate::sub_lib::neighborhood::{ConnectionProgressEvent, ConnectionProgressMessage, Hops};
     use crate::sub_lib::utils::time_t_timestamp;
-    use crate::test_utils::neighborhood_test_utils::{
-        db_from_node, make_meaningless_db, make_node_record, make_node_record_f,
-    };
-    use crate::test_utils::recorder::make_recorder;
+    use crate::test_utils::neighborhood_test_utils::{db_from_node, make_meaningless_db, make_node_record, make_node_record_f, MIN_HOPS_COUNT_FOR_TEST};
     use crate::test_utils::unshared_test_utils::make_cpm_recipient;
     use crate::test_utils::{assert_contains, main_cryptde, vec_to_set};
-    use actix::{Actor, System};
+    use actix::System;
     use masq_lib::test_utils::logging::{init_test_logging, TestLogHandler};
     use masq_lib::test_utils::utils::TEST_DEFAULT_CHAIN;
     use std::convert::TryInto;
@@ -1367,6 +1361,14 @@ mod tests {
         // ZeroHop is decentralized and should never appear in GossipAcceptor tests
     }
 
+    fn make_default_neighborhood_metadata() -> NeighborhoodMetadata {
+        NeighborhoodMetadata {
+            connection_progress_peers: vec![],
+            cpm_recipient: make_cpm_recipient().0,
+            min_hops_count: MIN_HOPS_COUNT_FOR_TEST,
+        }
+    }
+
     #[test]
     fn proper_debut_of_accepting_node_with_populated_database_is_identified_and_handled() {
         let (gossip, new_node, gossip_source_opt) = make_debut(2345, Mode::Standard);
@@ -1376,7 +1378,6 @@ mod tests {
         db.add_arbitrary_full_neighbor(root_node.public_key(), neighbor_key);
         let cryptde = CryptDENull::from(db.root().public_key(), TEST_DEFAULT_CHAIN);
         let agrs_vec: Vec<AccessibleGossipRecord> = gossip.try_into().unwrap();
-        let (cpm_recipient, _) = make_cpm_recipient();
         let subject = DebutHandler::new(Logger::new("test"));
 
         let qualifies_result =
@@ -1386,8 +1387,7 @@ mod tests {
             &mut db,
             agrs_vec,
             gossip_source_opt,
-            &vec![],
-            &cpm_recipient,
+            make_default_neighborhood_metadata(),
         );
 
         assert_eq!(Qualification::Matched, qualifies_result);
@@ -1414,7 +1414,6 @@ mod tests {
         db.add_arbitrary_full_neighbor(root_node.public_key(), neighbor_key);
         let cryptde = CryptDENull::from(db.root().public_key(), TEST_DEFAULT_CHAIN);
         let agrs_vec: Vec<AccessibleGossipRecord> = gossip.try_into().unwrap();
-        let (cpm_recipient, _) = make_cpm_recipient();
         let subject = DebutHandler::new(Logger::new("test"));
 
         let qualifies_result = subject.qualifies(&db, agrs_vec.as_slice(), gossip_source.clone());
@@ -1423,8 +1422,7 @@ mod tests {
             &mut db,
             agrs_vec,
             gossip_source,
-            &vec![],
-            &cpm_recipient,
+            make_default_neighborhood_metadata(),
         );
 
         assert_eq!(Qualification::Matched, qualifies_result);
@@ -1470,7 +1468,6 @@ mod tests {
             .node(src_db.root().public_key(), true)
             .build();
         let agrs_vec: Vec<AccessibleGossipRecord> = gossip.try_into().unwrap();
-        let (cpm_recipient, _) = make_cpm_recipient();
         let subject = DebutHandler::new(Logger::new("test"));
 
         let result = subject.handle(
@@ -1478,8 +1475,7 @@ mod tests {
             &mut dest_db,
             agrs_vec,
             src_root.node_addr_opt().unwrap().into(),
-            &vec![],
-            &cpm_recipient,
+            make_default_neighborhood_metadata(),
         );
 
         assert_eq!(result, GossipAcceptanceResult::Accepted);
@@ -1504,7 +1500,6 @@ mod tests {
             .node(src_db.root().public_key(), true)
             .build();
         let agrs_vec: Vec<AccessibleGossipRecord> = gossip.try_into().unwrap();
-        let (cpm_recipient, _) = make_cpm_recipient();
         let subject = DebutHandler::new(Logger::new("test"));
 
         let result = subject.handle(
@@ -1512,8 +1507,7 @@ mod tests {
             &mut dest_db,
             agrs_vec,
             src_root.node_addr_opt().unwrap().into(),
-            &vec![],
-            &cpm_recipient,
+            make_default_neighborhood_metadata(),
         );
 
         assert_eq!(
@@ -1618,7 +1612,6 @@ mod tests {
             .build()
             .try_into()
             .unwrap();
-        let (cpm_recipient, _) = make_cpm_recipient();
         let subject = DebutHandler::new(Logger::new("test"));
 
         let result = subject.handle(
@@ -1626,8 +1619,7 @@ mod tests {
             &mut dest_db,
             agrs_vec,
             dest_root.node_addr_opt().clone().unwrap().into(),
-            &vec![],
-            &cpm_recipient,
+            make_default_neighborhood_metadata(),
         );
 
         assert_eq!(result, GossipAcceptanceResult::Accepted);
@@ -1640,7 +1632,6 @@ mod tests {
         let mut dest_db = make_meaningless_db();
         let cryptde = CryptDENull::from(dest_db.root().public_key(), TEST_DEFAULT_CHAIN);
         let agrs_vec: Vec<AccessibleGossipRecord> = gossip.try_into().unwrap();
-        let (cpm_recipient, _) = make_cpm_recipient();
 
         let qualifies_result = subject.qualifies(&dest_db, agrs_vec.as_slice(), gossip_source);
         let handle_result = subject.handle(
@@ -1648,8 +1639,7 @@ mod tests {
             &mut dest_db,
             agrs_vec,
             gossip_source,
-            &vec![],
-            &cpm_recipient,
+            make_default_neighborhood_metadata(),
         );
 
         assert_eq!(Qualification::Matched, qualifies_result);
@@ -1897,7 +1887,6 @@ mod tests {
                 &SocketAddr::from_str("4.5.6.7:4567").unwrap(),
             ));
         dest_db.resign_node(introducer_key);
-        let (cpm_recipient, _) = make_cpm_recipient();
         let introducer_before_gossip = dest_db.node_by_key(introducer_key).unwrap().clone();
         let before = time_t_timestamp();
 
@@ -1907,8 +1896,7 @@ mod tests {
             &mut dest_db,
             agrs.clone(),
             gossip_source,
-            &vec![],
-            &cpm_recipient,
+            make_default_neighborhood_metadata(),
         );
 
         let after = time_t_timestamp();
@@ -1946,7 +1934,6 @@ mod tests {
         let cryptde = CryptDENull::from(dest_db.root().public_key(), TEST_DEFAULT_CHAIN);
         let subject = IntroductionHandler::new(Logger::new("test"));
         let agrs: Vec<AccessibleGossipRecord> = gossip.try_into().unwrap();
-        let (cpm_recipient, _) = make_cpm_recipient();
 
         let qualifies_result = subject.qualifies(&dest_db, &agrs, gossip_source);
         let handle_result = subject.handle(
@@ -1954,8 +1941,7 @@ mod tests {
             &mut dest_db,
             agrs.clone(),
             gossip_source,
-            &vec![],
-            &cpm_recipient,
+            make_default_neighborhood_metadata(),
         );
 
         assert_eq!(Qualification::Matched, qualifies_result);
@@ -1997,15 +1983,13 @@ mod tests {
         let cryptde = CryptDENull::from(dest_db.root().public_key(), TEST_DEFAULT_CHAIN);
         let subject = IntroductionHandler::new(Logger::new("test"));
         let agrs: Vec<AccessibleGossipRecord> = gossip.try_into().unwrap();
-        let (cpm_recipient, _) = make_cpm_recipient();
 
         let handle_result = subject.handle(
             &cryptde,
             &mut dest_db,
             agrs.clone(),
             gossip_source,
-            &vec![],
-            &cpm_recipient,
+            make_default_neighborhood_metadata(),
         );
 
         assert_eq!(handle_result, GossipAcceptanceResult::Ignored);
@@ -2026,7 +2010,6 @@ mod tests {
             .unwrap()
             .set_version(0);
         dest_db.resign_node(&agrs[0].inner.public_key);
-        let (cpm_recipient, _) = make_cpm_recipient();
 
         let qualifies_result = subject.qualifies(&dest_db, &agrs, gossip_source);
         let handle_result = subject.handle(
@@ -2034,8 +2017,7 @@ mod tests {
             &mut dest_db,
             agrs.clone(),
             gossip_source,
-            &vec![],
-            &cpm_recipient,
+            make_default_neighborhood_metadata(),
         );
 
         assert_eq!(Qualification::Matched, qualifies_result);
@@ -2083,7 +2065,6 @@ mod tests {
         let agrs: Vec<AccessibleGossipRecord> = gossip.try_into().unwrap();
         dest_db.add_node(NodeRecord::from(&agrs[0])).unwrap();
         dest_db.add_arbitrary_half_neighbor(dest_root.public_key(), &agrs[0].inner.public_key);
-        let (cpm_recipient, _) = make_cpm_recipient();
 
         let qualifies_result = subject.qualifies(&dest_db, &agrs, gossip_source);
         let handle_result = subject.handle(
@@ -2091,8 +2072,7 @@ mod tests {
             &mut dest_db,
             agrs.clone(),
             gossip_source,
-            &vec![],
-            &cpm_recipient,
+            make_default_neighborhood_metadata(),
         );
 
         assert_eq!(Qualification::Matched, qualifies_result);
@@ -2335,6 +2315,8 @@ mod tests {
         let agrs_vec: Vec<AccessibleGossipRecord> = gossip.try_into().unwrap();
         let gossip_source: SocketAddr = src_root.node_addr_opt().unwrap().into();
         let (cpm_recipient, recording_arc) = make_cpm_recipient();
+        let mut neighborhood_metadata = make_default_neighborhood_metadata();
+        neighborhood_metadata.cpm_recipient = cpm_recipient;
         let system = System::new("test");
 
         let qualifies_result = subject.qualifies(&dest_db, agrs_vec.as_slice(), gossip_source);
@@ -2343,8 +2325,7 @@ mod tests {
             &mut dest_db,
             agrs_vec,
             gossip_source,
-            &vec![],
-            &cpm_recipient,
+            neighborhood_metadata,
         );
 
         assert_eq!(Qualification::Matched, qualifies_result);
@@ -2400,7 +2381,7 @@ mod tests {
             .build();
         let agrs: Vec<AccessibleGossipRecord> = gossip.try_into().unwrap();
 
-        let result = subject.compute_patch(&agrs, node_a_db.root());
+        let result = subject.compute_patch(&agrs, node_a_db.root(), MIN_HOPS_COUNT_FOR_TEST as u8);
 
         let expected_hashset = vec![
             node_a.public_key().clone(),
@@ -2452,7 +2433,7 @@ mod tests {
             .build();
         let agrs: Vec<AccessibleGossipRecord> = gossip.try_into().unwrap();
 
-        let patch = subject.compute_patch(&agrs, node_a_db.root());
+        let patch = subject.compute_patch(&agrs, node_a_db.root(), MIN_HOPS_COUNT_FOR_TEST as u8);
 
         let expected_hashset = vec![
             node_a.public_key().clone(),
@@ -2501,7 +2482,7 @@ mod tests {
             .build();
         let agrs: Vec<AccessibleGossipRecord> = gossip.try_into().unwrap();
 
-        let patch = subject.compute_patch(&agrs, node_a_db.root());
+        let patch = subject.compute_patch(&agrs, node_a_db.root(), MIN_HOPS_COUNT_FOR_TEST as u8);
 
         let expected_hashset = vec![
             node_a.public_key().clone(),
@@ -2535,7 +2516,6 @@ mod tests {
         */
 
         let cryptde = main_cryptde();
-        let (cpm_recipient, _) = make_cpm_recipient();
         let subject = StandardGossipHandler::new(Logger::new("test"));
         let node_a = make_node_record(1111, true);
         let node_b = make_node_record(2222, true);
@@ -2578,11 +2558,58 @@ mod tests {
             &mut node_a_db,
             agrs,
             gossip_source,
-            &vec![],
-            &cpm_recipient,
+            make_default_neighborhood_metadata(),
         );
 
         assert_eq!(result, GossipAcceptanceResult::Ignored);
+    }
+
+    fn assert_compute_patch(min_hops_count: Hops) {
+        let subject = StandardGossipHandler::new(Logger::new("assert_compute_patch"));
+        // Create Nodes
+        let nodes_count = min_hops_count as usize + 2; // one to finish hops and one extra node
+        let mut nodes = Vec::with_capacity(nodes_count as usize);
+        for i in 1..=nodes_count {
+            let nonce = 1000 + i;
+            let has_ip = if i <= 2 { true } else { false };
+            nodes.push(make_node_record(nonce as u16, has_ip))
+        }
+        // Create Database
+        let root_node = &nodes[0];
+        let mut root_node_db = db_from_node(root_node);
+        for i in 1..nodes_count {
+            root_node_db.add_node(nodes[i].clone()).unwrap();
+            root_node_db
+                .add_arbitrary_full_neighbor(nodes[i - 1].public_key(), nodes[i].public_key());
+        }
+        // Create Gossip
+        let mut gossip_builder = GossipBuilder::new(&root_node_db);
+        for i in 1..nodes_count {
+            gossip_builder = gossip_builder.node(nodes[i].public_key(), false);
+        }
+        let gossip = gossip_builder.build();
+        let agrs: Vec<AccessibleGossipRecord> = gossip.try_into().unwrap();
+
+        let result = subject.compute_patch(&agrs, root_node_db.root(), min_hops_count as u8);
+
+        let mut expected_nodes = nodes;
+        expected_nodes.pop();
+        let expected_hashet = expected_nodes
+            .iter()
+            .map(|node| node.public_key().clone())
+            .collect::<HashSet<PublicKey>>();
+
+        assert_eq!(result, expected_hashet);
+    }
+
+    #[test]
+    fn patch_can_be_calculated_for_different_hops() {
+        assert_compute_patch(Hops::OneHop);
+        assert_compute_patch(Hops::TwoHops);
+        assert_compute_patch(Hops::ThreeHops);
+        assert_compute_patch(Hops::FourHops);
+        assert_compute_patch(Hops::FiveHops);
+        assert_compute_patch(Hops::SixHops);
     }
 
     #[test]
@@ -2604,6 +2631,8 @@ mod tests {
             .build();
         let agrs = gossip.try_into().unwrap();
         let (cpm_recipient, recording_arc) = make_cpm_recipient();
+        let mut neighborhood_metadata = make_default_neighborhood_metadata();
+        neighborhood_metadata.cpm_recipient = cpm_recipient;
         let subject = StandardGossipHandler::new(Logger::new("test"));
         let system = System::new("test");
 
@@ -2612,8 +2641,7 @@ mod tests {
             &mut root_db,
             agrs,
             src_node_socket_addr,
-            &vec![],
-            &cpm_recipient,
+            make_default_neighborhood_metadata(),
         );
 
         System::current().stop();
@@ -2643,6 +2671,8 @@ mod tests {
             .build();
         let agrs = gossip.try_into().unwrap();
         let (cpm_recipient, recording_arc) = make_cpm_recipient();
+        let mut neighborhood_metadata = make_default_neighborhood_metadata();
+        neighborhood_metadata.cpm_recipient = cpm_recipient;
         let subject = StandardGossipHandler::new(Logger::new("test"));
         let system = System::new("test");
 
@@ -2651,8 +2681,7 @@ mod tests {
             &mut root_db,
             agrs,
             src_node_socket_addr,
-            &vec![],
-            &cpm_recipient,
+            neighborhood_metadata,
         );
 
         System::current().stop();
@@ -2689,6 +2718,8 @@ mod tests {
             .build();
         let agrs = gossip.try_into().unwrap();
         let (cpm_recipient, recording_arc) = make_cpm_recipient();
+        let mut neighborhood_metadata = make_default_neighborhood_metadata();
+        neighborhood_metadata.cpm_recipient = cpm_recipient;
         let subject = StandardGossipHandler::new(Logger::new("test"));
         let system = System::new("test");
 
@@ -2697,8 +2728,7 @@ mod tests {
             &mut root_db,
             agrs,
             src_node_socket_addr,
-            &vec![],
-            &cpm_recipient,
+            neighborhood_metadata,
         );
 
         System::current().stop();
@@ -2729,6 +2759,8 @@ mod tests {
             .build();
         let agrs = gossip.try_into().unwrap();
         let (cpm_recipient, recording_arc) = make_cpm_recipient();
+        let mut neighborhood_metadata = make_default_neighborhood_metadata();
+        neighborhood_metadata.cpm_recipient = cpm_recipient;
         let subject = StandardGossipHandler::new(Logger::new("test"));
         let system = System::new("test");
 
@@ -2737,8 +2769,7 @@ mod tests {
             &mut root_db,
             agrs,
             src_node_socket_addr,
-            &vec![],
-            &cpm_recipient,
+            neighborhood_metadata,
         );
 
         System::current().stop();
@@ -2781,7 +2812,7 @@ mod tests {
             &mut dest_db,
             gossip.try_into().unwrap(),
             src_root.node_addr_opt().clone().unwrap().into(),
-            &vec![],
+            make_default_neighborhood_metadata(),
         );
 
         assert_eq!(result, GossipAcceptanceResult::Ignored);
@@ -2865,7 +2896,7 @@ mod tests {
             &mut dest_db,
             gossip.try_into().unwrap(),
             src_node.node_addr_opt().unwrap().into(),
-            &vec![],
+            make_default_neighborhood_metadata(),
         );
 
         assert_eq!(GossipAcceptanceResult::Ignored, result);
@@ -2884,7 +2915,7 @@ mod tests {
             &mut dest_db,
             gossip.try_into().unwrap(),
             gossip_source,
-            &vec![],
+            make_default_neighborhood_metadata(),
         );
 
         let after = time_t_timestamp();
@@ -2923,7 +2954,7 @@ mod tests {
             &mut dest_db,
             gossip.try_into().unwrap(),
             gossip_source,
-            &vec![],
+            make_default_neighborhood_metadata(),
         );
 
         let after = time_t_timestamp();
@@ -2994,7 +3025,7 @@ mod tests {
             &mut dest_db,
             gossip.try_into().unwrap(),
             gossip_source,
-            &vec![],
+            make_default_neighborhood_metadata(),
         );
 
         let after = time_t_timestamp();
@@ -3090,7 +3121,7 @@ mod tests {
             &mut dest_db,
             gossip.try_into().unwrap(),
             gossip_source,
-            &vec![],
+            make_default_neighborhood_metadata(),
         );
 
         let expected_acceptance_gossip_2 = GossipBuilder::new(&dest_db)
@@ -3179,7 +3210,7 @@ mod tests {
             &mut dest_db,
             gossip.try_into().unwrap(),
             gossip_source,
-            &vec![],
+            make_default_neighborhood_metadata(),
         );
 
         let expected_acceptance_gossip = GossipBuilder::new(&dest_db)
@@ -3234,7 +3265,7 @@ mod tests {
             &mut dest_db,
             debut.try_into().unwrap(),
             gossip_source,
-            &vec![],
+            make_default_neighborhood_metadata(),
         );
 
         assert_eq!(GossipAcceptanceResult::Ignored, result);
@@ -3269,7 +3300,12 @@ mod tests {
         let subject = make_subject(main_cryptde());
 
         let begin_at = time_t_timestamp();
-        let result = subject.handle(&mut dest_db, debut_agrs, gossip_source, &vec![]);
+        let result = subject.handle(
+            &mut dest_db,
+            debut_agrs,
+            gossip_source,
+            make_default_neighborhood_metadata(),
+        );
         let end_at = time_t_timestamp();
 
         assert_eq!(GossipAcceptanceResult::Accepted, result);
@@ -3297,7 +3333,12 @@ mod tests {
         let gossip_source = src_node.node_addr_opt().unwrap().into();
         let subject = make_subject(main_cryptde());
 
-        let result = subject.handle(&mut dest_db, debut_agrs, gossip_source, &vec![]);
+        let result = subject.handle(
+            &mut dest_db,
+            debut_agrs,
+            gossip_source,
+            make_default_neighborhood_metadata(),
+        );
 
         assert_eq!(result, GossipAcceptanceResult::Accepted);
         assert_eq!(
@@ -3327,7 +3368,12 @@ mod tests {
         let gossip_source = src_node.node_addr_opt().unwrap().into();
         let subject = make_subject(main_cryptde());
 
-        let result = subject.handle(&mut dest_db, debut_agrs, gossip_source, &vec![]);
+        let result = subject.handle(
+            &mut dest_db,
+            debut_agrs,
+            gossip_source,
+            make_default_neighborhood_metadata(),
+        );
 
         assert_eq!(result, GossipAcceptanceResult::Accepted);
         assert_eq!(
@@ -3347,6 +3393,8 @@ mod tests {
         let subject = IntroductionHandler::new(Logger::new("test"));
         let (gossip, gossip_source) = make_introduction(0, 1);
         let (cpm_recipient, recording_arc) = make_cpm_recipient();
+        let mut neighborhood_metadata = make_default_neighborhood_metadata();
+        neighborhood_metadata.cpm_recipient = cpm_recipient;
         let agrs: Vec<AccessibleGossipRecord> = gossip.try_into().unwrap();
         let (_introducer, introducee) =
             IntroductionHandler::identify_players(agrs.clone(), gossip_source).unwrap();
@@ -3354,14 +3402,7 @@ mod tests {
         let system =
             System::new("introduction_gossip_handler_sends_cpm_for_neighborship_established");
 
-        subject.handle(
-            cryptde,
-            &mut db,
-            agrs,
-            gossip_source,
-            &vec![],
-            &cpm_recipient,
-        );
+        subject.handle(cryptde, &mut db, agrs, gossip_source, neighborhood_metadata);
 
         System::current().stop();
         assert_eq!(system.run(), 0);
@@ -3396,7 +3437,12 @@ mod tests {
         let (gossip, pass_target, gossip_source) = make_pass(2345);
         let subject = make_subject(main_cryptde());
 
-        let result = subject.handle(&mut db, gossip.try_into().unwrap(), gossip_source, &vec![]);
+        let result = subject.handle(
+            &mut db,
+            gossip.try_into().unwrap(),
+            gossip_source,
+            make_default_neighborhood_metadata(),
+        );
 
         let expected_relay_gossip = GossipBuilder::new(&db)
             .node(root_node.public_key(), true)
@@ -3421,6 +3467,8 @@ mod tests {
         let (gossip, pass_target, gossip_source) = make_pass(2345);
         let system = System::new("handles_a_new_pass_target");
         let (cpm_recipient, recording_arc) = make_cpm_recipient();
+        let mut neighborhood_metadata = make_default_neighborhood_metadata();
+        neighborhood_metadata.cpm_recipient = cpm_recipient;
         let initial_timestamp = SystemTime::now();
 
         let result = subject.handle(
@@ -3428,8 +3476,7 @@ mod tests {
             &mut db,
             gossip.try_into().unwrap(),
             gossip_source,
-            &vec![],
-            &cpm_recipient,
+            neighborhood_metadata,
         );
 
         let final_timestamp = SystemTime::now();
@@ -3474,6 +3521,8 @@ mod tests {
         );
         let system = System::new("handles_pass_target_that_is_not_yet_expired");
         let (cpm_recipient, recording_arc) = make_cpm_recipient();
+        let mut neighborhood_metadata = make_default_neighborhood_metadata();
+        neighborhood_metadata.cpm_recipient = cpm_recipient;
         let initial_timestamp = SystemTime::now();
 
         let result = subject.handle(
@@ -3481,8 +3530,7 @@ mod tests {
             &mut db,
             gossip.try_into().unwrap(),
             gossip_source,
-            &vec![],
-            &cpm_recipient,
+            neighborhood_metadata,
         );
 
         let final_timestamp = SystemTime::now();
@@ -3515,14 +3563,16 @@ mod tests {
         let system =
             System::new("handles_pass_target_that_is_a_part_of_a_different_connection_progress");
         let (cpm_recipient, recording_arc) = make_cpm_recipient();
+        let mut neighborhood_metadata = make_default_neighborhood_metadata();
+        neighborhood_metadata.cpm_recipient = cpm_recipient;
+        neighborhood_metadata.connection_progress_peers = vec![pass_target_ip_addr];
 
         let result = subject.handle(
             cryptde,
             &mut db,
             gossip.try_into().unwrap(),
             gossip_source,
-            &vec![pass_target_ip_addr],
-            &cpm_recipient,
+            neighborhood_metadata,
         );
 
         System::current().stop();
@@ -3547,6 +3597,8 @@ mod tests {
         let subject = PassHandler::new();
         let (gossip, pass_target, gossip_source) = make_pass(2345);
         let (cpm_recipient, recording_arc) = make_cpm_recipient();
+        let mut neighborhood_metadata = make_default_neighborhood_metadata();
+        neighborhood_metadata.cpm_recipient = cpm_recipient;
         let pass_target_ip_addr = pass_target.node_addr_opt().unwrap().ip_addr();
         let expired_time = PASS_GOSSIP_EXPIRED_TIME.add(Duration::from_secs(1));
         subject
@@ -3561,8 +3613,7 @@ mod tests {
             &mut db,
             gossip.try_into().unwrap(),
             gossip_source,
-            &vec![],
-            &cpm_recipient,
+            neighborhood_metadata,
         );
 
         let final_timestamp = SystemTime::now();
@@ -3667,7 +3718,7 @@ mod tests {
             &mut dest_db,
             gossip.try_into().unwrap(),
             node_a.node_addr_opt().unwrap().into(),
-            &vec![],
+            make_default_neighborhood_metadata(),
         );
 
         let after = time_t_timestamp();
@@ -3783,7 +3834,7 @@ mod tests {
             &mut dest_db,
             gossip.try_into().unwrap(),
             src_node.node_addr_opt().unwrap().into(),
-            &vec![],
+            make_default_neighborhood_metadata(),
         );
 
         let after = time_t_timestamp();
@@ -3870,7 +3921,7 @@ mod tests {
             &mut dest_db,
             gossip.try_into().unwrap(),
             src_root.node_addr_opt().unwrap().into(),
-            &vec![],
+            make_default_neighborhood_metadata(),
         );
 
         let after = time_t_timestamp();
@@ -4228,10 +4279,7 @@ mod tests {
     }
 
     fn make_subject(crypt_de: &dyn CryptDE) -> GossipAcceptorReal {
-        let (neighborhood, _, _) = make_recorder();
-        let addr = neighborhood.start();
-        let recipient = addr.recipient::<ConnectionProgressMessage>();
-        GossipAcceptorReal::new(crypt_de, recipient)
+        GossipAcceptorReal::new(crypt_de)
     }
 
     fn assert_node_records_eq(

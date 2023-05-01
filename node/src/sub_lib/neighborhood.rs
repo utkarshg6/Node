@@ -87,6 +87,17 @@ impl Display for NeighborhoodMode {
     }
 }
 
+impl Into<NeighborhoodModeLight> for &NeighborhoodMode {
+    fn into(self) -> NeighborhoodModeLight {
+        match self {
+            NeighborhoodMode::Standard(_, _, _) => NeighborhoodModeLight::Standard,
+            NeighborhoodMode::ConsumeOnly(_) => NeighborhoodModeLight::ConsumeOnly,
+            NeighborhoodMode::OriginateOnly(_, _) => NeighborhoodModeLight::OriginateOnly,
+            NeighborhoodMode::ZeroHop => NeighborhoodModeLight::ZeroHop,
+        }
+    }
+}
+
 impl NeighborhoodMode {
     pub fn is_decentralized(&self) -> bool {
         self != &NeighborhoodMode::ZeroHop
@@ -141,15 +152,6 @@ impl NeighborhoodMode {
 
     pub fn is_zero_hop(&self) -> bool {
         matches!(self, NeighborhoodMode::ZeroHop)
-    }
-
-    pub fn make_light(&self) -> NeighborhoodModeLight {
-        match self {
-            NeighborhoodMode::Standard(_, _, _) => NeighborhoodModeLight::Standard,
-            NeighborhoodMode::ConsumeOnly(_) => NeighborhoodModeLight::ConsumeOnly,
-            NeighborhoodMode::OriginateOnly(_, _) => NeighborhoodModeLight::OriginateOnly,
-            NeighborhoodMode::ZeroHop => NeighborhoodModeLight::ZeroHop,
-        }
     }
 }
 
@@ -367,9 +369,36 @@ impl Display for DescriptorParsingError<'_> {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Hops {
+    OneHop = 1,
+    TwoHops = 2,
+    ThreeHops = 3, // minimum for anonymity
+    FourHops = 4,
+    FiveHops = 5,
+    SixHops = 6,
+}
+
+impl TryFrom<String> for Hops {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match value.as_str() {
+            "1" => Ok(Hops::OneHop),
+            "2" => Ok(Hops::TwoHops),
+            "3" => Ok(Hops::ThreeHops),
+            "4" => Ok(Hops::FourHops),
+            "5" => Ok(Hops::FiveHops),
+            "6" => Ok(Hops::SixHops),
+            _ => Err("Invalid value for min hops count provided".to_string()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NeighborhoodConfig {
     pub mode: NeighborhoodMode,
+    pub min_hops_count: Hops,
 }
 
 lazy_static! {
@@ -443,7 +472,6 @@ pub struct DispatcherNodeQueryMessage {
 pub struct RouteQueryMessage {
     pub target_key_opt: Option<PublicKey>,
     pub target_component: Component,
-    pub minimum_hop_count: usize,
     pub return_component_opt: Option<Component>,
     pub payload_size: usize,
     pub hostname_opt: Option<String>,
@@ -454,15 +482,15 @@ impl Message for RouteQueryMessage {
 }
 
 impl RouteQueryMessage {
+    // Earlier min_hops_count was passed to this function and stored inside RouteQueryMessage
+    // TODO: GH-690: Make sure the entities using RouteQueryMessage can easily retieve the min_hops_count from Neighborhood
     pub fn data_indefinite_route_request(
         hostname_opt: Option<String>,
-        minimum_hop_count: usize,
         payload_size: usize,
     ) -> RouteQueryMessage {
         RouteQueryMessage {
             target_key_opt: None,
             target_component: Component::ProxyClient,
-            minimum_hop_count,
             return_component_opt: Some(Component::ProxyServer),
             payload_size,
             hostname_opt,
@@ -548,6 +576,13 @@ impl fmt::Display for GossipFailure_0v1 {
         };
         write!(f, "{}", msg)
     }
+}
+
+// This metadata is only passed from Neighborhood to GossipHandler
+pub struct NeighborhoodMetadata {
+    pub connection_progress_peers: Vec<IpAddr>,
+    pub cpm_recipient: Recipient<ConnectionProgressMessage>,
+    pub min_hops_count: Hops,
 }
 
 pub struct NeighborhoodTools {
@@ -1003,14 +1038,13 @@ mod tests {
 
     #[test]
     fn data_indefinite_route_request() {
-        let result = RouteQueryMessage::data_indefinite_route_request(None, 2, 7500);
+        let result = RouteQueryMessage::data_indefinite_route_request(None,  7500);
 
         assert_eq!(
             result,
             RouteQueryMessage {
                 target_key_opt: None,
                 target_component: Component::ProxyClient,
-                minimum_hop_count: 2,
                 return_component_opt: Some(Component::ProxyServer),
                 payload_size: 7500,
                 hostname_opt: None
@@ -1186,7 +1220,7 @@ mod tests {
     #[test]
     fn neighborhood_mode_light_can_be_made_from_neighborhood_mode() {
         assert_make_light(
-            NeighborhoodMode::Standard(
+            &NeighborhoodMode::Standard(
                 NodeAddr::new(&localhost(), &[1234, 2345]),
                 vec![],
                 rate_pack(100),
@@ -1194,18 +1228,19 @@ mod tests {
             NeighborhoodModeLight::Standard,
         );
         assert_make_light(
-            NeighborhoodMode::ConsumeOnly(vec![]),
+            &NeighborhoodMode::ConsumeOnly(vec![]),
             NeighborhoodModeLight::ConsumeOnly,
         );
         assert_make_light(
-            NeighborhoodMode::OriginateOnly(vec![], rate_pack(100)),
+            &NeighborhoodMode::OriginateOnly(vec![], rate_pack(100)),
             NeighborhoodModeLight::OriginateOnly,
         );
-        assert_make_light(NeighborhoodMode::ZeroHop, NeighborhoodModeLight::ZeroHop)
+        assert_make_light(&NeighborhoodMode::ZeroHop, NeighborhoodModeLight::ZeroHop)
     }
 
-    fn assert_make_light(heavy: NeighborhoodMode, expected_value: NeighborhoodModeLight) {
-        assert_eq!(heavy.make_light(), expected_value)
+    fn assert_make_light(heavy: &NeighborhoodMode, expected_value: NeighborhoodModeLight) {
+        let result: NeighborhoodModeLight = heavy.into();
+        assert_eq!(result, expected_value)
     }
 
     #[test]
@@ -1217,5 +1252,26 @@ mod tests {
             .downcast_ref::<NotifyLaterHandleReal<AskAboutDebutGossipMessage>>()
             .unwrap();
         assert_eq!(subject.ask_about_gossip_interval, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn min_hops_count_can_be_converted_from_string() {
+        let min_hops_count = String::from("6");
+
+        let result: Hops = min_hops_count.try_into().unwrap();
+
+        assert_eq!(result, Hops::SixHops);
+    }
+
+    #[test]
+    fn min_hops_count_conversion_from_string_panics() {
+        let min_hops_count = String::from("100");
+
+        let result: Result<Hops, String> = min_hops_count.try_into();
+
+        assert_eq!(
+            result,
+            Err("Invalid value for min hops count provided".to_string())
+        )
     }
 }

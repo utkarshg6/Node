@@ -34,7 +34,7 @@ use crate::sub_lib::proxy_client::{ClientResponsePayload_0v1, DnsResolveFailure_
 use crate::sub_lib::proxy_server::ClientRequestPayload_0v1;
 use crate::sub_lib::proxy_server::ProxyServerSubs;
 use crate::sub_lib::proxy_server::{
-    AddReturnRouteMessage, AddRouteMessage, DEFAULT_MINIMUM_HOP_COUNT,
+    AddReturnRouteMessage, AddRouteMessage,
 };
 use crate::sub_lib::route::Route;
 use crate::sub_lib::set_consuming_wallet_message::SetConsumingWalletMessage;
@@ -952,11 +952,12 @@ impl IBCDHelperReal {
             route_source
                 .send(RouteQueryMessage::data_indefinite_route_request(
                     hostname_opt,
-                    if common_args.is_decentralized {
-                        DEFAULT_MINIMUM_HOP_COUNT
-                    } else {
-                        0
-                    },
+                    // TODO: GH-690: This edge case hasn't been take care
+                    // if common_args.is_decentralized {
+                    //     DEFAULT_MINIMUM_HOP_COUNT
+                    // } else {
+                    //     0
+                    // },
                     payload_size,
                 ))
                 .then(move |route_result| {
@@ -1292,7 +1293,6 @@ mod tests {
             record,
             &RouteQueryMessage::data_indefinite_route_request(
                 Some("nowhere.com".to_string()),
-                DEFAULT_MINIMUM_HOP_COUNT,
                 47
             )
         );
@@ -1416,7 +1416,6 @@ mod tests {
             neighborhood_record,
             &RouteQueryMessage::data_indefinite_route_request(
                 Some("realdomain.nu".to_string()),
-                DEFAULT_MINIMUM_HOP_COUNT,
                 12
             )
         );
@@ -1766,6 +1765,7 @@ mod tests {
     #[test]
     fn proxy_server_receives_http_request_with_no_consuming_wallet_in_zero_hop_mode_and_handles_normally(
     ) {
+        // TODO: GH-690: Initially this test is intended for a RouteQueryMessage with a min_hop_count = 0, but it is working fine irrespective of that
         init_test_logging();
         let main_cryptde = main_cryptde();
         let alias_cryptde = alias_cryptde();
@@ -1813,7 +1813,6 @@ mod tests {
             &RouteQueryMessage {
                 target_key_opt: None,
                 target_component: Component::ProxyClient,
-                minimum_hop_count: 0,
                 return_component_opt: Some(Component::ProxyServer),
                 payload_size: 47,
                 hostname_opt: Some("nowhere.com".to_string())
@@ -1894,7 +1893,6 @@ mod tests {
             &RouteQueryMessage {
                 target_key_opt: None,
                 target_component: Component::ProxyClient,
-                minimum_hop_count: 0,
                 return_component_opt: Some(Component::ProxyServer),
                 payload_size: 16,
                 hostname_opt: None
@@ -2209,7 +2207,6 @@ mod tests {
             record,
             &RouteQueryMessage::data_indefinite_route_request(
                 Some("nowhere.com".to_string()),
-                3,
                 47
             )
         );
@@ -2725,7 +2722,6 @@ mod tests {
             record,
             &RouteQueryMessage::data_indefinite_route_request(
                 Some("nowhere.com".to_string()),
-                3,
                 47
             )
         );
@@ -2901,7 +2897,6 @@ mod tests {
             record,
             &RouteQueryMessage::data_indefinite_route_request(
                 Some("nowhere.com".to_string()),
-                3,
                 47
             )
         );

@@ -20,7 +20,7 @@ impl MASQNodeClient {
 
         MASQNodeClient {
             stream,
-            timeout: Duration::from_secs(1),
+            timeout: Duration::from_secs(2),
         }
     }
 

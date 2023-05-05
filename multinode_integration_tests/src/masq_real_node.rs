@@ -15,12 +15,13 @@ use masq_lib::test_utils::utils::TEST_DEFAULT_MULTINODE_CHAIN;
 use masq_lib::utils::localhost;
 use masq_lib::utils::{DEFAULT_CONSUMING_DERIVATION_PATH, DEFAULT_EARNING_DERIVATION_PATH};
 use node_lib::blockchain::bip32::Bip32ECKeyProvider;
+use node_lib::neighborhood::DEFAULT_MIN_HOPS_COUNT;
 use node_lib::sub_lib::accountant::{
     PaymentThresholds, DEFAULT_EARNING_WALLET, DEFAULT_PAYMENT_THRESHOLDS,
 };
 use node_lib::sub_lib::cryptde::{CryptDE, PublicKey};
 use node_lib::sub_lib::cryptde_null::CryptDENull;
-use node_lib::sub_lib::neighborhood::{RatePack, DEFAULT_RATE_PACK, ZERO_RATE_PACK, Hops};
+use node_lib::sub_lib::neighborhood::{Hops, RatePack, DEFAULT_RATE_PACK, ZERO_RATE_PACK};
 use node_lib::sub_lib::node_addr::NodeAddr;
 use node_lib::sub_lib::wallet::Wallet;
 use regex::Regex;
@@ -34,9 +35,9 @@ use std::str::FromStr;
 use std::string::ToString;
 use std::thread;
 use std::time::Duration;
-use node_lib::neighborhood::DEFAULT_MIN_HOPS_COUNT;
 
 pub const DATA_DIRECTORY: &str = "/node_root/home";
+pub const STANDARD_CLIENT_TIMEOUT_MILLIS: u64 = 1000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Firewall {
@@ -940,9 +941,9 @@ impl MASQRealNode {
         }
     }
 
-    pub fn make_client(&self, port: u16) -> MASQNodeClient {
+    pub fn make_client(&self, port: u16, timeout_millis: u64) -> MASQNodeClient {
         let socket_addr = SocketAddr::new(self.ip_address(), port);
-        MASQNodeClient::new(socket_addr)
+        MASQNodeClient::new(socket_addr, timeout_millis)
     }
 
     pub fn make_server(&self, port: u16) -> MASQNodeServer {

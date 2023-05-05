@@ -435,9 +435,7 @@ impl Neighborhood {
         let neighborhood_mode = &neighborhood_config.mode;
         let mode: NeighborhoodModeLight = neighborhood_mode.into();
         let neighborhood_configs = neighborhood_mode.neighbor_configs();
-        if mode == NeighborhoodModeLight::ZeroHop
-            && !neighborhood_configs.is_empty()
-        {
+        if mode == NeighborhoodModeLight::ZeroHop && !neighborhood_configs.is_empty() {
             panic!(
                 "A zero-hop MASQ Node is not decentralized and cannot have a --neighbors setting"
             )
@@ -540,7 +538,6 @@ impl Neighborhood {
         } else {
             self.make_round_trip_route(msg)
         };
-        eprintln!("Round Trip Result: {:?}", route_result);
         match route_result {
             Ok(response) => {
                 let msg_str = debug_msg_opt.expect("Debug Message wasn't built but expected.");
@@ -843,12 +840,10 @@ impl Neighborhood {
             payload_size: 10000,
             hostname_opt: None,
         };
-        debug!(Logger::new("Multinode"), "Searching for a {}-hops route.", self.min_hops_count as usize);
-        if let Some(route_query_response) = self.handle_route_query_message(msg) {
-            trace!(Logger::new("Multinode"), "Round Trip Route Length: {:?}", route_query_response.route.hops.len());
+        if self.handle_route_query_message(msg).is_some() {
             debug!(
                 &self.logger,
-                "The connectivity check has found a {}-hops route.", self.min_hops_count as usize
+                "The connectivity check has found a {}-hop(s) route.", self.min_hops_count as usize
             );
             self.overall_connection_status
                 .update_ocs_stage_and_send_message_to_ui(
@@ -1246,11 +1241,9 @@ impl Neighborhood {
                 hostname_opt,
             )
             .into_iter()
-            .filter_map(|cr| {
-                match cr.undesirability <= minimum_undesirability {
-                    true => Some(cr.nodes),
-                    false => None,
-                }
+            .filter_map(|cr| match cr.undesirability <= minimum_undesirability {
+                true => Some(cr.nodes),
+                false => None,
             })
             .next();
 
@@ -1638,7 +1631,12 @@ mod tests {
     use crate::test_utils::assert_contains;
     use crate::test_utils::make_meaningless_route;
     use crate::test_utils::make_wallet;
-    use crate::test_utils::neighborhood_test_utils::{db_from_node, make_global_cryptde_node_record, make_ip, make_node, make_node_descriptor, make_node_record, make_node_record_f, MIN_HOPS_COUNT_FOR_TEST, neighborhood_from_nodes};
+    use crate::test_utils::neighborhood_test_utils::{
+        cryptdes_from_node_records, db_from_node, linearly_connect_nodes,
+        make_global_cryptde_node_record, make_ip, make_node, make_node_descriptor,
+        make_node_record, make_node_record_f, make_node_records, neighborhood_from_nodes,
+        MIN_HOPS_COUNT_FOR_TEST,
+    };
     use crate::test_utils::persistent_configuration_mock::PersistentConfigurationMock;
     use crate::test_utils::rate_pack;
     use crate::test_utils::recorder::make_recorder;
@@ -2750,9 +2748,7 @@ mod tests {
         let addr: Addr<Neighborhood> = subject.start();
         let sub: Recipient<RouteQueryMessage> = addr.recipient::<RouteQueryMessage>();
 
-        let future = sub.send(RouteQueryMessage::data_indefinite_route_request(
-            None, 400,
-        ));
+        let future = sub.send(RouteQueryMessage::data_indefinite_route_request(None, 400));
 
         System::current().stop_with_code(0);
         system.run();
@@ -2768,9 +2764,7 @@ mod tests {
         let addr: Addr<Neighborhood> = subject.start();
         let sub: Recipient<RouteQueryMessage> = addr.recipient::<RouteQueryMessage>();
 
-        let future = sub.send(RouteQueryMessage::data_indefinite_route_request(
-            None,  430,
-        ));
+        let future = sub.send(RouteQueryMessage::data_indefinite_route_request(None, 430));
 
         System::current().stop_with_code(0);
         system.run();
@@ -2885,7 +2879,7 @@ mod tests {
         }
         let addr: Addr<Neighborhood> = subject.start();
         let sub: Recipient<RouteQueryMessage> = addr.recipient::<RouteQueryMessage>();
-        let msg = RouteQueryMessage::data_indefinite_route_request(None,  10000);
+        let msg = RouteQueryMessage::data_indefinite_route_request(None, 10000);
 
         let future = sub.send(msg);
 
@@ -3019,9 +3013,7 @@ mod tests {
         let addr: Addr<Neighborhood> = subject.start();
         let sub: Recipient<RouteQueryMessage> = addr.recipient::<RouteQueryMessage>();
 
-        let data_route = sub.send(RouteQueryMessage::data_indefinite_route_request(
-            None, 5000,
-        ));
+        let data_route = sub.send(RouteQueryMessage::data_indefinite_route_request(None, 5000));
 
         System::current().stop_with_code(0);
         system.run();
@@ -3116,12 +3108,8 @@ mod tests {
         let addr: Addr<Neighborhood> = subject.start();
         let sub: Recipient<RouteQueryMessage> = addr.recipient::<RouteQueryMessage>();
 
-        let data_route_0 = sub.send(RouteQueryMessage::data_indefinite_route_request(
-            None, 2000,
-        ));
-        let data_route_1 = sub.send(RouteQueryMessage::data_indefinite_route_request(
-            None, 3000,
-        ));
+        let data_route_0 = sub.send(RouteQueryMessage::data_indefinite_route_request(None, 2000));
+        let data_route_1 = sub.send(RouteQueryMessage::data_indefinite_route_request(None, 3000));
 
         System::current().stop_with_code(0);
         system.run();
@@ -3171,15 +3159,13 @@ mod tests {
         )
         .unwrap();
 
-        let route_request_1 = route_sub.send(RouteQueryMessage::data_indefinite_route_request(
-            None, 1000,
-        ));
+        let route_request_1 =
+            route_sub.send(RouteQueryMessage::data_indefinite_route_request(None, 1000));
         let _ = set_wallet_sub.try_send(SetConsumingWalletMessage {
             wallet: expected_new_wallet,
         });
-        let route_request_2 = route_sub.send(RouteQueryMessage::data_indefinite_route_request(
-            None, 2000,
-        ));
+        let route_request_2 =
+            route_sub.send(RouteQueryMessage::data_indefinite_route_request(None, 2000));
 
         System::current().stop();
         system.run();
@@ -3951,7 +3937,7 @@ mod tests {
     fn neighborhood_starts_accountant_when_first_route_can_be_made() {
         let (accountant, _, accountant_recording_arc) = make_recorder();
         let (ui_gateway, _, _) = make_recorder();
-        let mut subject = make_neighborhood_linearly_connected_with_nodes(3);
+        let mut subject = make_neighborhood_with_linearly_connected_nodes(4);
         subject.node_to_ui_recipient_opt = Some(ui_gateway.start().recipient());
         let peer_actors = peer_actors_builder().accountant(accountant).build();
         bind_subject(&mut subject, peer_actors);
@@ -4015,8 +4001,9 @@ mod tests {
     fn assert_connectivity_check(hops: Hops) {
         init_test_logging();
         let test_name = &format!("connectivity_check_for_{}_hops", hops as usize);
+        let nodes_count = hops as u16 + 1;
         let mut subject: Neighborhood =
-            make_neighborhood_linearly_connected_with_nodes(hops as u16);
+            make_neighborhood_with_linearly_connected_nodes(nodes_count);
         let (ui_gateway, _, ui_gateway_arc) = make_recorder();
         let (accountant, _, _) = make_recorder();
         let node_to_ui_recipient = ui_gateway.start().recipient::<NodeToUiMessage>();
@@ -4054,7 +4041,7 @@ mod tests {
             }
         );
         TestLogHandler::new().exists_log_containing(&format!(
-            "DEBUG: {}: The connectivity check has found a {}-hops route.",
+            "DEBUG: {}: The connectivity check has found a {}-hop(s) route.",
             test_name, hops as usize
         ));
     }
@@ -4073,7 +4060,7 @@ mod tests {
     fn neighborhood_logs_when_three_hops_route_can_not_be_made() {
         init_test_logging();
         let test_name = "neighborhood_logs_when_three_hops_route_can_not_be_made";
-        let mut subject: Neighborhood = make_neighborhood_linearly_connected_with_nodes(2);
+        let mut subject: Neighborhood = make_neighborhood_with_linearly_connected_nodes(3);
         let (ui_gateway, _, ui_gateway_arc) = make_recorder();
         let (accountant, _, _) = make_recorder();
         let node_to_ui_recipient = ui_gateway.start().recipient::<NodeToUiMessage>();
@@ -5321,33 +5308,13 @@ mod tests {
     fn assert_route_query_message(min_hops_count: Hops) {
         let hops = min_hops_count as usize;
         let nodes_count = hops + 1;
-        // Create Nodes
-        let nodes = (1..=nodes_count)
-            .map(|i| {
-                let nonce = 1000 + i as u16;
-                let has_ip = if i <= 2 { true } else { false };
-                let node = if i == 1 {
-                    make_global_cryptde_node_record(nonce, has_ip)
-                } else {
-                    make_node_record(nonce, has_ip)
-                };
-                node
-            })
-            .collect::<Vec<NodeRecord>>();
-        // Create Database
-        let root_node = nodes.get(0).unwrap();
-        let neighbor = nodes.get(1).unwrap();
-        let mut subject = neighborhood_from_nodes(root_node, Some(neighbor));
+        let root_node = make_global_cryptde_node_record(4242, true);
+        let mut nodes = make_node_records(nodes_count as u16);
+        nodes[0] = root_node;
+        let db = linearly_connect_nodes(&nodes);
+        let mut subject = neighborhood_from_nodes(db.root(), nodes.get(1));
         subject.min_hops_count = min_hops_count;
-        for i in 1..nodes_count {
-            subject
-                .neighborhood_database
-                .add_node(nodes[i].clone())
-                .unwrap();
-            subject
-                .neighborhood_database
-                .add_arbitrary_full_neighbor(nodes[i - 1].public_key(), nodes[i].public_key());
-        }
+        subject.neighborhood_database = db;
 
         let result = subject.make_round_trip_route(RouteQueryMessage {
             target_key_opt: None,
@@ -5364,24 +5331,14 @@ mod tests {
             }
         };
         let mut route = result.clone().unwrap().route.hops;
+        let route_length = route.len();
         let _accounting = route.pop();
         let over_route = &route[..hops];
         let back_route = &route[hops..];
-        let over_cryptdes = {
-            let mut over_nodes = nodes.clone();
-            over_nodes.pop();
-            over_nodes
-                .iter()
-                .map(|node| CryptDENull::from(node.public_key(), TEST_DEFAULT_CHAIN))
-                .collect::<Vec<CryptDENull>>()
-        };
-        let back_cryptdes = {
-            nodes
-                .iter()
-                .rev()
-                .map(|node| CryptDENull::from(node.public_key(), TEST_DEFAULT_CHAIN))
-                .collect::<Vec<CryptDENull>>()
-        };
+        let over_cryptdes = cryptdes_from_node_records(&nodes[..nodes_count - 1]);
+        let mut back_cryptdes = cryptdes_from_node_records(&nodes);
+        back_cryptdes.reverse();
+        assert_eq!(route_length, 2 * nodes_count);
         assert_hops(over_cryptdes, over_route);
         assert_hops(back_cryptdes, back_route);
     }
@@ -6099,47 +6056,13 @@ mod tests {
         message_opt
     }
 
-    fn make_neighborhood_linearly_connected_with_nodes(hops: u16) -> Neighborhood {
-        let subject_node = make_global_cryptde_node_record(1234, true);
-        let relay1 = make_node_record(1111, true);
-        let mut nodes = vec![
-            subject_node.public_key().clone(),
-            relay1.public_key().clone(),
-        ];
-        let mut neighborhood: Neighborhood = neighborhood_from_nodes(&subject_node, Some(&relay1));
-        let mut replacement_database = neighborhood.neighborhood_database.clone();
-
-        fn nonce(x: u16) -> u16 {
-            x + (10 * x) + (100 * x) + (1000 * x)
-        }
-
-        for i in 1..=hops {
-            match i {
-                1 => {
-                    replacement_database.add_node(relay1.clone()).unwrap();
-                }
-                i if i < hops => {
-                    let relay_node = make_node_record(nonce(i), false);
-                    replacement_database.add_node(relay_node.clone()).unwrap();
-                    nodes.push(relay_node.public_key().clone());
-                }
-                i if i == hops => {
-                    let exit_node = make_node_record(nonce(i), false);
-                    replacement_database.add_node(exit_node.clone()).unwrap();
-                    nodes.push(exit_node.public_key().clone());
-                }
-                _ => panic!("The match statement should be exhaustive."),
-            }
-            replacement_database
-                .add_arbitrary_full_neighbor(&nodes[i as usize - 1], &nodes[i as usize]);
-        }
-
-        neighborhood.gossip_acceptor = Box::new(DatabaseReplacementGossipAcceptor {
-            replacement_database,
-        });
-        neighborhood.persistent_config_opt = Some(Box::new(
-            PersistentConfigurationMock::new().set_past_neighbors_result(Ok(())),
-        ));
+    fn make_neighborhood_with_linearly_connected_nodes(nodes_count: u16) -> Neighborhood {
+        let root_node = make_global_cryptde_node_record(4242, true);
+        let mut nodes = make_node_records(nodes_count);
+        nodes[0] = root_node;
+        let db = linearly_connect_nodes(&nodes);
+        let mut neighborhood = neighborhood_from_nodes(db.root(), nodes.get(1));
+        neighborhood.neighborhood_database = db;
 
         neighborhood
     }

@@ -12,15 +12,15 @@ use std::thread;
 use std::time::Duration;
 
 #[test]
-fn http_end_to_end_routing_test_with_different_min_hops() {
+fn data_can_be_routed_using_different_min_hops() {
     // This test fails sometimes due to a timeout: "Couldn't read chunk: Kind(TimedOut)"
     // You may fix it by increasing the timeout for the client.
-    assert_http_end_to_end_routing_test(Hops::OneHop);
-    assert_http_end_to_end_routing_test(Hops::TwoHops);
-    assert_http_end_to_end_routing_test(Hops::SixHops);
+    assert_http_end_to_end_routing(Hops::OneHop);
+    assert_http_end_to_end_routing(Hops::TwoHops);
+    assert_http_end_to_end_routing(Hops::SixHops);
 }
 
-fn assert_http_end_to_end_routing_test(min_hops: Hops) {
+fn assert_http_end_to_end_routing(min_hops: Hops) {
     let mut cluster = MASQNodeCluster::start().unwrap();
     let config = NodeStartupConfigBuilder::standard()
         .min_hops(min_hops)
@@ -69,15 +69,14 @@ fn min_hops_can_be_changed_during_runtime() {
         .build();
     let first_node = cluster.start_real_node(first_node_config);
     let ui_client = first_node.make_ui(ui_port);
-    let mut prev_node_reference = first_node.node_reference();
 
     for _ in 0..initial_min_hops as u8 {
-        let new_node_config = NodeStartupConfigBuilder::standard()
-            .neighbor(prev_node_reference)
-            .chain(cluster.chain)
-            .build();
-        let new_node = cluster.start_real_node(new_node_config);
-        prev_node_reference = new_node.node_reference();
+        cluster.start_real_node(
+            NodeStartupConfigBuilder::standard()
+                .neighbor(first_node.node_reference())
+                .chain(cluster.chain)
+                .build(),
+        );
     }
     thread::sleep(Duration::from_millis(1000));
 

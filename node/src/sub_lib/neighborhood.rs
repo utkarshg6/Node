@@ -4,7 +4,6 @@ use crate::neighborhood::gossip::Gossip_0v1;
 use crate::neighborhood::node_record::NodeRecord;
 use crate::neighborhood::overall_connection_status::ConnectionProgress;
 use crate::neighborhood::Neighborhood;
-use crate::sub_lib::configurator::NewPasswordMessage;
 use crate::sub_lib::cryptde::{CryptDE, PublicKey};
 use crate::sub_lib::cryptde_real::CryptDEReal;
 use crate::sub_lib::dispatcher::{Component, StreamShutdownMsg};
@@ -12,7 +11,6 @@ use crate::sub_lib::hopper::ExpiredCoresPackage;
 use crate::sub_lib::node_addr::NodeAddr;
 use crate::sub_lib::peer_actors::{BindMessage, NewPublicIp, StartMessage};
 use crate::sub_lib::route::Route;
-use crate::sub_lib::set_consuming_wallet_message::SetConsumingWalletMessage;
 use crate::sub_lib::stream_handler_pool::DispatcherNodeQueryResponse;
 use crate::sub_lib::stream_handler_pool::TransmitDataMsg;
 use crate::sub_lib::utils::{NotifyLaterHandle, NotifyLaterHandleReal};
@@ -370,7 +368,7 @@ impl Display for DescriptorParsingError<'_> {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, PartialOrd, Eq)]
 pub enum Hops {
     OneHop = 1,
     TwoHops = 2,
@@ -423,10 +421,9 @@ pub struct NeighborhoodSubs {
     pub gossip_failure: Recipient<ExpiredCoresPackage<GossipFailure_0v1>>,
     pub dispatcher_node_query: Recipient<DispatcherNodeQueryMessage>,
     pub remove_neighbor: Recipient<RemoveNeighborMessage>,
+    pub configuration_change_msg_sub: Recipient<ConfigurationChangeMessage>,
     pub stream_shutdown_sub: Recipient<StreamShutdownMsg>,
-    pub set_consuming_wallet_sub: Recipient<SetConsumingWalletMessage>,
     pub from_ui_message_sub: Recipient<NodeFromUiMessage>,
-    pub new_password_sub: Recipient<NewPasswordMessage>,
     pub connection_progress_sub: Recipient<ConnectionProgressMessage>,
 }
 
@@ -555,6 +552,18 @@ pub enum NRMetadataChange {
     AddUnreachableHost { hostname: String },
 }
 
+#[derive(Clone, Debug, Message, PartialEq, Eq)]
+pub struct ConfigurationChangeMessage {
+    pub change: ConfigurationChange,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfigurationChange {
+    UpdateNewPassword(String),
+    UpdateConsumingWallet(Wallet),
+    UpdateMinHops(Hops),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(non_camel_case_types)]
 pub enum GossipFailure_0v1 {
@@ -582,7 +591,7 @@ impl fmt::Display for GossipFailure_0v1 {
 pub struct NeighborhoodMetadata {
     pub connection_progress_peers: Vec<IpAddr>,
     pub cpm_recipient: Recipient<ConnectionProgressMessage>,
-    pub min_hops: Hops,
+    pub db_patch_size: Hops,
 }
 
 pub struct NeighborhoodTools {
@@ -659,10 +668,9 @@ mod tests {
             gossip_failure: recipient!(recorder, ExpiredCoresPackage<GossipFailure_0v1>),
             dispatcher_node_query: recipient!(recorder, DispatcherNodeQueryMessage),
             remove_neighbor: recipient!(recorder, RemoveNeighborMessage),
+            configuration_change_msg_sub: recipient!(recorder, ConfigurationChangeMessage),
             stream_shutdown_sub: recipient!(recorder, StreamShutdownMsg),
-            set_consuming_wallet_sub: recipient!(recorder, SetConsumingWalletMessage),
             from_ui_message_sub: recipient!(recorder, NodeFromUiMessage),
-            new_password_sub: recipient!(recorder, NewPasswordMessage),
             connection_progress_sub: recipient!(recorder, ConnectionProgressMessage),
         };
 

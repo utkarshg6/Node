@@ -1,6 +1,7 @@
 // Copyright (c) 2019-2021, MASQ (https://masq.ai) and/or its affiliates. All rights reserved.
 
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use actix::{Actor, Context, Handler, Recipient};
 
@@ -25,7 +26,8 @@ use crate::db_config::config_dao::ConfigDaoReal;
 use crate::db_config::persistent_configuration::{
     PersistentConfigError, PersistentConfiguration, PersistentConfigurationReal,
 };
-use crate::sub_lib::configurator::NewPasswordMessage;
+use crate::sub_lib::neighborhood::ConfigurationChange::UpdateMinHops;
+use crate::sub_lib::neighborhood::{ConfigurationChange, ConfigurationChangeMessage, Hops};
 use crate::sub_lib::peer_actors::BindMessage;
 use crate::sub_lib::utils::{db_connection_launch_panic, handle_ui_crash_request};
 use crate::sub_lib::wallet::Wallet;
@@ -45,8 +47,8 @@ pub const CRASH_KEY: &str = "CONFIGURATOR";
 
 pub struct Configurator {
     persistent_config: Box<dyn PersistentConfiguration>,
-    node_to_ui_sub: Option<Recipient<NodeToUiMessage>>,
-    new_password_subs: Option<Vec<Recipient<NewPasswordMessage>>>,
+    node_to_ui_sub_opt: Option<Recipient<NodeToUiMessage>>,
+    configuration_change_msg_sub_opt: Option<Recipient<ConfigurationChangeMessage>>,
     crashable: bool,
     logger: Logger,
 }
@@ -59,8 +61,9 @@ impl Handler<BindMessage> for Configurator {
     type Result = ();
 
     fn handle(&mut self, msg: BindMessage, _ctx: &mut Self::Context) -> Self::Result {
-        self.node_to_ui_sub = Some(msg.peer_actors.ui_gateway.node_to_ui_message_sub.clone());
-        self.new_password_subs = Some(vec![msg.peer_actors.neighborhood.new_password_sub])
+        self.node_to_ui_sub_opt = Some(msg.peer_actors.ui_gateway.node_to_ui_message_sub.clone());
+        self.configuration_change_msg_sub_opt =
+            Some(msg.peer_actors.neighborhood.configuration_change_msg_sub);
     }
 }
 
@@ -68,6 +71,7 @@ impl Handler<NodeFromUiMessage> for Configurator {
     type Result = ();
 
     fn handle(&mut self, msg: NodeFromUiMessage, _ctx: &mut Self::Context) -> Self::Result {
+        // TODO: I wish if we would log the body and context_id of each request over here. Is there a security risk?
         if let Ok((body, context_id)) = UiChangePasswordRequest::fmb(msg.body.clone()) {
             let client_id = msg.client_id;
             self.call_handler(msg, |c| {
@@ -107,8 +111,8 @@ impl Configurator {
             Box::new(PersistentConfigurationReal::new(Box::new(config_dao)));
         Configurator {
             persistent_config,
-            node_to_ui_sub: None,
-            new_password_subs: None,
+            node_to_ui_sub_opt: None,
+            configuration_change_msg_sub_opt: None,
             crashable,
             logger: Logger::new("Configurator"),
         }
@@ -690,10 +694,18 @@ impl Configurator {
         msg: UiSetConfigurationRequest,
         context_id: u64,
     ) -> MessageBody {
+        let configuration_change_msg_sub_opt = self.configuration_change_msg_sub_opt.clone();
+        let logger = &self.logger;
+        debug!(
+            logger,
+            "A request from UI received: {:?} from context id: {}", msg, context_id
+        );
         match Self::unfriendly_handle_set_configuration(
             msg,
             context_id,
             &mut self.persistent_config,
+            configuration_change_msg_sub_opt,
+            logger,
         ) {
             Ok(message_body) => message_body,
             Err((code, msg)) => MessageBody {
@@ -707,16 +719,25 @@ impl Configurator {
     fn unfriendly_handle_set_configuration(
         msg: UiSetConfigurationRequest,
         context_id: u64,
-        persist_config: &mut Box<dyn PersistentConfiguration>,
+        persistent_config: &mut Box<dyn PersistentConfiguration>,
+        configuration_change_msg_sub_opt: Option<Recipient<ConfigurationChangeMessage>>,
+        logger: &Logger,
     ) -> Result<MessageBody, MessageError> {
         let password: Option<String> = None; //prepared for an upgrade with parameters requiring the password
 
         match password {
             None => {
                 if "gas-price" == &msg.name {
-                    Self::set_gas_price(msg.value, persist_config)?;
+                    Self::set_gas_price(msg.value, persistent_config)?;
                 } else if "start-block" == &msg.name {
-                    Self::set_start_block(msg.value, persist_config)?;
+                    Self::set_start_block(msg.value, persistent_config)?;
+                } else if "min-hops" == &msg.name {
+                    Self::set_min_hops(
+                        msg.value,
+                        persistent_config,
+                        configuration_change_msg_sub_opt,
+                        logger,
+                    )?;
                 } else {
                     return Err((
                         UNRECOGNIZED_PARAMETER,
@@ -746,6 +767,38 @@ impl Configurator {
         }
     }
 
+    fn set_min_hops(
+        string_number: String,
+        config: &mut Box<dyn PersistentConfiguration>,
+        configuration_change_msg_sub_opt: Option<Recipient<ConfigurationChangeMessage>>,
+        logger: &Logger,
+    ) -> Result<(), (u64, String)> {
+        let min_hops = match Hops::from_str(&string_number) {
+            Ok(min_hops) => min_hops,
+            Err(e) => {
+                return Err((NON_PARSABLE_VALUE, format!("min hops: {:?}", e)));
+            }
+        };
+        match config.set_min_hops(min_hops) {
+            Ok(_) => {
+                debug!(
+                    logger,
+                    "The value of min-hops has been changed to {}-hop inside the database",
+                    min_hops
+                );
+                configuration_change_msg_sub_opt
+                    .as_ref()
+                    .expect("Configurator is unbound")
+                    .try_send(ConfigurationChangeMessage {
+                        change: UpdateMinHops(min_hops),
+                    })
+                    .expect("Configurator is unbound");
+                Ok(())
+            }
+            Err(e) => Err((CONFIGURATOR_WRITE_ERROR, format!("min hops: {:?}", e))),
+        }
+    }
+
     fn set_start_block(
         string_number: String,
         config: &mut Box<dyn PersistentConfiguration>,
@@ -762,7 +815,7 @@ impl Configurator {
 
     fn send_to_ui_gateway(&self, target: MessageTarget, body: MessageBody) {
         let msg = NodeToUiMessage { target, body };
-        self.node_to_ui_sub
+        self.node_to_ui_sub_opt
             .as_ref()
             .expect("Configurator is unbound")
             .try_send(msg)
@@ -770,15 +823,14 @@ impl Configurator {
     }
 
     fn send_password_changes(&self, new_password: String) {
-        let msg = NewPasswordMessage { new_password };
-        self.new_password_subs
+        let msg = ConfigurationChangeMessage {
+            change: ConfigurationChange::UpdateNewPassword(new_password),
+        };
+        self.configuration_change_msg_sub_opt
             .as_ref()
             .expect("Configurator is unbound")
-            .iter()
-            .for_each(|sub| {
-                sub.try_send(msg.clone())
-                    .expect("New password recipient is dead")
-            });
+            .try_send(msg)
+            .expect("New password recipient is dead");
     }
 
     fn call_handler<F: FnOnce(&mut Configurator) -> MessageBody>(
@@ -834,7 +886,7 @@ mod tests {
     use crate::sub_lib::accountant::{PaymentThresholds, ScanIntervals};
     use crate::sub_lib::cryptde::PublicKey as PK;
     use crate::sub_lib::cryptde::{CryptDE, PlainData};
-    use crate::sub_lib::neighborhood::{NodeDescriptor, RatePack};
+    use crate::sub_lib::neighborhood::{ConfigurationChange, NodeDescriptor, RatePack};
     use crate::sub_lib::node_addr::NodeAddr;
     use crate::sub_lib::wallet::Wallet;
     use crate::test_utils::unshared_test_utils::{
@@ -865,11 +917,13 @@ mod tests {
         )));
         let (recorder, _, _) = make_recorder();
         let recorder_addr = recorder.start();
+        let (neighborhood, _, _) = make_recorder();
+        let neighborhood_addr = neighborhood.start();
 
         let mut subject = Configurator::new(data_dir, false);
 
-        subject.node_to_ui_sub = Some(recorder_addr.recipient());
-        subject.new_password_subs = Some(vec![]);
+        subject.node_to_ui_sub_opt = Some(recorder_addr.recipient());
+        subject.configuration_change_msg_sub_opt = Some(neighborhood_addr.recipient());
         let _ = subject.handle_change_password(
             UiChangePasswordRequest {
                 old_password_opt: None,
@@ -1034,9 +1088,9 @@ mod tests {
         );
         let neighborhood_recording = neighborhood_recording_arc.lock().unwrap();
         assert_eq!(
-            neighborhood_recording.get_record::<NewPasswordMessage>(0),
-            &NewPasswordMessage {
-                new_password: "new_password".to_string()
+            neighborhood_recording.get_record::<ConfigurationChangeMessage>(0),
+            &ConfigurationChangeMessage {
+                change: ConfigurationChange::UpdateNewPassword("new_password".to_string())
             }
         );
         assert_eq!(neighborhood_recording.len(), 1);
@@ -1934,24 +1988,28 @@ mod tests {
 
     #[test]
     fn handle_set_configuration_works() {
+        init_test_logging();
+        let test_name = "handle_set_configuration_works";
         let set_start_block_params_arc = Arc::new(Mutex::new(vec![]));
         let (ui_gateway, _, ui_gateway_recording_arc) = make_recorder();
         let persistent_config = PersistentConfigurationMock::new()
             .set_start_block_params(&set_start_block_params_arc)
             .set_start_block_result(Ok(()));
-        let subject = make_subject(Some(persistent_config));
+        let mut subject = make_subject(Some(persistent_config));
+        subject.logger = Logger::new(test_name);
         let subject_addr = subject.start();
         let peer_actors = peer_actors_builder().ui_gateway(ui_gateway).build();
         subject_addr.try_send(BindMessage { peer_actors }).unwrap();
+        let msg = UiSetConfigurationRequest {
+            name: "start-block".to_string(),
+            value: "166666".to_string(),
+        };
+        let context_id = 4444;
 
         subject_addr
             .try_send(NodeFromUiMessage {
                 client_id: 1234,
-                body: UiSetConfigurationRequest {
-                    name: "start-block".to_string(),
-                    value: "166666".to_string(),
-                }
-                .tmb(4444),
+                body: msg.clone().tmb(context_id),
             })
             .unwrap();
 
@@ -1964,6 +2022,10 @@ mod tests {
         assert_eq!(context_id, 4444);
         let check_start_block_params = set_start_block_params_arc.lock().unwrap();
         assert_eq!(*check_start_block_params, vec![166666]);
+        TestLogHandler::new().exists_log_containing(&format!(
+            "DEBUG: {}: A request from UI received: {:?} from context id: {}",
+            test_name, msg, context_id
+        ));
     }
 
     #[test]
@@ -2096,6 +2158,121 @@ mod tests {
                 payload: Err((
                     NON_PARSABLE_VALUE,
                     r#"start block: ParseIntError { kind: InvalidDigit }"#.to_string()
+                ))
+            }
+        );
+    }
+
+    #[test]
+    fn handle_set_configuration_works_for_min_hops() {
+        init_test_logging();
+        let test_name = "handle_set_configuration_works_for_min_hops";
+        let new_min_hops = Hops::SixHops;
+        let set_min_hops_params_arc = Arc::new(Mutex::new(vec![]));
+        let persistent_config = PersistentConfigurationMock::new()
+            .set_min_hops_params(&set_min_hops_params_arc)
+            .set_min_hops_result(Ok(()));
+        let system = System::new("handle_set_configuration_works_for_min_hops");
+        let (neighborhood, _, neighborhood_recording_arc) = make_recorder();
+        let neighborhood_addr = neighborhood.start();
+        let mut subject = make_subject(Some(persistent_config));
+        subject.logger = Logger::new(test_name);
+        subject.configuration_change_msg_sub_opt =
+            Some(neighborhood_addr.recipient::<ConfigurationChangeMessage>());
+
+        let result = subject.handle_set_configuration(
+            UiSetConfigurationRequest {
+                name: "min-hops".to_string(),
+                value: new_min_hops.to_string(),
+            },
+            4000,
+        );
+
+        System::current().stop();
+        system.run();
+        let neighborhood_recording = neighborhood_recording_arc.lock().unwrap();
+        let message_to_neighborhood =
+            neighborhood_recording.get_record::<ConfigurationChangeMessage>(0);
+        let set_min_hops_params = set_min_hops_params_arc.lock().unwrap();
+        let min_hops_in_db = set_min_hops_params.get(0).unwrap();
+        assert_eq!(
+            result,
+            MessageBody {
+                opcode: "setConfiguration".to_string(),
+                path: MessagePath::Conversation(4000),
+                payload: Ok(r#"{}"#.to_string())
+            }
+        );
+        assert_eq!(
+            message_to_neighborhood,
+            &ConfigurationChangeMessage {
+                change: ConfigurationChange::UpdateMinHops(new_min_hops)
+            }
+        );
+        assert_eq!(*min_hops_in_db, new_min_hops);
+        TestLogHandler::new().exists_log_containing(&format!(
+           "DEBUG: {test_name}: The value of min-hops has been changed to {new_min_hops}-hop inside the database"
+        ));
+    }
+
+    #[test]
+    fn handle_set_configuration_throws_err_for_invalid_min_hops() {
+        let mut subject = make_subject(None);
+
+        let result = subject.handle_set_configuration(
+            UiSetConfigurationRequest {
+                name: "min-hops".to_string(),
+                value: "600".to_string(),
+            },
+            4000,
+        );
+
+        assert_eq!(
+            result,
+            MessageBody {
+                opcode: "setConfiguration".to_string(),
+                path: MessagePath::Conversation(4000),
+                payload: Err((
+                    NON_PARSABLE_VALUE,
+                    "min hops: \"Invalid value for min hops provided\"".to_string()
+                ))
+            }
+        );
+    }
+
+    #[test]
+    fn handle_set_configuration_handles_failure_on_min_hops_database_issue() {
+        let persistent_config = PersistentConfigurationMock::new()
+            .set_min_hops_result(Err(PersistentConfigError::TransactionError));
+        let system =
+            System::new("handle_set_configuration_handles_failure_on_min_hops_database_issue");
+        let (neighborhood, _, neighborhood_recording_arc) = make_recorder();
+        let configuration_change_msg_sub = neighborhood
+            .start()
+            .recipient::<ConfigurationChangeMessage>();
+        let mut subject = make_subject(Some(persistent_config));
+        subject.configuration_change_msg_sub_opt = Some(configuration_change_msg_sub);
+
+        let result = subject.handle_set_configuration(
+            UiSetConfigurationRequest {
+                name: "min-hops".to_string(),
+                value: "4".to_string(),
+            },
+            4000,
+        );
+
+        System::current().stop();
+        system.run();
+        let recording = neighborhood_recording_arc.lock().unwrap();
+        assert!(recording.is_empty());
+        assert_eq!(
+            result,
+            MessageBody {
+                opcode: "setConfiguration".to_string(),
+                path: MessagePath::Conversation(4000),
+                payload: Err((
+                    CONFIGURATOR_WRITE_ERROR,
+                    "min hops: TransactionError".to_string()
                 ))
             }
         );
@@ -2547,8 +2724,8 @@ mod tests {
         fn from(persistent_config: Box<dyn PersistentConfiguration>) -> Self {
             Configurator {
                 persistent_config,
-                node_to_ui_sub: None,
-                new_password_subs: None,
+                node_to_ui_sub_opt: None,
+                configuration_change_msg_sub_opt: None,
                 crashable: false,
                 logger: Logger::new("Configurator"),
             }

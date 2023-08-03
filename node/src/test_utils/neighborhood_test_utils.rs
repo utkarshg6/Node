@@ -268,6 +268,16 @@ impl NeighborhoodDatabase {
     }
 }
 
+macro_rules! network {
+    ($($key:expr => $value:expr),+) => {{
+        $(
+            let _key = $key.to_string();
+            let _value = $value;
+            println!("key: {:?}, value: {:?}", _key, _value);
+        )*
+    }};
+}
+
 impl From<&NodeRecord> for AccessibleGossipRecord {
     fn from(node_record: &NodeRecord) -> Self {
         AccessibleGossipRecord {
@@ -341,4 +351,13 @@ pub fn cryptdes_from_node_records(nodes: &[NodeRecord]) -> Vec<CryptDENull> {
         .iter()
         .map(|node| CryptDENull::from(node.public_key(), TEST_DEFAULT_CHAIN))
         .collect::<Vec<CryptDENull>>()
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn network_macro_works() {
+        let something = network!(1 => 2);
+    }
 }

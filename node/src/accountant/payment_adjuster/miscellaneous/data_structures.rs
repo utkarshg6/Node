@@ -31,7 +31,7 @@ impl WeightedPayable {
 #[derive(Debug, PartialEq, Eq)]
 pub struct AdjustmentIterationResult {
     pub decided_accounts: DecidedAccounts,
-    pub remaining_undecided_accounts: Vec<WeightedPayable>,
+    pub undecided_accounts: Vec<WeightedPayable>,
 }
 
 pub struct RecursionResults {
@@ -40,16 +40,6 @@ pub struct RecursionResults {
 }
 
 impl RecursionResults {
-    pub fn new(
-        here_decided_accounts: Vec<AdjustedAccountBeforeFinalization>,
-        downstream_decided_accounts: Vec<AdjustedAccountBeforeFinalization>,
-    ) -> Self {
-        Self {
-            here_decided_accounts,
-            downstream_decided_accounts,
-        }
-    }
-
     pub fn merge_results_from_recursion(self) -> Vec<AdjustedAccountBeforeFinalization> {
         self.here_decided_accounts
             .into_iter()
@@ -62,6 +52,15 @@ impl RecursionResults {
 pub enum DecidedAccounts {
     LowGainingAccountEliminated,
     SomeAccountsProcessed(Vec<AdjustedAccountBeforeFinalization>),
+}
+
+impl From<DecidedAccounts> for Vec<AdjustedAccountBeforeFinalization> {
+    fn from(decided_accounts: DecidedAccounts) -> Self {
+        match decided_accounts {
+            DecidedAccounts::LowGainingAccountEliminated => vec![],
+            DecidedAccounts::SomeAccountsProcessed(accounts) => accounts,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
